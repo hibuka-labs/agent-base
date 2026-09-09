@@ -17,7 +17,9 @@ mod turn_facts;
 
 pub use approval::{AllowAllApprovalHandler, ApprovalHandler, DenyAllApprovalHandler};
 pub use builder::AgentBuilder;
-pub use context::{ContextCompaction, ContextWindowManager};
+pub use context::{
+    ContextCompaction, ContextWindowManager, estimate_messages_tokens, first_system_prompt,
+};
 pub use middleware::{Middleware, PostLlmCtx, PreLlmCtx, UserMessageCtx};
 pub use pipeline::{DefaultPipeline, ToolExecutionPipeline};
 pub use react_loop_guard::{GuardCtx, GuardDecision, NoopGuard, ReactLoopGuard};

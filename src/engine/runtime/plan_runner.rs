@@ -107,29 +107,6 @@ impl RuntimeCore {
     {
         self.session_manager.with_session_mut(session_id, f).await
     }
-
-    /// Estimate the total token count for a session's message history.
-    ///
-    /// Uses `ContextWindowManager::estimate_tokens` per message, or the
-    /// compactor's `token_count_hint` if available.
-    pub(crate) async fn estimate_session_tokens(&self, session_id: &SessionId) -> usize {
-        // Try the compactor's hint first
-        if let Some(ref compactor) = self.context_compactor
-            && let Some(hint) = compactor.token_count_hint(session_id)
-        {
-            return hint;
-        }
-        // Fall back to ContextWindowManager estimation
-        if let Ok(session) = self.session_manager.session_or_err(session_id).await {
-            let messages = session.chat_messages();
-            messages
-                .iter()
-                .map(ContextWindowManager::message_tokens)
-                .sum()
-        } else {
-            0
-        }
-    }
 }
 
 #[cfg(test)]

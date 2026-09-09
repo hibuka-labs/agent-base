@@ -1,5 +1,26 @@
 use crate::types::{ChatMessage, SessionId};
 
+/// Find the first non-ephemeral System message (the system prompt).
+pub fn first_system_prompt(messages: &[ChatMessage]) -> Option<ChatMessage> {
+    messages.iter().find_map(|msg| match msg {
+        ChatMessage::System {
+            content,
+            ephemeral: false,
+        } => Some(ChatMessage::system(content.clone())),
+        _ => None,
+    })
+}
+
+/// Estimate total tokens across a message list using `ContextWindowManager::message_tokens`.
+pub fn estimate_messages_tokens(messages: &[ChatMessage]) -> usize {
+    messages
+        .iter()
+        .map(ContextWindowManager::message_tokens)
+        .sum()
+}
+
+// ── Context Window Manager ──────────────────────────────────────────────────
+
 #[derive(Clone, Debug)]
 pub struct ContextWindowManager {
     pub max_tokens: usize,

@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
 use crate::engine::middleware::{PostLlmCtx, PreLlmCtx};
+use crate::engine::context::ContextWindowManager;
 use crate::engine::runtime::plan_runner::RuntimeCore;
 use crate::types::{
     AgentResult, CheckpointData, CheckpointStep, FinishReason, MessageRole, RunOutcome,
@@ -344,28 +345,31 @@ impl RuntimeCore {
             {
                 TurnFlow::Continue => {
                     // Inline compaction check — context may have grown after
-                    // tool execution. Compact if we exceed the configured
-                    // threshold to prevent context window overflow.
+                    // tool execution. The compactor owns ALL threshold
+                    // judgment (token-budget phases live in `compact()`),
+                    // so it runs every iteration and returns None when no
+                    // action is needed. The previous gate (`token_count >
+                    // max_message_tokens`) starved budget-based compactors:
+                    // that config defaults to 128K and doubles as the
+                    // single-message safety valve — it is not a compaction
+                    // trigger. Registered compactors self-gate cheaply.
                     if let Some(ref compactor) = self.context_compactor {
-                        let token_count = self.estimate_session_tokens(session_id).await;
-                        let config = self.config_snapshot_async().await;
-                        let threshold = config.session.max_message_tokens.unwrap_or(128_000);
-                        if token_count > threshold {
-                            tracing::info!(
-                                session_id = session_id.id,
-                                turn = turn_count,
-                                token_count,
-                                threshold,
-                                "context exceeds threshold, compacting inline"
-                            );
-                            // Read messages, compact, write back
-                            let messages = {
-                                let session = self.session_manager.session_or_err(session_id).await;
-                                session.ok().map(|s| s.chat_messages().to_vec())
-                            };
-                            if let Some(msgs) = messages
-                                && let Some(compacted) = compactor.compact(session_id, &msgs).await
-                            {
+                        let messages = {
+                            let session = self.session_manager.session_or_err(session_id).await;
+                            session.ok().map(|s| s.chat_messages().to_vec())
+                        };
+                        if let Some(msgs) = messages {
+                            let token_count: usize = msgs
+                                .iter()
+                                .map(|m| ContextWindowManager::message_tokens(m))
+                                .sum();
+                            if let Some(compacted) = compactor.compact(session_id, &msgs).await {
+                                tracing::info!(
+                                    session_id = session_id.id,
+                                    turn = turn_count,
+                                    token_count,
+                                    "inline compaction triggered"
+                                );
                                 self.with_session_mut(session_id, |session| {
                                     if let Err(e) = session.set_chat_messages(compacted) {
                                         tracing::warn!(

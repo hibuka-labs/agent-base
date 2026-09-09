@@ -47,8 +47,8 @@ pub use engine::{
     ConsecutiveFailureRecovery, ContextCompaction, ContextWindowManager, DenyAllApprovalHandler,
     GuardCtx, GuardDecision, Middleware, NoopGuard, PostLlmCtx, PreLlmCtx, ReactLoopGuard,
     RetryOnError, RiskLevel, StopOnError, ToolEnforcementConfig, ToolEnforcementMiddleware,
-    ToolErrorAction, ToolErrorRecovery, TurnFactMiddleware, TurnToolLimitMiddleware,
-    UserMessageCtx,
+    ToolErrorAction, ToolErrorRecovery, TurnFactMiddleware, TurnToolLimitMiddleware, UserMessageCtx,
+    estimate_messages_tokens, first_system_prompt,
 };
 
 // ---------------------------------------------------------------------------

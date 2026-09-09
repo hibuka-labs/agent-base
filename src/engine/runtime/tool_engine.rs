@@ -653,18 +653,23 @@ impl ToolEngine {
             event_bus: event_bus.clone(),
         };
 
-        tracing::debug!(
+        tracing::info!(
             session_id = session_id.id,
             tool = name,
-            "looking up tool in registry (parallel)"
+            "execute_tool_static: acquiring tools read lock (parallel)"
         );
         let tools_guard = tools.read().await;
+        tracing::info!(
+            session_id = session_id.id,
+            tool = name,
+            "execute_tool_static: tools read lock acquired (parallel)"
+        );
         let tool_result = match tools_guard.get(name) {
             Some(tool) => {
-                tracing::debug!(
+                tracing::info!(
                     session_id = session_id.id,
                     tool = name,
-                    "tool found, executing via pipeline (parallel)"
+                    "execute_tool_static: tool found, calling pipeline (parallel)"
                 );
 
                 let call_pipeline = DefaultPipeline::new(
@@ -673,6 +678,11 @@ impl ToolEngine {
                     ctx.max_output_chars,
                 );
 
+                tracing::info!(
+                    session_id = session_id.id,
+                    tool = name,
+                    "execute_tool_static: entering select loop (parallel)"
+                );
                 let future = call_pipeline.execute(tool.as_ref(), args, &tool_context);
                 tokio::pin!(future);
 
@@ -709,7 +719,14 @@ impl ToolEngine {
                 }
 
                 match output {
-                    Ok(output) => output,
+                    Ok(output) => {
+                        tracing::info!(
+                            session_id = session_id.id,
+                            tool = name,
+                            "execute_tool_static: tool completed (parallel)"
+                        );
+                        output
+                    }
                     Err(e) => {
                         tracing::error!(session_id = session_id.id, tool_name = name, error = %e, "Tool execution failed (parallel)");
                         let error_summary = if ctx.language == Language::Zh {
@@ -1807,5 +1824,110 @@ mod tests {
             &outcome.failures[0].error,
             AgentError::ToolExecution { .. }
         ));
+    }
+
+    /// Tool that does synchronous file I/O — mimics history.list_items.
+    /// This exercises the real-world path where a blocking `fs::read_to_string`
+    /// runs inside an async `call` on a multi-thread tokio runtime.
+    struct SyncFileReadTool {
+        dir: tempfile::TempDir,
+    }
+
+    impl SyncFileReadTool {
+        fn new() -> Self {
+            let dir = tempfile::TempDir::new().unwrap();
+            // Write a few small files to simulate session history
+            for i in 0..5 {
+                let path = dir.path().join(format!("file_{i}.jsonl"));
+                let content = format!("line1 for file {i}\nline2 for file {i}\n");
+                std::fs::write(&path, content).unwrap();
+            }
+            Self { dir }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for SyncFileReadTool {
+        fn name(&self) -> &'static str { "sync_file_read" }
+        fn description(&self) -> &'static str { "" }
+        fn schema(&self) -> Value { serde_json::json!({}) }
+        async fn call(&self, _args: &Value, _ctx: &ToolContext) -> AgentResult<Vec<Content>> {
+            // Synchronous file I/O — same pattern as history.list_items
+            let mut output = String::new();
+            for i in 0..5 {
+                let path = self.dir.path().join(format!("file_{i}.jsonl"));
+                let content = std::fs::read_to_string(&path)
+                    .map_err(|e| AgentError::internal(format!("sync_file_read: {e}")))?;
+                output.push_str(&content);
+            }
+            Ok(vec![Content::text(output)])
+        }
+    }
+
+    #[tokio::test]
+    async fn orchestrate_sync_io_tool_does_not_hang() {
+        let tool = SyncFileReadTool::new();
+        let mut registry = ToolRegistry::default();
+        registry.register(tool);
+
+        let event_bus = EventBus::new(64);
+        let mut event_rx = event_bus.subscribe();
+        let engine = ToolEngine::new(registry, None, None, Arc::new(StopOnError), event_bus);
+        let sm = session_manager();
+        let c = ctx(&sm);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            engine.orchestrate(
+                &SessionId::new(1),
+                &[("c1".into(), "sync_file_read".into(), "{}".into())],
+                &c,
+                &mut event_rx,
+                std::sync::Arc::new(std::sync::Mutex::new(|_| -> AgentResult<()> { Ok(()) })),
+            ),
+        )
+        .await;
+
+        assert!(result.is_ok(), "sync I/O tool timed out (hang!)");
+        let outcome = result.unwrap().unwrap();
+        assert_eq!(outcome.results.len(), 1);
+        assert!(outcome.failures.is_empty());
+    }
+
+    #[tokio::test]
+    async fn orchestrate_parallel_sync_io_tools_do_not_hang() {
+        let tool = SyncFileReadTool::new();
+        let mut registry = ToolRegistry::default();
+        registry.register(tool);
+        registry.register(EchoTool);
+
+        let event_bus = EventBus::new(64);
+        let mut event_rx = event_bus.subscribe();
+        let engine = ToolEngine::new(registry, None, None, Arc::new(StopOnError), event_bus);
+        let sm = session_manager();
+        let c = ctx(&sm);
+
+        // Mix sync I/O tools with fast tools in parallel
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            engine.orchestrate(
+                &SessionId::new(1),
+                &[
+                    ("c1".into(), "sync_file_read".into(), "{}".into()),
+                    ("c2".into(), "echo".into(), r#"{"text":"hello"}"#.into()),
+                    ("c3".into(), "sync_file_read".into(), "{}".into()),
+                    ("c4".into(), "echo".into(), r#"{"text":"world"}"#.into()),
+                ],
+                &c,
+                &mut event_rx,
+                std::sync::Arc::new(std::sync::Mutex::new(|_| -> AgentResult<()> { Ok(()) })),
+            ),
+        )
+        .await;
+
+        assert!(result.is_ok(), "parallel sync I/O tools timed out (hang!)");
+        let outcome = result.unwrap().unwrap();
+        assert_eq!(outcome.results.len(), 4, "expected 4 results");
+        assert!(outcome.failures.is_empty(), "failures: {:?}", outcome.failures);
     }
 }

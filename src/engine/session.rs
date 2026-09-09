@@ -462,11 +462,26 @@ impl AgentSession {
 /// Validate that a chat message sequence is well-formed for LLM API consumption.
 ///
 /// Checks:
+/// - At least one non-System/non-Custom message (System maps to the
+///   top-level `system` parameter, Custom is stripped — a sequence of only
+///   those leaves an empty `messages` array, which providers reject with
+///   HTTP 400). Guards compaction outputs against producing an unsendable
+///   window.
 /// - No Tool message without a preceding Assistant with matching tool_call
 /// - No duplicate Tool messages for the same tool_call_id
 /// - All tool_calls in an Assistant batch must be answered before the next Assistant batch
 /// - No unanswered tool calls at the end of the sequence
 pub fn validate_message_sequence(messages: &[ChatMessage]) -> Result<(), String> {
+    if !messages.iter().any(|m| {
+        !matches!(m, ChatMessage::System { .. } | ChatMessage::Custom { .. })
+    }) {
+        return Err(
+            "sequence contains no sendable message: System/Custom alone leave the \
+             provider `messages` array empty"
+                .to_string(),
+        );
+    }
+
     let mut pending_tool_call_ids: HashSet<String> = HashSet::new();
 
     for (i, msg) in messages.iter().enumerate() {
@@ -860,6 +875,29 @@ mod validate_tests {
         ];
         let err = validate_message_sequence(&msgs).unwrap_err();
         assert!(err.contains("no preceding tool_call"));
+    }
+
+    #[test]
+    fn test_system_only_sequence_rejected() {
+        // A compaction that leaves only System/Custom messages would send an
+        // empty `messages` array (System maps to the `system` param) — the
+        // contract rejects it.
+        let msgs = vec![
+            ChatMessage::system("prompt"),
+            ChatMessage::system_ephemeral("reminder"),
+            ChatMessage::Custom {
+                role: "artifact".into(),
+                data: serde_json::json!({"id": "x"}),
+            },
+        ];
+        let err = validate_message_sequence(&msgs).unwrap_err();
+        assert!(err.contains("no sendable message"));
+    }
+
+    #[test]
+    fn test_system_plus_user_ok() {
+        let msgs = vec![ChatMessage::system("prompt"), ChatMessage::user("hi")];
+        assert!(validate_message_sequence(&msgs).is_ok());
     }
 
     #[test]
