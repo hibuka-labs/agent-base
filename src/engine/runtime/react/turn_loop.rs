@@ -361,7 +361,7 @@ impl RuntimeCore {
                         if let Some(msgs) = messages {
                             let token_count: usize = msgs
                                 .iter()
-                                .map(|m| ContextWindowManager::message_tokens(m))
+                                .map(ContextWindowManager::message_tokens)
                                 .sum();
                             if let Some(compacted) = compactor.compact(session_id, &msgs).await {
                                 tracing::info!(

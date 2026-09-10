@@ -11,6 +11,12 @@ use crate::engine::runtime::event_bus::EventBus;
 use crate::llm::{ReasoningConfig, StreamChunk, UsageInfo};
 use crate::types::{AgentResult, ChatMessage, RuntimeEvent, SessionId};
 
+/// Bound on the wait for the LLM to *start* responding (time to response
+/// headers). Generous enough for slow providers cold-starting a long prompt
+/// (typical TTFT is well under 10 s), tight enough to surface a dead
+/// network within a minute instead of hanging forever.
+const TTFB_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Build a `ChatRequest` from individual parameters.
 fn build_chat_request(
     messages: &[ChatMessage],
@@ -76,6 +82,48 @@ impl LlmEngine {
         self.set_provider(client);
     }
 
+    /// Await the provider's `stream()` with cancellation + TTFB timeout.
+    ///
+    /// reqwest's connect_timeout covers only TCP connect and read_timeout
+    /// only response-body reads — the wait for response headers is covered
+    /// by neither, so a silently dropped network hangs the await forever
+    /// (session 20260910_e528c7a3: 1.5 h silent hang, TUI unresponsive to
+    /// Ctrl+C for the same reason). Both gaps are closed here: the cancel
+    /// token aborts the in-flight request, and the TTFB timeout turns a
+    /// stalled connection into a regular error that the caller's retry
+    /// logic can handle.
+    async fn stream_cancellable(
+        &self,
+        cancel_token: &tokio_util::sync::CancellationToken,
+        request: llm_trait::ChatRequest,
+    ) -> AgentResult<Pin<Box<dyn Stream<Item = AgentResult<StreamChunk>> + Send>>> {
+        // Bind the provider handle outside the select!: select! drops
+        // temporaries at the end of the statement, which would free the
+        // Arc clone mid-await.
+        let provider = self.get_provider();
+        tokio::select! {
+            _ = cancel_token.cancelled() => {
+                tracing::info!("LLM request cancelled while awaiting response");
+                Err(crate::types::AgentError::Cancelled)
+            }
+            result = tokio::time::timeout(TTFB_TIMEOUT, provider.stream(request)) => {
+                match result {
+                    Ok(inner) => inner.map(chat_stream_to_old).map_err(Into::into),
+                    Err(_) => {
+                        tracing::error!(
+                            timeout_secs = TTFB_TIMEOUT.as_secs(),
+                            "LLM request timed out waiting for response (network stalled?)"
+                        );
+                        Err(crate::types::AgentError::Llm(format!(
+                            "no response within {}s (network stalled or provider unreachable)",
+                            TTFB_TIMEOUT.as_secs()
+                        )))
+                    }
+                }
+            }
+        }
+    }
+
     pub async fn chat_stream(
         &self,
         messages: &[ChatMessage],
@@ -83,6 +131,7 @@ impl LlmEngine {
         reasoning: Option<&ReasoningConfig>,
         response_format: Option<&crate::types::ResponseFormat>,
         thinking_disabled: bool,
+        cancel_token: &tokio_util::sync::CancellationToken,
     ) -> AgentResult<Pin<Box<dyn Stream<Item = AgentResult<StreamChunk>> + Send>>> {
         tracing::info!(
             msg_count = messages.len(),
@@ -97,12 +146,12 @@ impl LlmEngine {
             response_format,
             thinking_disabled,
         );
-        let result = self.get_provider().stream(request).await;
+        let result = self.stream_cancellable(cancel_token, request).await;
         match &result {
             Ok(_) => tracing::info!("LLM chat_stream: API response received"),
             Err(e) => tracing::error!(error = %e, "LLM chat_stream: API request failed"),
         }
-        result.map(chat_stream_to_old).map_err(Into::into)
+        result
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -115,6 +164,7 @@ impl LlmEngine {
         response_format: Option<&crate::types::ResponseFormat>,
         retry: crate::types::RetryConfig,
         thinking_disabled: bool,
+        cancel_token: &tokio_util::sync::CancellationToken,
     ) -> AgentResult<Pin<Box<dyn Stream<Item = AgentResult<StreamChunk>> + Send>>> {
         let request = build_chat_request(
             messages,
@@ -126,10 +176,15 @@ impl LlmEngine {
         let mut attempt = 1;
         let mut delay_ms = retry.initial_backoff_ms;
         loop {
-            match self.get_provider().stream(request.clone()).await {
-                Ok(chat_stream) => return Ok(chat_stream_to_old(chat_stream)),
+            match self.stream_cancellable(cancel_token, request.clone()).await {
+                Ok(chat_stream) => return Ok(chat_stream),
                 Err(e) => {
-                    let agent_err: crate::types::AgentError = e.into();
+                    let agent_err: crate::types::AgentError = e;
+                    // Cancellation is a user decision, not a transient
+                    // failure — never retry past it.
+                    if agent_err.is_cancelled() {
+                        return Err(agent_err);
+                    }
                     if attempt > retry.max_retries {
                         tracing::error!(session_id = session_id.id, attempts = attempt, error = %agent_err, "LLM stream retry exhausted");
                         return Err(agent_err);
@@ -920,7 +975,7 @@ mod tests {
     async fn chat_stream_returns_stream_on_ok() {
         let engine = LlmEngine::new(Arc::new(StubProvider("x")), EventBus::new(16));
         let mut stream = engine
-            .chat_stream(&[], &[], None, None, false)
+            .chat_stream(&[], &[], None, None, false, &tokio_util::sync::CancellationToken::new())
             .await
             .unwrap();
         let next = futures_util::StreamExt::next(&mut stream).await;
@@ -932,7 +987,7 @@ mod tests {
         let engine = LlmEngine::new(Arc::new(StubProvider("x")), EventBus::new(16));
         // Test with thinking_disabled=true — should still work, just without reasoning
         let mut stream = engine
-            .chat_stream(&[], &[], None, None, true)
+            .chat_stream(&[], &[], None, None, true, &tokio_util::sync::CancellationToken::new())
             .await
             .unwrap();
         let next = futures_util::StreamExt::next(&mut stream).await;
@@ -943,7 +998,7 @@ mod tests {
     async fn chat_stream_forwards_error() {
         let engine = LlmEngine::new(Arc::new(AlwaysFail), EventBus::new(16));
         let err = engine
-            .chat_stream(&[], &[], None, None, false)
+            .chat_stream(&[], &[], None, None, false, &tokio_util::sync::CancellationToken::new())
             .await
             .err()
             .expect("should fail");
@@ -961,7 +1016,7 @@ mod tests {
             jitter: false,
         };
         let _stream = engine
-            .run_llm_turn_with_retry(&SessionId::new(1), &[], &[], None, None, cfg, false)
+            .run_llm_turn_with_retry(&SessionId::new(1), &[], &[], None, None, cfg, false, &tokio_util::sync::CancellationToken::new())
             .await
             .expect("should succeed after retries");
     }
@@ -977,11 +1032,54 @@ mod tests {
             jitter: false,
         };
         let err = engine
-            .run_llm_turn_with_retry(&SessionId::new(1), &[], &[], None, None, cfg, false)
+            .run_llm_turn_with_retry(&SessionId::new(1), &[], &[], None, None, cfg, false, &tokio_util::sync::CancellationToken::new())
             .await
             .err()
             .expect("should be exhausted");
         assert!(err.to_string().contains("transient"));
+    }
+
+    #[tokio::test]
+    async fn chat_stream_cancelled_while_awaiting_response() {
+        // A provider whose `stream()` never resolves — the shape of a silent
+        // network drop while waiting for response headers. Cancelling must
+        // abort the wait instead of hanging forever.
+        struct NeverResolves;
+
+        #[async_trait]
+        impl LlmProvider for NeverResolves {
+            async fn stream(&self, _request: ChatRequest) -> Result<ChatStream, LlmError> {
+                std::future::pending().await
+            }
+
+            async fn chat(&self, _request: ChatRequest) -> Result<llm_trait::ChatResponse, LlmError> {
+                Err(LlmError::Llm("not implemented".into()))
+            }
+
+            fn capabilities(&self) -> Capabilities {
+                Capabilities::default()
+            }
+
+            fn info(&self) -> ProviderInfo {
+                ProviderInfo {
+                    name: "never-resolves".to_string(),
+                    model: "never-resolves".to_string(),
+                    version: None,
+                }
+            }
+        }
+
+        let engine = LlmEngine::new(Arc::new(NeverResolves), EventBus::new(16));
+        let token = tokio_util::sync::CancellationToken::new();
+        let fut = engine.chat_stream(&[], &[], None, None, false, &token);
+        tokio::pin!(fut);
+        token.cancel();
+        let err = tokio::time::timeout(std::time::Duration::from_secs(5), fut)
+            .await
+            .expect("chat_stream must resolve after cancel")
+            .err()
+            .expect("must be cancelled");
+        assert!(err.is_cancelled(), "expected Cancelled, got: {err}");
     }
 
     #[tokio::test]

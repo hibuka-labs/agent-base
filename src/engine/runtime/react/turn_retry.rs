@@ -38,6 +38,7 @@ impl RuntimeCore {
     {
         let mut retry_left: u32 = STREAM_RETRY_MAX;
         let mut retry_delay_ms: u64 = STREAM_RETRY_INITIAL_MS;
+        let cancel_token = self.cancel_token();
 
         loop {
             let stream = match config.llm.llm_retry.as_ref() {
@@ -56,6 +57,7 @@ impl RuntimeCore {
                             config.llm.response_format.as_ref(),
                             retry.clone(),
                             thinking_disabled,
+                            &cancel_token,
                         )
                         .await?
                 }
@@ -72,6 +74,7 @@ impl RuntimeCore {
                             config.reasoning.as_ref(),
                             config.llm.response_format.as_ref(),
                             thinking_disabled,
+                            &cancel_token,
                         )
                         .await?
                 }
