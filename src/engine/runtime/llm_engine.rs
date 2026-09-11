@@ -24,6 +24,7 @@ fn build_chat_request(
     reasoning: Option<&ReasoningConfig>,
     response_format: Option<&crate::types::ResponseFormat>,
     thinking_disabled: bool,
+    model_override: Option<&str>,
 ) -> llm_trait::ChatRequest {
     let mut request = llm_trait::ChatRequest::new(messages.to_vec());
     if !tool_definitions.is_empty() {
@@ -41,6 +42,12 @@ fn build_chat_request(
         }
     }
     request.response_format = response_format.cloned();
+
+    // Apply model override if specified
+    if let Some(model) = model_override {
+        request = request.with_model(model);
+    }
+
     request
 }
 
@@ -55,6 +62,11 @@ fn chat_stream_to_old(
 pub struct LlmEngine {
     provider: RwLock<Arc<dyn llm_trait::LlmProvider>>,
     event_bus: EventBus,
+    /// Optional model override for all requests.
+    ///
+    /// When set, this overrides the model in ChatRequest.
+    /// Used by sub-agents to specify their model tier (e.g., "lite").
+    model_override: RwLock<Option<String>>,
 }
 
 impl LlmEngine {
@@ -62,6 +74,7 @@ impl LlmEngine {
         Self {
             provider: RwLock::new(provider),
             event_bus,
+            model_override: RwLock::new(None),
         }
     }
 
@@ -73,6 +86,19 @@ impl LlmEngine {
     /// Replace the LLM provider at runtime (e.g., model switch).
     pub fn set_provider(&self, provider: Arc<dyn llm_trait::LlmProvider>) {
         *self.provider.write().unwrap() = provider;
+    }
+
+    /// Get the model override, if set.
+    pub fn get_model_override(&self) -> Option<String> {
+        self.model_override.read().unwrap().clone()
+    }
+
+    /// Set a model override for all requests.
+    ///
+    /// This is used by sub-agents to specify their model tier (e.g., "lite").
+    /// The override is applied to all ChatRequests before sending to the provider.
+    pub fn set_model_override(&self, model: Option<String>) {
+        *self.model_override.write().unwrap() = model;
     }
 
     /// Replace the LLM client at runtime (e.g., model switch).
@@ -139,12 +165,14 @@ impl LlmEngine {
             thinking_disabled,
             "LLM chat_stream: sending request to API"
         );
+        let model_override = self.get_model_override();
         let request = build_chat_request(
             messages,
             tool_definitions,
             reasoning,
             response_format,
             thinking_disabled,
+            model_override.as_deref(),
         );
         let result = self.stream_cancellable(cancel_token, request).await;
         match &result {
@@ -166,12 +194,14 @@ impl LlmEngine {
         thinking_disabled: bool,
         cancel_token: &tokio_util::sync::CancellationToken,
     ) -> AgentResult<Pin<Box<dyn Stream<Item = AgentResult<StreamChunk>> + Send>>> {
+        let model_override = self.get_model_override();
         let request = build_chat_request(
             messages,
             tool_definitions,
             reasoning,
             response_format,
             thinking_disabled,
+            model_override.as_deref(),
         );
         let mut attempt = 1;
         let mut delay_ms = retry.initial_backoff_ms;
@@ -975,7 +1005,14 @@ mod tests {
     async fn chat_stream_returns_stream_on_ok() {
         let engine = LlmEngine::new(Arc::new(StubProvider("x")), EventBus::new(16));
         let mut stream = engine
-            .chat_stream(&[], &[], None, None, false, &tokio_util::sync::CancellationToken::new())
+            .chat_stream(
+                &[],
+                &[],
+                None,
+                None,
+                false,
+                &tokio_util::sync::CancellationToken::new(),
+            )
             .await
             .unwrap();
         let next = futures_util::StreamExt::next(&mut stream).await;
@@ -987,7 +1024,14 @@ mod tests {
         let engine = LlmEngine::new(Arc::new(StubProvider("x")), EventBus::new(16));
         // Test with thinking_disabled=true — should still work, just without reasoning
         let mut stream = engine
-            .chat_stream(&[], &[], None, None, true, &tokio_util::sync::CancellationToken::new())
+            .chat_stream(
+                &[],
+                &[],
+                None,
+                None,
+                true,
+                &tokio_util::sync::CancellationToken::new(),
+            )
             .await
             .unwrap();
         let next = futures_util::StreamExt::next(&mut stream).await;
@@ -998,7 +1042,14 @@ mod tests {
     async fn chat_stream_forwards_error() {
         let engine = LlmEngine::new(Arc::new(AlwaysFail), EventBus::new(16));
         let err = engine
-            .chat_stream(&[], &[], None, None, false, &tokio_util::sync::CancellationToken::new())
+            .chat_stream(
+                &[],
+                &[],
+                None,
+                None,
+                false,
+                &tokio_util::sync::CancellationToken::new(),
+            )
             .await
             .err()
             .expect("should fail");
@@ -1016,7 +1067,16 @@ mod tests {
             jitter: false,
         };
         let _stream = engine
-            .run_llm_turn_with_retry(&SessionId::new(1), &[], &[], None, None, cfg, false, &tokio_util::sync::CancellationToken::new())
+            .run_llm_turn_with_retry(
+                &SessionId::new(1),
+                &[],
+                &[],
+                None,
+                None,
+                cfg,
+                false,
+                &tokio_util::sync::CancellationToken::new(),
+            )
             .await
             .expect("should succeed after retries");
     }
@@ -1032,7 +1092,16 @@ mod tests {
             jitter: false,
         };
         let err = engine
-            .run_llm_turn_with_retry(&SessionId::new(1), &[], &[], None, None, cfg, false, &tokio_util::sync::CancellationToken::new())
+            .run_llm_turn_with_retry(
+                &SessionId::new(1),
+                &[],
+                &[],
+                None,
+                None,
+                cfg,
+                false,
+                &tokio_util::sync::CancellationToken::new(),
+            )
             .await
             .err()
             .expect("should be exhausted");
@@ -1052,7 +1121,10 @@ mod tests {
                 std::future::pending().await
             }
 
-            async fn chat(&self, _request: ChatRequest) -> Result<llm_trait::ChatResponse, LlmError> {
+            async fn chat(
+                &self,
+                _request: ChatRequest,
+            ) -> Result<llm_trait::ChatResponse, LlmError> {
                 Err(LlmError::Llm("not implemented".into()))
             }
 

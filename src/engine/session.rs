@@ -472,9 +472,10 @@ impl AgentSession {
 /// - All tool_calls in an Assistant batch must be answered before the next Assistant batch
 /// - No unanswered tool calls at the end of the sequence
 pub fn validate_message_sequence(messages: &[ChatMessage]) -> Result<(), String> {
-    if !messages.iter().any(|m| {
-        !matches!(m, ChatMessage::System { .. } | ChatMessage::Custom { .. })
-    }) {
+    if !messages
+        .iter()
+        .any(|m| !matches!(m, ChatMessage::System { .. } | ChatMessage::Custom { .. }))
+    {
         return Err(
             "sequence contains no sendable message: System/Custom alone leave the \
              provider `messages` array empty"

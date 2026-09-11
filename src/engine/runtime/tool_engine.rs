@@ -1848,9 +1848,15 @@ mod tests {
 
     #[async_trait]
     impl Tool for SyncFileReadTool {
-        fn name(&self) -> &'static str { "sync_file_read" }
-        fn description(&self) -> &'static str { "" }
-        fn schema(&self) -> Value { serde_json::json!({}) }
+        fn name(&self) -> &'static str {
+            "sync_file_read"
+        }
+        fn description(&self) -> &'static str {
+            ""
+        }
+        fn schema(&self) -> Value {
+            serde_json::json!({})
+        }
         async fn call(&self, _args: &Value, _ctx: &ToolContext) -> AgentResult<Vec<Content>> {
             // Synchronous file I/O — same pattern as history.list_items
             let mut output = String::new();
@@ -1928,6 +1934,10 @@ mod tests {
         assert!(result.is_ok(), "parallel sync I/O tools timed out (hang!)");
         let outcome = result.unwrap().unwrap();
         assert_eq!(outcome.results.len(), 4, "expected 4 results");
-        assert!(outcome.failures.is_empty(), "failures: {:?}", outcome.failures);
+        assert!(
+            outcome.failures.is_empty(),
+            "failures: {:?}",
+            outcome.failures
+        );
     }
 }

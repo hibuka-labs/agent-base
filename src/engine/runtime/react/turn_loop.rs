@@ -2,8 +2,8 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::broadcast;
 
-use crate::engine::middleware::{PostLlmCtx, PreLlmCtx};
 use crate::engine::context::ContextWindowManager;
+use crate::engine::middleware::{PostLlmCtx, PreLlmCtx};
 use crate::engine::runtime::plan_runner::RuntimeCore;
 use crate::types::{
     AgentResult, CheckpointData, CheckpointStep, FinishReason, MessageRole, RunOutcome,
@@ -359,10 +359,8 @@ impl RuntimeCore {
                             session.ok().map(|s| s.chat_messages().to_vec())
                         };
                         if let Some(msgs) = messages {
-                            let token_count: usize = msgs
-                                .iter()
-                                .map(ContextWindowManager::message_tokens)
-                                .sum();
+                            let token_count: usize =
+                                msgs.iter().map(ContextWindowManager::message_tokens).sum();
                             if let Some(compacted) = compactor.compact(session_id, &msgs).await {
                                 tracing::info!(
                                     session_id = session_id.id,

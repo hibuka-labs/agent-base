@@ -100,6 +100,19 @@ impl AgentRuntime {
         self.runner.llm_engine.set_provider(provider);
     }
 
+    /// Get the model override, if set.
+    pub fn get_model_override(&self) -> Option<String> {
+        self.runner.llm_engine.get_model_override()
+    }
+
+    /// Set a model override for all requests.
+    ///
+    /// This is used by sub-agents to specify their model tier (e.g., "lite").
+    /// The override is applied to all ChatRequests before sending to the provider.
+    pub fn set_model_override(&self, model: Option<String>) {
+        self.runner.llm_engine.set_model_override(model);
+    }
+
     pub fn tools_mut(&self) -> Arc<tokio::sync::RwLock<crate::tool::ToolRegistry>> {
         self.runner.tool_engine.tools_arc()
     }

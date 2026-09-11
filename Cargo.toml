@@ -3,7 +3,7 @@ members = ["crates/agent-types"]
 
 [package]
 name = "agent-base"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 description = "A lightweight Agent Runtime Kernel for building AI agents in Rust"
 license = "MIT"
@@ -13,10 +13,10 @@ keywords = ["agent", "ai", "llm", "runtime", "tool-calling"]
 categories = ["development-tools", "asynchronous"]
 
 [dependencies]
-agent-types = { version = "0.1.1" }
+agent-types = { path = "crates/agent-types" }
 anyhow = "1"
-llm-trait = "0.1.1"
-llm-unified = "0.1.1"
+llm-trait = { path = "../llm-providers/llm-trait" }
+llm-unified = { path = "../llm-providers" }
 async-openai = { version = "0.41", default-features = true }
 async-trait = "0.1"
 eventsource-stream = "0.2"
