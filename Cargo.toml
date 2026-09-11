@@ -13,10 +13,10 @@ keywords = ["agent", "ai", "llm", "runtime", "tool-calling"]
 categories = ["development-tools", "asynchronous"]
 
 [dependencies]
-agent-types = { path = "crates/agent-types" }
+agent-types = { version = "0.1.1" }
 anyhow = "1"
-llm-trait = { path = "../llm-providers/llm-trait" }
-llm-unified = { path = "../llm-providers" }
+llm-trait = { version = "0.1.3" }
+llm-unified = { version = "0.1.3" }
 async-openai = { version = "0.41", default-features = true }
 async-trait = "0.1"
 eventsource-stream = "0.2"
