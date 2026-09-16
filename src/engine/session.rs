@@ -245,6 +245,41 @@ impl AgentSession {
         self.chat_messages.push(chat_msg);
     }
 
+    /// Push a message as ephemeral (user/system only): the LLM sees it this
+    /// turn, then `remove_ephemeral_messages` strips it at turn end — from
+    /// both memory and persistence.
+    pub fn push_message_ephemeral(&mut self, role: MessageRole, content: impl Into<String>) {
+        let content = content.into();
+        let chat_msg = match role {
+            MessageRole::System => ChatMessage::system_ephemeral(content),
+            MessageRole::User => ChatMessage::user_ephemeral(content),
+            MessageRole::Assistant | MessageRole::Tool => {
+                // Ephemeral assistant/tool messages are not a thing; fall back
+                // to a regular push rather than silently mis-marking.
+                self.push_message(role, content);
+                return;
+            },
+        };
+        self.chat_messages.push(chat_msg);
+    }
+
+    /// Replace the system prompt — the first **non-ephemeral** System message
+    /// (wherever it sits, matching how `context` locates it); inserted at
+    /// index 0 if none exists. All other messages are untouched. Hosts that
+    /// own prompt composition (e.g. skill activation) re-bake through this.
+    pub fn set_system_prompt(&mut self, content: impl Into<String>) {
+        let content = content.into();
+        if let Some(idx) = self
+            .chat_messages
+            .iter()
+            .position(|m| matches!(m, ChatMessage::System { ephemeral: false, .. }))
+        {
+            self.chat_messages[idx] = ChatMessage::system(content);
+        } else {
+            self.chat_messages.insert(0, ChatMessage::system(content));
+        }
+    }
+
     /// Push an assistant message with reasoning/thinking content preserved.
     /// This allows the LLM to see its own prior reasoning in subsequent turns,
     /// preventing it from re-deriving the same conclusions every turn.
@@ -760,6 +795,56 @@ mod tests {
         s.remove_ephemeral_messages();
         assert_eq!(s.chat_messages().len(), 2);
         assert!(s.chat_messages().iter().all(|m| !m.is_ephemeral()));
+    }
+
+    #[test]
+    fn test_set_system_prompt_replaces_first_non_ephemeral_system() {
+        let mut s = make_session();
+        s.push_message(MessageRole::System, "old prompt");
+        s.push_message(MessageRole::User, "hi");
+        s.push_message(MessageRole::Assistant, "hello");
+
+        s.set_system_prompt("new prompt");
+
+        let msgs = s.chat_messages();
+        assert_eq!(msgs.len(), 3, "history length unchanged");
+        assert!(
+            matches!(&msgs[0], ChatMessage::System { content, ephemeral: false } if content == "new prompt")
+        );
+        assert!(matches!(&msgs[1], ChatMessage::User { content, .. } if content == "hi"));
+        assert!(matches!(&msgs[2], ChatMessage::Assistant { content: Some(c), .. } if c == "hello"));
+    }
+
+    #[test]
+    fn test_set_system_prompt_inserts_when_absent() {
+        let mut s = make_session();
+        s.push_message(MessageRole::User, "hi");
+
+        s.set_system_prompt("fresh prompt");
+
+        let msgs = s.chat_messages();
+        assert_eq!(msgs.len(), 2);
+        assert!(matches!(&msgs[0], ChatMessage::System { content, ephemeral: false } if content == "fresh prompt"));
+        assert!(matches!(&msgs[1], ChatMessage::User { .. }));
+    }
+
+    #[test]
+    fn test_set_system_prompt_skips_ephemeral_system_and_inserts() {
+        let mut s = make_session();
+        s.chat_messages_mut()
+            .push(ChatMessage::system_ephemeral("ephemeral nudge"));
+        s.push_message(MessageRole::User, "hi");
+
+        s.set_system_prompt("real prompt");
+
+        // 非临时 System 不存在 → 插到最前；ephemeral nudge 保留原。
+        let msgs = s.chat_messages();
+        assert_eq!(msgs.len(), 3);
+        assert!(
+            matches!(&msgs[0], ChatMessage::System { content, ephemeral: false } if content == "real prompt")
+        );
+        assert!(matches!(&msgs[1], ChatMessage::System { ephemeral: true, .. }));
+        assert!(matches!(&msgs[2], ChatMessage::User { .. }));
     }
 
     #[test]

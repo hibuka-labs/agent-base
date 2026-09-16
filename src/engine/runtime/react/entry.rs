@@ -158,6 +158,37 @@ impl RuntimeCore {
     where
         F: FnMut(RuntimeEvent) -> AgentResult<()> + Send + 'static,
     {
+        self.run_turn_impl(session_id, user_input, false, on_event).await
+    }
+
+    /// Like `run_turn`, but the user input is pushed as an **ephemeral**
+    /// message: the LLM sees it for this turn only, then the existing
+    /// turn-end cleanup removes it from memory and persistence. Used for
+    /// skill-body injection. Note: the turn leaves NO trace in conversation
+    /// history — neither the body nor any command (hosts that need a trail
+    /// keep it in their own turn log).
+    pub async fn run_turn_ephemeral_input<F>(
+        &self,
+        session_id: SessionId,
+        user_input: &str,
+        on_event: F,
+    ) -> AgentResult<RunOutcome>
+    where
+        F: FnMut(RuntimeEvent) -> AgentResult<()> + Send + 'static,
+    {
+        self.run_turn_impl(session_id, user_input, true, on_event).await
+    }
+
+    async fn run_turn_impl<F>(
+        &self,
+        session_id: SessionId,
+        user_input: &str,
+        ephemeral_input: bool,
+        on_event: F,
+    ) -> AgentResult<RunOutcome>
+    where
+        F: FnMut(RuntimeEvent) -> AgentResult<()> + Send + 'static,
+    {
         // Reset cancel token for this turn
         self.reset_cancel();
 
@@ -201,7 +232,11 @@ impl RuntimeCore {
 
         if let Err(e) = self
             .with_session_mut(&session_id, |session| {
-                session.push_message(MessageRole::User, &user_input_owned);
+                if ephemeral_input {
+                    session.push_message_ephemeral(MessageRole::User, &user_input_owned);
+                } else {
+                    session.push_message(MessageRole::User, &user_input_owned);
+                }
             })
             .await
         {

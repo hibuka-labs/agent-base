@@ -121,6 +121,12 @@ impl AgentRuntime {
         self.runner.config.blocking_read()
     }
 
+    /// Snapshot the configured system prompt (async — safe to call inside a
+    /// runtime, unlike [`Self::config`]).
+    pub async fn system_prompt(&self) -> Option<String> {
+        self.runner.config.read().await.system_prompt.clone()
+    }
+
     /// 设置 reasoning effort（异步版本）
     pub async fn set_reasoning_effort(&self, effort: crate::llm::ReasoningEffort) {
         let mut config = self.runner.config.write().await;
@@ -200,6 +206,22 @@ impl AgentRuntime {
         self.runner.run_turn(session_id, user_input, on_event).await
     }
 
+    /// Like `run_turn`, but the user input is pushed as an ephemeral message:
+    /// visible to the LLM for this turn only, auto-removed at turn end.
+    pub async fn run_turn_ephemeral_input<F>(
+        &self,
+        session_id: SessionId,
+        user_input: &str,
+        on_event: F,
+    ) -> AgentResult<RunOutcome>
+    where
+        F: FnMut(RuntimeEvent) -> AgentResult<()> + Send + 'static,
+    {
+        self.runner
+            .run_turn_ephemeral_input(session_id, user_input, on_event)
+            .await
+    }
+
     pub async fn run_turn_collect(
         &self,
         session_id: SessionId,
@@ -216,6 +238,20 @@ impl AgentRuntime {
         let text = text.into();
         self.with_session_mut(session_id, |session| {
             session.push_message(MessageRole::User, &text);
+        })
+        .await
+    }
+
+    /// Replace the session's system prompt (the first non-ephemeral System
+    /// message). Hosts that own prompt composition re-bake through this.
+    pub async fn set_system_prompt(
+        &self,
+        session_id: &SessionId,
+        prompt: impl Into<String>,
+    ) -> AgentResult<()> {
+        let prompt = prompt.into();
+        self.with_session_mut(session_id, |session| {
+            session.set_system_prompt(prompt);
         })
         .await
     }
