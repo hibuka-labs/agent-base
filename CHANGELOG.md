@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-18
+
+### Added
+- **`RepeatToolLimitMiddleware`** + `RepeatToolLimitConfig`: breaks repeated
+  identical tool-call loops (e.g. polling) with a configurable nudge→block
+  escalation (default nudge at 5, block at 10).
+- **Ephemeral-input turns** + session prompt surgery for skill injection:
+  `ChatMessage::User` gains `ephemeral: bool` for one-shot context that is
+  stripped after the LLM turn; `AgentRuntime::inject_prompt()` splices content
+  into the session at Continue points.
+
+### Fixed
+- Scope `MutexGuard` in tests to avoid holding across await points (clippy).
+- Exclude `fuzz/` from published crate.
+
 ## [0.6.0] - 2026-09-11
 
 ### Added
