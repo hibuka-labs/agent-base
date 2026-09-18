@@ -258,7 +258,7 @@ impl AgentSession {
                 // to a regular push rather than silently mis-marking.
                 self.push_message(role, content);
                 return;
-            },
+            }
         };
         self.chat_messages.push(chat_msg);
     }
@@ -269,11 +269,15 @@ impl AgentSession {
     /// own prompt composition (e.g. skill activation) re-bake through this.
     pub fn set_system_prompt(&mut self, content: impl Into<String>) {
         let content = content.into();
-        if let Some(idx) = self
-            .chat_messages
-            .iter()
-            .position(|m| matches!(m, ChatMessage::System { ephemeral: false, .. }))
-        {
+        if let Some(idx) = self.chat_messages.iter().position(|m| {
+            matches!(
+                m,
+                ChatMessage::System {
+                    ephemeral: false,
+                    ..
+                }
+            )
+        }) {
             self.chat_messages[idx] = ChatMessage::system(content);
         } else {
             self.chat_messages.insert(0, ChatMessage::system(content));
@@ -812,7 +816,9 @@ mod tests {
             matches!(&msgs[0], ChatMessage::System { content, ephemeral: false } if content == "new prompt")
         );
         assert!(matches!(&msgs[1], ChatMessage::User { content, .. } if content == "hi"));
-        assert!(matches!(&msgs[2], ChatMessage::Assistant { content: Some(c), .. } if c == "hello"));
+        assert!(
+            matches!(&msgs[2], ChatMessage::Assistant { content: Some(c), .. } if c == "hello")
+        );
     }
 
     #[test]
@@ -824,7 +830,9 @@ mod tests {
 
         let msgs = s.chat_messages();
         assert_eq!(msgs.len(), 2);
-        assert!(matches!(&msgs[0], ChatMessage::System { content, ephemeral: false } if content == "fresh prompt"));
+        assert!(
+            matches!(&msgs[0], ChatMessage::System { content, ephemeral: false } if content == "fresh prompt")
+        );
         assert!(matches!(&msgs[1], ChatMessage::User { .. }));
     }
 
@@ -843,7 +851,13 @@ mod tests {
         assert!(
             matches!(&msgs[0], ChatMessage::System { content, ephemeral: false } if content == "real prompt")
         );
-        assert!(matches!(&msgs[1], ChatMessage::System { ephemeral: true, .. }));
+        assert!(matches!(
+            &msgs[1],
+            ChatMessage::System {
+                ephemeral: true,
+                ..
+            }
+        ));
         assert!(matches!(&msgs[2], ChatMessage::User { .. }));
     }
 

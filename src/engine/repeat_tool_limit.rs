@@ -94,9 +94,7 @@ impl RepeatToolLimitMiddleware {
     fn bump(&self, session_id: &SessionId, fingerprint: &str) -> usize {
         let mut counts = self.counts.lock().unwrap();
         let session_counts = counts.entry(session_id.clone()).or_default();
-        let entry = session_counts
-            .entry(fingerprint.to_string())
-            .or_insert(0);
+        let entry = session_counts.entry(fingerprint.to_string()).or_insert(0);
         *entry += 1;
         *entry
     }
@@ -170,9 +168,7 @@ mod tests {
             tool_calls: calls
                 .into_iter()
                 .enumerate()
-                .map(|(i, (name, args))| {
-                    (format!("call_{i}"), name.to_string(), args.to_string())
-                })
+                .map(|(i, (name, args))| (format!("call_{i}"), name.to_string(), args.to_string()))
                 .collect(),
             available_tools: vec![],
             turn_count: 1,
@@ -200,20 +196,14 @@ mod tests {
             call(
                 &mw,
                 1,
-                vec![
-                    ("list_agents", "{}"),
-                    ("read_file", r#"{"path":"a.rs"}"#),
-                ],
+                vec![("list_agents", "{}"), ("read_file", r#"{"path":"a.rs"}"#)],
             )
             .await;
         }
         // 5th identical list_agents → nudge.
         let mut c = ctx(
             1,
-            vec![
-                ("list_agents", "{}"),
-                ("read_file", r#"{"path":"b.rs"}"#),
-            ],
+            vec![("list_agents", "{}"), ("read_file", r#"{"path":"b.rs"}"#)],
         );
         mw.on_post_llm(&mut c).await.unwrap();
         assert!(c.follow_up_message.is_some(), "5th identical call nudges");
@@ -245,10 +235,7 @@ mod tests {
         }
         let mut c = ctx(
             1,
-            vec![
-                ("list_agents", "{}"),
-                ("read_file", r#"{"path":"x"}"#),
-            ],
+            vec![("list_agents", "{}"), ("read_file", r#"{"path":"x"}"#)],
         );
         mw.on_post_llm(&mut c).await.unwrap();
         assert!(c.tool_calls.is_empty(), "pending calls discarded");

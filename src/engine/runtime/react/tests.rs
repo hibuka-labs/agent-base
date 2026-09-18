@@ -3352,7 +3352,11 @@ async fn ephemeral_turn_body_removed_after_turn_plain_turn_keeps_it() {
     let result = runtime
         .run_turn_ephemeral_input(sid.clone(), &skill_body(), |_| Ok(()))
         .await;
-    assert!(result.is_ok(), "ephemeral turn should complete: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "ephemeral turn should complete: {:?}",
+        result.err()
+    );
 
     let session = runtime.session(&sid).await.expect("session exists");
     let messages = session.chat_messages().to_vec();
@@ -3387,7 +3391,8 @@ async fn ephemeral_turn_body_removed_after_turn_plain_turn_keeps_it() {
 /// duplicate bodies — each request sees it exactly once, session ends clean.
 #[tokio::test]
 async fn repeated_ephemeral_turns_do_not_accumulate_body() {
-    let provider = RecordingScriptedProvider::new(vec![plain_text_response(), plain_text_response()]);
+    let provider =
+        RecordingScriptedProvider::new(vec![plain_text_response(), plain_text_response()]);
     let runtime = AgentBuilder::new(provider.clone())
         .system_prompt("test")
         .build()
@@ -3398,24 +3403,29 @@ async fn repeated_ephemeral_turns_do_not_accumulate_body() {
         let result = runtime
             .run_turn_ephemeral_input(sid.clone(), &skill_body(), |_| Ok(()))
             .await;
-        assert!(result.is_ok(), "ephemeral turn should complete: {:?}", result.err());
-    }
-
-    let requests = provider.requests.lock().unwrap();
-    assert_eq!(requests.len(), 2, "two turns → two LLM requests");
-    for (i, req) in requests.iter().enumerate() {
-        let body_count = req
-            .iter()
-            .filter(|m| {
-                matches!(m, ChatMessage::User { content, .. } if content.contains(SKILL_BODY_MARKER))
-            })
-            .count();
-        assert_eq!(
-            body_count, 1,
-            "request {i}: body must appear exactly once (no residue from earlier turns)"
+        assert!(
+            result.is_ok(),
+            "ephemeral turn should complete: {:?}",
+            result.err()
         );
     }
-    drop(requests);
+
+    {
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2, "two turns → two LLM requests");
+        for (i, req) in requests.iter().enumerate() {
+            let body_count = req
+                .iter()
+                .filter(|m| {
+                    matches!(m, ChatMessage::User { content, .. } if content.contains(SKILL_BODY_MARKER))
+                })
+                .count();
+            assert_eq!(
+                body_count, 1,
+                "request {i}: body must appear exactly once (no residue from earlier turns)"
+            );
+        }
+    }
 
     let session = runtime.session(&sid).await.expect("session exists");
     assert!(session.chat_messages().iter().all(|m| !m.is_ephemeral()));

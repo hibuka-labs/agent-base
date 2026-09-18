@@ -158,7 +158,8 @@ impl RuntimeCore {
     where
         F: FnMut(RuntimeEvent) -> AgentResult<()> + Send + 'static,
     {
-        self.run_turn_impl(session_id, user_input, false, on_event).await
+        self.run_turn_impl(session_id, user_input, false, on_event)
+            .await
     }
 
     /// Like `run_turn`, but the user input is pushed as an **ephemeral**
@@ -176,7 +177,8 @@ impl RuntimeCore {
     where
         F: FnMut(RuntimeEvent) -> AgentResult<()> + Send + 'static,
     {
-        self.run_turn_impl(session_id, user_input, true, on_event).await
+        self.run_turn_impl(session_id, user_input, true, on_event)
+            .await
     }
 
     async fn run_turn_impl<F>(
