@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agent-base"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "agent-types 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "anyhow",

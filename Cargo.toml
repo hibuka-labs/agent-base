@@ -4,7 +4,7 @@ exclude = ["fuzz"]
 
 [package]
 name = "agent-base"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 description = "A lightweight Agent Runtime Kernel for building AI agents in Rust"
 license = "MIT"
