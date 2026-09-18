@@ -6,7 +6,7 @@ pub mod max_turns_nudge;
 mod middleware;
 mod pipeline;
 pub mod react_loop_guard;
-
+pub mod repeat_tool_limit;
 mod recovery;
 mod runtime;
 mod safety;
@@ -44,3 +44,4 @@ pub use max_turns_nudge::{MaxTurnsNudgeConfig, MaxTurnsNudgeMiddleware};
 pub use session_store::SqliteSessionStore;
 pub use tool_enforcement::{ToolEnforcementConfig, ToolEnforcementMiddleware};
 pub use turn_facts::TurnFactMiddleware;
+pub use repeat_tool_limit::{RepeatToolLimitConfig, RepeatToolLimitMiddleware};
