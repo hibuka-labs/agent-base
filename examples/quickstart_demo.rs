@@ -150,6 +150,7 @@ impl ToolPolicy for HealthCheckPolicy {
                     risk_level: RiskLevel::Sensitive,
                     action_key: Some(format!("restart:{}", service)),
                     raw: None,
+                    source: None,
                 })
             }
             _ => None,

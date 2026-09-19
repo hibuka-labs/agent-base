@@ -947,6 +947,7 @@ mod tests {
                 action_key: Some(format!("approve:{tool_name}")),
                 risk_level: RiskLevel::Sensitive,
                 raw: None,
+                source: None,
             })
         }
     }

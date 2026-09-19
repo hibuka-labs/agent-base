@@ -77,6 +77,7 @@ mod tests {
             action_key: Some("delete".to_string()),
             risk_level: RiskLevel::Destructive,
             raw: None,
+            source: None,
         }
     }
 

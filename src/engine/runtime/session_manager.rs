@@ -451,6 +451,30 @@ mod tests {
         assert!(m.cached_approval(&id, "read_file").await);
     }
 
+    /// D4 不变式：AllowAlways 缓存键控在 (session_id, action_key)——子 agent
+    /// 的 "always" 授权绝不泄漏到父/兄弟 session（子 agent 持独立 session_id）。
+    #[tokio::test]
+    async fn approval_cache_is_scoped_per_session() {
+        let m = manager();
+        let parent = m.create_session(None).await;
+        let child = m.create_session(None).await;
+        m.cache_approval(&child, "write_file:src/x.rs".to_string())
+            .await;
+        assert!(
+            m.cached_approval(&child, "write_file:src/x.rs").await,
+            "同 session 命中"
+        );
+        assert!(
+            !m.cached_approval(&parent, "write_file:src/x.rs").await,
+            "跨 session 必须未命中（子 always 不影响父）"
+        );
+        let sibling = m.create_session(None).await;
+        assert!(
+            !m.cached_approval(&sibling, "write_file:src/x.rs").await,
+            "跨 session 必须未命中（子 always 不影响兄弟）"
+        );
+    }
+
     #[tokio::test]
     async fn save_session_persists_to_store() {
         let store = Arc::new(InMemorySessionStore::new());

@@ -133,6 +133,7 @@ impl ToolPolicy for DenyAllToolPolicy {
             action_key: None,
             risk_level: RiskLevel::Destructive,
             raw: None,
+            source: None,
         })
     }
 }

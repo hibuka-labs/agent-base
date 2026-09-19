@@ -222,6 +222,7 @@ mod tests {
             action_key: None,
             risk_level: RiskLevel::Safe,
             raw: None,
+            source: None,
         }
     }
 

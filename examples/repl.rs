@@ -245,6 +245,7 @@ impl ToolPolicy for ArithmeticToolPolicy {
                 action_key: Some("divide".to_string()),
                 risk_level: RiskLevel::Safe,
                 raw: None,
+                source: None,
             });
         }
         None
