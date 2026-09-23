@@ -77,6 +77,16 @@ impl ToolEngine {
             .unwrap_or(false)
     }
 
+    /// The named tool's input schema, or `None` when the tool is unknown.
+    /// Read-only sibling of [`Self::tool_requires_params`] for callers that
+    /// need the full schema — e.g. the react truncation guard's markup
+    /// salvage, which validates required fields and coerces recovered
+    /// argument values by declared type.
+    pub async fn tool_schema(&self, name: &str) -> Option<Value> {
+        let guard = self.tools.read().await;
+        guard.get(name).map(|t| t.schema())
+    }
+
     #[allow(dead_code, clippy::too_many_arguments)]
     pub async fn execute_tool<F>(
         &self,

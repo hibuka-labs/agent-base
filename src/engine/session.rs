@@ -318,6 +318,13 @@ impl AgentSession {
         ));
     }
 
+    /// 转义并截取参数前 `max_chars` 个字符，供截断 WARN 直接展示原始内容。
+    /// Rust debug 转义让未闭合 JSON、控制字符与 CJK 边界清晰可辨，线上
+    /// 排查 provider 截断时不必再间接还原线内容。
+    fn preview_args(args: &str, max_chars: usize) -> String {
+        format!("{:?}", args.chars().take(max_chars).collect::<String>())
+    }
+
     pub fn push_assistant_tool_calls(
         &mut self,
         tool_calls: &[(String, String, String)],
@@ -342,6 +349,7 @@ impl AgentSession {
                     tracing::warn!(
                         tool_name = %name,
                         args_len = args.len(),
+                        args_preview = %Self::preview_args(args, 80),
                         "tool call arguments are not valid JSON (provider truncated them), \
                          sanitizing to empty object; re-issue instruction goes to the tool_result"
                     );
@@ -1594,6 +1602,28 @@ mod proptest_tests {
                 assert_eq!(tc[0].arguments, "{}");
             } else {
                 panic!("expected Assistant with tool_calls");
+            }
+        }
+
+        #[test]
+        fn preview_args_escapes_and_caps_at_max_chars(payload in "[a-z\u{4e00}-\u{9fff}\n\t]{0,400}") {
+            // 截断 WARN 的 args_preview：按字符截取（不是字节），控制字符以
+            // debug 形式转义（每个输入字符最多膨胀为 2 个字符），长度封顶在
+            // min(80, len) * 2 + 成对引号。
+            let preview = AgentSession::preview_args(&payload, 80);
+            let expected_cap = 2 * payload.chars().count().min(80) + 2;
+            assert!(
+                preview.chars().count() <= expected_cap,
+                "preview must cap at escaped length plus quotes: {preview}"
+            );
+            if payload.contains('\n') || payload.contains('\t') {
+                assert!(
+                    preview.contains("\\n") || preview.contains("\\t"),
+                    "control chars must be escaped: {preview}"
+                );
+            }
+            if payload.chars().count() <= 80 && !payload.contains('\n') && !payload.contains('\t') {
+                assert_eq!(preview, format!("{payload:?}"));
             }
         }
 

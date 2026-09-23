@@ -1,4 +1,5 @@
 mod entry;
+mod text_toolcall;
 mod tools;
 mod turn_dispatch;
 mod turn_end;

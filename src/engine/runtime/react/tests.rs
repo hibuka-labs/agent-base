@@ -499,6 +499,190 @@ async fn truncation_guard_blocks_tool_calls_on_finish_tool_calls_mimo() {
 }
 
 #[tokio::test]
+async fn truncation_guard_salvages_call_from_leaked_text_markup() {
+    // mimo-v2.6-flash (session 20260923_263149bf) emits the SAME tool call on
+    // two channels: the native tool_call argument stream dies mid-JSON with a
+    // bogus "stop" finish, while the content channel leaks the chat-template
+    // markup carrying the full parameter values. The guard must harvest the
+    // leaked copy (name match + schema-valid) and EXECUTE it, not burn a
+    // re-issue strike — the re-issue truncated again on the real session.
+    let leaked = "我来派一个子代理。<tool_call><function=spawn_agent>\
+<parameter=task_name>research<parameter=message>只读调研 codex，不改文件。";
+    let runtime = AgentBuilder::new(Arc::new(ScriptedProvider::new(vec![
+        vec![
+            StreamChunk::Text(leaked.to_string()),
+            StreamChunk::ToolCall(serde_json::json!({
+                "delta": {
+                    "tool_calls": [{
+                        "id": "call_leak_1",
+                        "function": {
+                            "name": "spawn_agent",
+                            "arguments": "{\"task_name\":\"res"
+                        }
+                    }]
+                }
+            })),
+            StreamChunk::Stop {
+                finish_reason: Some("stop".to_string()),
+            },
+        ],
+        vec![
+            StreamChunk::Text("Should never be reached.".to_string()),
+            StreamChunk::Stop {
+                finish_reason: Some("stop".to_string()),
+            },
+        ],
+    ])))
+    .system_prompt("You are a careful assistant.")
+    .register_tool(SpawnLikeTool)
+    .build()
+    .expect("build runtime");
+
+    let sid = runtime.create_session().await;
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    let result = runtime
+        .run_turn(sid.clone(), "spawn a sub-agent", move |event| {
+            events_clone.lock().unwrap().push(event);
+            Ok(())
+        })
+        .await;
+    assert!(
+        result.is_ok(),
+        "run_turn should complete: {:?}",
+        result.err()
+    );
+
+    let session = runtime.session(&sid).await.expect("session exists");
+    let messages = session.chat_messages().to_vec();
+
+    // The salvaged call must have executed exactly once.
+    let spawned_count = messages
+        .iter()
+        .filter(|m| {
+            if let ChatMessage::Tool { content, .. } = m {
+                content.contains("spawned")
+            } else {
+                false
+            }
+        })
+        .count();
+    assert_eq!(
+        spawned_count, 1,
+        "leaked call must be salvaged and executed. Messages: {:#?}",
+        messages
+            .iter()
+            .map(|m| format!("{:?}", m))
+            .collect::<Vec<_>>()
+    );
+
+    // No re-issue guidance, and no ToolArgsInvalid death-spiral residue.
+    let bad = messages.iter().any(|m| {
+        if let ChatMessage::Tool { content, .. } = m {
+            content.contains("Tool call was not executed")
+                || content.contains("argument parsing failed")
+                || content.contains("EOF while parsing")
+        } else {
+            false
+        }
+    });
+    assert!(
+        !bad,
+        "salvaged call must not surface re-issue guidance or parse failure. Messages: {:#?}",
+        messages
+            .iter()
+            .map(|m| format!("{:?}", m))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn salvage_rejects_leak_missing_required_field() {
+    // A leak that omits a schema-required field must NOT be salvaged: executing
+    // it would fail typed parsing (ToolArgsInvalid — the death-spiral trigger).
+    // The call stays on the re-issue path instead.
+    let leaked = "<tool_call><function=spawn_agent><parameter=task_name>research</tool_call>";
+    let runtime = AgentBuilder::new(Arc::new(ScriptedProvider::new(vec![
+        vec![
+            StreamChunk::Text(leaked.to_string()),
+            StreamChunk::ToolCall(serde_json::json!({
+                "delta": {
+                    "tool_calls": [{
+                        "id": "call_leak_2",
+                        "function": {
+                            "name": "spawn_agent",
+                            "arguments": "{\"task_name\":\"res"
+                        }
+                    }]
+                }
+            })),
+            StreamChunk::Stop {
+                finish_reason: Some("stop".to_string()),
+            },
+        ],
+        vec![
+            StreamChunk::Text("Re-issuing with complete arguments.".to_string()),
+            StreamChunk::Stop {
+                finish_reason: Some("stop".to_string()),
+            },
+        ],
+    ])))
+    .system_prompt("You are a careful assistant.")
+    .register_tool(SpawnLikeTool)
+    .build()
+    .expect("build runtime");
+
+    let sid = runtime.create_session().await;
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    let result = runtime
+        .run_turn(sid.clone(), "spawn a sub-agent", move |event| {
+            events_clone.lock().unwrap().push(event);
+            Ok(())
+        })
+        .await;
+    assert!(
+        result.is_ok(),
+        "run_turn should complete: {:?}",
+        result.err()
+    );
+
+    let session = runtime.session(&sid).await.expect("session exists");
+    let messages = session.chat_messages().to_vec();
+
+    let executed = messages.iter().any(|m| {
+        if let ChatMessage::Tool { content, .. } = m {
+            content.contains("spawned")
+        } else {
+            false
+        }
+    });
+    assert!(
+        !executed,
+        "incomplete leak must not execute. Messages: {:#?}",
+        messages
+            .iter()
+            .map(|m| format!("{:?}", m))
+            .collect::<Vec<_>>()
+    );
+    let has_reissue = messages.iter().any(|m| {
+        if let ChatMessage::Tool { content, .. } = m {
+            content.contains("Tool call was not executed")
+        } else {
+            false
+        }
+    });
+    assert!(
+        has_reissue,
+        "incomplete leak must fall back to re-issue guidance. Messages: {:#?}",
+        messages
+            .iter()
+            .map(|m| format!("{:?}", m))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
 async fn truncation_guard_recognizes_wrapper_echo() {
     // mimo, having seen a `{error:"tool_call_arguments_truncated",...}` object
     // in its history, replays it VERBATIM as the next call's arguments. That
