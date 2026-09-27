@@ -137,7 +137,10 @@ pub fn build_arguments(call: &HarvestedCall, schema: Option<&Value>) -> Option<S
             .and_then(Value::as_str);
         obj.insert(key.clone(), coerce(raw, ty));
     }
-    if let Some(required) = schema.and_then(|s| s.get("required")).and_then(Value::as_array) {
+    if let Some(required) = schema
+        .and_then(|s| s.get("required"))
+        .and_then(Value::as_array)
+    {
         for field in required.iter().filter_map(Value::as_str) {
             if !obj.contains_key(field) {
                 return None;
@@ -155,15 +158,16 @@ fn coerce(raw: &str, ty: Option<&str>) -> Value {
             .unwrap_or_else(|_| Value::String(raw.to_string())),
         Some("number") => raw
             .parse::<f64>()
-            .map(|n| Value::from(n as f64))
+            .map(Value::from)
             .unwrap_or_else(|_| Value::String(raw.to_string())),
         Some("boolean") => match raw {
             "true" => Value::Bool(true),
             "false" => Value::Bool(false),
             _ => Value::String(raw.to_string()),
         },
-        Some("object") | Some("array") => serde_json::from_str(raw)
-            .unwrap_or_else(|_| Value::String(raw.to_string())),
+        Some("object") | Some("array") => {
+            serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
+        }
         _ => Value::String(raw.to_string()),
     }
 }

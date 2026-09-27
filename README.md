@@ -61,7 +61,7 @@ agent-base = "0.2.1"
 
 ```toml
 [dependencies]
-agent-base = { version = "0.2.1", features = ["sqlite-session"] }
+agent-base = { version = "0.8.0", features = ["sqlite-session"] }
 ```
 
 ## Quick Start

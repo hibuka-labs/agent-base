@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-27
+
+### Added
+- **Truncated tool-call salvage** (`react/text_toolcall.rs`): recovers tool calls
+  leaked into the text channel as template markup (parameter-style, closing tag
+  optional, and Hermes JSON blocks) when native tool-call args are truncated
+  mid-stream. `build_arguments()` validates schema-required fields and coerces
+  scalar types; the truncation guard salvages per-call by name before strike
+  accounting — recovered args execute instead of burning a re-issue strike.
+  Skipped under `finish_reason=length`; schema-invalid leaks keep the re-issue
+  path. `tool_engine::tool_schema()` read accessor; truncation WARN logs now
+  carry an `args_preview` (first 80 chars, debug-escaped).
+- **`ApprovalRequest.source`** (`agent-types` 0.2.0): optional requesting-agent
+  path (e.g. `root/coder-1`); legacy callers leave it `None` and old JSON
+  deserializes unchanged (`#[serde(default)]`). `SourcedApprovalHandler` fills it
+  from `ctx.agent_path`.
+- **Per-session approval cache isolation**: the allow-always cache is scoped per
+  session — a child's "always" no longer leaks to the parent or siblings.
+
+### Changed
+- Bump `agent-types` to 0.2.0 (adds `ApprovalRequest.source`; struct-literal
+  construction sites must add the field).
+
 ## [0.7.0] - 2026-09-18
 
 ### Added

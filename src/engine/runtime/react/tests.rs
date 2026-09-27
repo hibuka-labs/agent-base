@@ -568,7 +568,8 @@ async fn truncation_guard_salvages_call_from_leaked_text_markup() {
         })
         .count();
     assert_eq!(
-        spawned_count, 1,
+        spawned_count,
+        1,
         "leaked call must be salvaged and executed. Messages: {:#?}",
         messages
             .iter()
