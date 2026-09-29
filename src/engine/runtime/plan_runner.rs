@@ -1,5 +1,5 @@
 use std::sync::{Arc, Mutex, RwLock as StdRwLock};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::engine::context::{ContextCompaction, ContextWindowManager};
@@ -36,6 +36,10 @@ pub(crate) struct RuntimeCore {
     pub(crate) guard: Arc<dyn ReactLoopGuard>,
     /// Optional inline context compactor (e.g., agent-works ContextCompactor).
     pub(crate) context_compactor: Option<Arc<dyn ContextCompaction>>,
+    /// Engine notice channel receiver end. The pump (drain_notices) forwards
+    /// pending notices into the event stream at run end; the sender side is
+    /// cloned out to guards via `ReactLoopGuard::set_notice`.
+    pub(crate) notice_rx: Mutex<mpsc::UnboundedReceiver<crate::types::Notice>>,
 }
 
 impl RuntimeCore {
@@ -52,6 +56,12 @@ impl RuntimeCore {
         guard: Option<Arc<dyn ReactLoopGuard>>,
         context_compactor: Option<Arc<dyn ContextCompaction>>,
     ) -> Self {
+        // Engine notice channel (Batch E): guards get the sender via
+        // set_notice; drain_notices forwards pending notices at run end.
+        let (notice_tx, notice_rx) = mpsc::unbounded_channel::<crate::types::Notice>();
+        if let Some(guard) = &guard {
+            guard.set_notice(crate::engine::runtime::NoticeHandle::new(notice_tx));
+        }
         Self {
             config: Arc::new(RwLock::new(config)),
             llm_engine,
@@ -66,6 +76,7 @@ impl RuntimeCore {
             convert_to_llm,
             guard: guard.unwrap_or_else(|| Arc::new(NoopGuard)),
             context_compactor,
+            notice_rx: Mutex::new(notice_rx),
         }
     }
 

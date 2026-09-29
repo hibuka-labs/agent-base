@@ -49,6 +49,9 @@ impl RuntimeCore {
     {
         // Reset cancel token for this run
         self.reset_cancel();
+        // Notice pump (Batch E): drop leftovers from before this run so they
+        // can never be stamped with this run's session id.
+        self.discard_pending_notices();
 
         let span = tracing::info_span!("agent_run", session_id = session_id.id);
         let _enter = span.enter();
@@ -105,6 +108,10 @@ impl RuntimeCore {
             )
             .await;
 
+        // Notice pump (Batch E): deliver pending notices before any
+        // terminal event (RunFinished / RunCancelled), on every exit path.
+        self.drain_notices(&session_id, &on_event)?;
+
         // Emit RunCancelled if cancelled, RunFinished otherwise (same as run_turn)
         match &result {
             Ok((RunOutcome::Cancelled, _)) => {
@@ -126,6 +133,10 @@ impl RuntimeCore {
                 }
             }
             _ => {
+                // Notice pump (Batch E): deliver guard/mechanism notices
+                // before the terminal event. Pure addition — no existing
+                // branch is touched.
+                self.drain_notices(&session_id, &on_event)?;
                 self.event_bus.emit(RuntimeEvent::RunFinished {
                     session_id: session_id.clone(),
                     agent_id: None,
@@ -193,6 +204,9 @@ impl RuntimeCore {
     {
         // Reset cancel token for this turn
         self.reset_cancel();
+        // Notice pump (Batch E): drop leftovers from before this run so they
+        // can never be stamped with this run's session id.
+        self.discard_pending_notices();
 
         let span = tracing::Span::current();
         let _guard = span.enter();
@@ -278,6 +292,10 @@ impl RuntimeCore {
             )
             .await;
 
+        // Notice pump (Batch E): deliver pending notices before any
+        // terminal event (RunFinished / RunCancelled), on every exit path.
+        self.drain_notices(&session_id, &on_event)?;
+
         // Emit RunCancelled event if cancelled
         match &result {
             Ok((RunOutcome::Cancelled, _)) => {
@@ -318,6 +336,9 @@ impl RuntimeCore {
             Ok(tuple) => {
                 // The loop no longer emits RunFinished on completion; emit it
                 // here once so listeners see a single terminal event.
+                // Notice pump (Batch E): deliver guard/mechanism notices
+                // before the terminal event. Pure addition.
+                self.drain_notices(&session_id, &on_event)?;
                 self.event_bus.emit(RuntimeEvent::RunFinished {
                     session_id: session_id.clone(),
                     agent_id: None,
@@ -375,6 +396,9 @@ impl RuntimeCore {
     {
         // Reset cancel token for this resume
         self.reset_cancel();
+        // Notice pump (Batch E): drop leftovers from before this run so they
+        // can never be stamped with this run's session id.
+        self.discard_pending_notices();
 
         let session_id = checkpoint.session_id.clone();
         let user_input = checkpoint.user_input.clone();
@@ -427,6 +451,10 @@ impl RuntimeCore {
                 &all_user_inputs,
             )
             .await;
+
+        // Notice pump (Batch E): deliver pending notices before any
+        // terminal event (RunFinished / RunCancelled), on every exit path.
+        self.drain_notices(&session_id, &on_event)?;
 
         // Emit RunCancelled if cancelled, same as run_turn
         match &result {
@@ -496,6 +524,9 @@ impl RuntimeCore {
     {
         // Reset cancel token for this managed run
         self.reset_cancel();
+        // Notice pump (Batch E): drop leftovers from before this run so they
+        // can never be stamped with this run's session id.
+        self.discard_pending_notices();
 
         let span = tracing::info_span!("agent_managed_run", session_id = session_id.id);
         let _enter = span.enter();
@@ -572,6 +603,10 @@ impl RuntimeCore {
                 )
                 .await;
 
+            // Notice pump (Batch E): deliver pending notices before any
+            // terminal event (RunFinished / RunCancelled), on every exit path.
+            self.drain_notices(&session_id, &on_event)?;
+
             // Emit RunCancelled if cancelled
             let is_cancelled = matches!(&result, Err(e) if e.is_cancelled());
             if is_cancelled {
@@ -628,6 +663,9 @@ impl RuntimeCore {
         }
 
         // Emit RunFinished
+        // Notice pump (Batch E): deliver guard/mechanism notices
+        // before the terminal event. Pure addition.
+        self.drain_notices(&session_id, &on_event)?;
         self.event_bus.emit(RuntimeEvent::RunFinished {
             session_id: session_id.clone(),
             agent_id: None,

@@ -13,6 +13,7 @@ mod checkpoint;
 mod execution;
 mod guard;
 mod message;
+mod notify;
 mod plan;
 mod session;
 mod tool;
@@ -22,6 +23,7 @@ pub use checkpoint::{CheckpointData, CheckpointStep, ToolResultData};
 pub use execution::{FinishReason, RunOutcome};
 pub use guard::{GuardCtx, GuardDecision};
 pub use message::MessageRole;
+pub use notify::{Notice, NoticeKind};
 pub use plan::{PlanItem, PlanStepStatus, UpdatePlanArgs};
 pub use session::SessionId;
 pub use tool::{

@@ -16,6 +16,7 @@ mod event_bus;
 pub(crate) use event_bus::EventBus;
 mod llm_engine;
 mod message_queue;
+mod notify;
 mod plan_runner;
 mod react;
 mod session_manager;
@@ -25,6 +26,7 @@ pub(super) const DEFAULT_MAX_TURNS: u32 = 160;
 
 pub use llm_engine::LlmEngine;
 pub use message_queue::QueueMode;
+pub use notify::NoticeHandle;
 pub(crate) use plan_runner::RuntimeCore;
 pub use session_manager::SessionManager;
 pub(crate) use tool_engine::ToolEngine;

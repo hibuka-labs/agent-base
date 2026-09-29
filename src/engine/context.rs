@@ -491,7 +491,10 @@ mod proptest_tests {
                 !trigger.contains("compaction"),
                 "{kind:?} trigger log must not claim compaction: {trigger}"
             );
-            assert!(kind.completion_log().is_none(), "{kind:?} append is atomic — no completion line");
+            assert!(
+                kind.completion_log().is_none(),
+                "{kind:?} append is atomic — no completion line"
+            );
         }
         // ...while a real replacement must say compaction.
         let reset = CompactionKind::Reset;

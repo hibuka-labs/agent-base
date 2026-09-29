@@ -3,6 +3,8 @@ use async_trait::async_trait;
 // Re-export from agent-types (single source of truth).
 pub use agent_types::{GuardCtx, GuardDecision};
 
+use crate::engine::runtime::NoticeHandle;
+
 /// React Loop Guard trait — single unified entry point.
 ///
 /// Runtime builds GuardCtx (with scene hints), guard decides what to do.
@@ -24,6 +26,13 @@ pub trait ReactLoopGuard: Send + Sync {
     async fn on_tool_call(&self, _ctx: &GuardCtx) -> GuardDecision {
         GuardDecision::Complete
     }
+
+    /// Receive the engine's notice handle (Batch E). Called once by the
+    /// runtime when the guard is registered, before any run starts. Guards
+    /// that want to surface display-only notices (e.g. judge degradation)
+    /// store the handle; the default implementation ignores it, so existing
+    /// implementers are unaffected.
+    fn set_notice(&self, _handle: NoticeHandle) {}
 }
 
 /// Default guard — fails on degenerate states, completes on normal flow.

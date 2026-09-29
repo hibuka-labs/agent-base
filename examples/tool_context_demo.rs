@@ -491,6 +491,9 @@ async fn main() -> AgentResult<()> {
                                 serde_json::to_string_pretty(&data).unwrap_or_default()
                             );
                         }
+                        UserEvent::Notice { kind, source, text } => {
+                            println!("  🔔 [Notice] {:?}/{source}: {text}", kind);
+                        }
                     },
                     RuntimeEvent::RunFinished { .. }
                         if assistant_started_clone.load(std::sync::atomic::Ordering::Relaxed) =>

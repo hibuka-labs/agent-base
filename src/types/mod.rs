@@ -19,6 +19,7 @@ pub use config::{
 pub use error::{AgentError, AgentResult, ErrorKind};
 pub use finish_reason::FinishReason;
 
+pub use agent_types::{Notice, NoticeKind};
 pub use events::{RuntimeEvent, UserEvent};
 pub use message::{
     ChatMessage, ConvertToLlmFn, ImageAttachment, ImageDetail, Message, MessageRole,

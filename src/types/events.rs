@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use agent_types::NoticeKind;
+
 use super::approval::ApprovalRequest;
 use super::checkpoint::CheckpointData;
 use super::plan_update::PlanItem;
@@ -28,6 +30,15 @@ pub enum UserEvent {
         tool_call_id: String,
         content: String,
         is_partial: bool,
+    },
+    /// Display-only notice from an engine mechanism (guard degradation,
+    /// reaper, ...). `text` is a mechanism-level English fact; product layers
+    /// may rewrite it per `source`. `source` is a `String` (not `&'static str`)
+    /// because `UserEvent` must deserialize across process boundaries.
+    Notice {
+        kind: NoticeKind,
+        source: String,
+        text: String,
     },
 }
 
@@ -444,5 +455,43 @@ mod tests {
         .unwrap();
         assert_eq!(v["userEventType"], "structured");
         assert_eq!(v["data"]["k"], serde_json::json!(1));
+    }
+
+    // Design doc §9: UserEvent::Notice serialization tag + serde round-trip
+    // (source must be String — &'static str cannot deserialize).
+    #[test]
+    fn user_event_notice_serde_round_trip() {
+        let ev = UserEvent::Notice {
+            kind: NoticeKind::Warning,
+            source: "guard".into(),
+            text: "guard judge unparsed — treating as complete".into(),
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["userEventType"], "notice");
+        assert_eq!(v["kind"], serde_json::json!("warning"));
+        assert_eq!(v["source"], serde_json::json!("guard"));
+        assert_eq!(
+            v["text"],
+            serde_json::json!("guard judge unparsed — treating as complete")
+        );
+
+        let back: UserEvent = serde_json::from_value(v).unwrap();
+        match back {
+            UserEvent::Notice { kind, source, text } => {
+                assert_eq!(kind, NoticeKind::Warning);
+                assert_eq!(source, "guard");
+                assert_eq!(text, "guard judge unparsed — treating as complete");
+            }
+            other => panic!("expected Notice, got {other:?}"),
+        }
+    }
+
+    // Design doc §11: old JSONL replay — a Notice serialized elsewhere must
+    // deserialize cleanly alongside existing variants (serde is add-only).
+    #[test]
+    fn notice_coexists_with_legacy_variants_on_replay() {
+        let json = r#"{"userEventType":"progress","text":"legacy line"}"#;
+        let back: UserEvent = serde_json::from_str(json).unwrap();
+        assert!(matches!(back, UserEvent::Progress { .. }));
     }
 }
