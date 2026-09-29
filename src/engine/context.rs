@@ -187,6 +187,50 @@ fn is_cjk(c: char) -> bool {
 
 // ── Inline Context Compaction ──────────────────────────────────────────────
 
+/// What a successful [`ContextCompaction::compact`] actually did to the
+/// history. agent-base stays strategy-free: it only relays the kind into
+/// the log line, so a nudge append never reads as a compaction and a real
+/// replacement always does (issue #33).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionKind {
+    /// One budget nudge appended at the end; prior messages untouched.
+    Reminder,
+    /// Last-turn nudge appended; prior messages untouched.
+    Fallback,
+    /// Messages replaced wholesale (window rotation or compression).
+    Reset,
+}
+
+impl CompactionKind {
+    /// The grep-able log line emitted when the compactor returns this kind.
+    /// The three strings are deliberately distinct: a Reminder/Fallback append
+    /// must NOT contain "compaction" (nothing was compacted — one message was
+    /// appended), while a Reset must (the history was replaced).
+    pub fn trigger_log(self) -> &'static str {
+        match self {
+            Self::Reminder => "context reminder appended",
+            Self::Fallback => "context fallback appended",
+            Self::Reset => "inline compaction triggered",
+        }
+    }
+
+    /// The completion log line, emitted after the compactor's messages are
+    /// installed. `None` for appends — they are atomic, there is nothing to
+    /// complete, and a second line would only invite misreading.
+    pub fn completion_log(self) -> Option<&'static str> {
+        match self {
+            Self::Reminder | Self::Fallback => None,
+            Self::Reset => Some("inline compaction completed (window reset)"),
+        }
+    }
+}
+
+/// Successful compaction outcome: what happened plus the messages to install.
+pub struct CompactionOutcome {
+    pub kind: CompactionKind,
+    pub messages: Vec<ChatMessage>,
+}
+
 /// Trait for inline context compaction within the react loop.
 ///
 /// Implemented by agent-works's `ContextCompactor`. agent-base defines
@@ -199,8 +243,9 @@ fn is_cjk(c: char) -> bool {
 pub trait ContextCompaction: Send + Sync {
     /// Compact a message history.
     ///
-    /// Takes the current messages and returns `Some(compacted_messages)` if
-    /// compaction was performed. Returns `None` if compaction was skipped
+    /// Takes the current messages and returns `Some(outcome)` if an action
+    /// was performed — the outcome carries the action kind (for logging) and
+    /// the messages to install. Returns `None` if compaction was skipped
     /// (below threshold, too few messages, or disabled).
     ///
     /// The react loop handles reading/writing the session — the compactor
@@ -209,7 +254,7 @@ pub trait ContextCompaction: Send + Sync {
         &self,
         session_id: &SessionId,
         messages: &[ChatMessage],
-    ) -> Option<Vec<ChatMessage>>;
+    ) -> Option<CompactionOutcome>;
 
     /// Estimate current token count for the session.
     ///
@@ -431,5 +476,47 @@ mod proptest_tests {
                 assert!(total_after <= total_before);
             }
         }
+    }
+
+    // ── CompactionKind log dispatch (issue #33) ──
+
+    #[test]
+    fn compaction_kind_log_lines_are_grep_able() {
+        use super::{CompactionKind, CompactionOutcome};
+
+        // A nudge append must never read as a compaction in the log...
+        for kind in [CompactionKind::Reminder, CompactionKind::Fallback] {
+            let trigger = kind.trigger_log();
+            assert!(
+                !trigger.contains("compaction"),
+                "{kind:?} trigger log must not claim compaction: {trigger}"
+            );
+            assert!(kind.completion_log().is_none(), "{kind:?} append is atomic — no completion line");
+        }
+        // ...while a real replacement must say compaction.
+        let reset = CompactionKind::Reset;
+        assert!(reset.trigger_log().contains("compaction"));
+        let completion = reset.completion_log().expect("reset has a completion line");
+        assert!(completion.contains("compaction"));
+
+        // The three kinds are distinguishable by grep in session.log.
+        let all = [
+            CompactionKind::Reminder.trigger_log(),
+            CompactionKind::Fallback.trigger_log(),
+            reset.trigger_log(),
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for b in all.iter().skip(i + 1) {
+                assert_ne!(a, b, "trigger log lines must be distinct");
+            }
+        }
+
+        // Outcome struct: kind + messages travel together.
+        let outcome = CompactionOutcome {
+            kind: CompactionKind::Reminder,
+            messages: vec![ChatMessage::user("nudge")],
+        };
+        assert_eq!(outcome.kind, CompactionKind::Reminder);
+        assert_eq!(outcome.messages.len(), 1);
     }
 }

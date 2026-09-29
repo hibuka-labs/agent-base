@@ -2358,6 +2358,59 @@ async fn turn_end_callback_receives_correct_context() {
     assert_eq!(ctx.user_input.as_str(), "question");
 }
 
+/// A tool-call turn carrying reasoning must record `thinking_bytes > 0` in
+/// the turn-end context. Regression for issue #32: `run_tool_turn`'s
+/// TurnEndCtx constructions passed `has_thinking` but dropped
+/// `thinking_bytes`, so every tool-call turn recorded 0 while the stream
+/// result carried the reasoning (session 20260927_4180845c: 14,370 bytes
+/// recorded vs 387,710 streamed — a 27x undercount).
+#[tokio::test]
+async fn turn_end_tool_call_turn_records_thinking_bytes() {
+    let reasoning = "why the echo tool, and with what text";
+    let runtime = AgentBuilder::new(Arc::new(ScriptedProvider::new(vec![
+        vec![
+            StreamChunk::Thought(reasoning.to_string()),
+            StreamChunk::ToolCall(serde_json::json!({
+                "delta": { "tool_calls": [
+                    { "index": 0, "id": "call_1", "function": { "name": "echo", "arguments": "{\"text\":\"hi\"}" } }
+                ] }
+            })),
+            StreamChunk::Stop {
+                finish_reason: Some("tool_calls".to_string()),
+            },
+        ],
+        text_script("done")[0].clone(),
+    ])))
+    .system_prompt("test")
+    .register_tool(EchoTool)
+    .build()
+    .expect("build runtime");
+
+    let captured = Arc::new(Mutex::new(Vec::<TurnContext>::new()));
+    let captured_clone = captured.clone();
+    runtime.on_turn_end(move |ctx| {
+        captured_clone.lock().unwrap().push(ctx.clone());
+    });
+
+    let sid = runtime.create_session().await;
+    let result = runtime.run_turn(sid.clone(), "do the thing", |_| Ok(())).await;
+    assert!(matches!(result, Ok(RunOutcome::Completed)));
+
+    let contexts = captured.lock().unwrap();
+    assert_eq!(contexts.len(), 2, "tool turn + final answer turn");
+    let tool_turn = &contexts[0];
+    assert!(tool_turn.has_thinking, "tool turn saw the reasoning");
+    assert_eq!(
+        tool_turn.thinking_bytes,
+        reasoning.len() as u64,
+        "tool-call turn must record the reasoning byte count"
+    );
+    // Acceptance check from the issue, in-process: over the whole session,
+    // recorded thinking_bytes equals the streamed reasoning bytes.
+    let recorded: u64 = contexts.iter().map(|c| c.thinking_bytes).sum();
+    assert_eq!(recorded, reasoning.len() as u64);
+}
+
 #[tokio::test]
 async fn run_turn_text_only_event_order() {
     let runtime = AgentBuilder::new(Arc::new(ScriptedProvider::new(text_script("answer"))))

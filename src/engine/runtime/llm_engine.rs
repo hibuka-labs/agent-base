@@ -882,6 +882,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn process_stream_keeps_reasoning_on_tool_call_turns() {
+        // Issue #32 regression anchor at the stream-result boundary: a turn
+        // that carries both Thought chunks and a tool call must keep the
+        // reasoning text in the result. `thinking_bytes` is derived from this
+        // string (same UTF-8 byte source as the `reasoning_len` log field),
+        // so an empty reasoning_text here is what zeroed the metric on every
+        // tool-call turn (session 20260927_4180845c: 27x undercount).
+        let bus = EventBus::new(16);
+        let engine = LlmEngine::new(Arc::new(StubProvider("x")), bus.clone());
+        let chunks = vec![
+            Ok(StreamChunk::Thought("why this tool, now".into())),
+            Ok(StreamChunk::ToolCall(serde_json::json!({
+                "delta": { "tool_calls": [
+                    { "index": 0, "id": "call_1", "function": { "name": "shell", "arguments": "{}" } }
+                ] }
+            }))),
+            Ok(StreamChunk::Thought("...and what it should do".into())),
+            Ok(StreamChunk::Stop {
+                finish_reason: Some("tool_calls".to_string()),
+            }),
+        ];
+        let stream = Box::pin(futures_util::stream::iter(chunks));
+        let mut rx = bus.subscribe();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let result = engine
+            .process_stream(
+                &SessionId::new(1),
+                stream,
+                tracing::Span::none(),
+                &mut rx,
+                std::sync::Arc::new(std::sync::Mutex::new(|_e| Ok(()))),
+                &cancel,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_tool_call);
+        assert!(!result.reasoning_only);
+        assert_eq!(
+            result.reasoning_text,
+            "why this tool, now...and what it should do"
+        );
+        // UTF-8 bytes — the unit `thinking_bytes` reports downstream.
+        assert_eq!(
+            result.reasoning_text.len(),
+            "why this tool, now".len() + "...and what it should do".len()
+        );
+    }
+
+    #[tokio::test]
     async fn process_stream_propagates_error() {
         let bus = EventBus::new(16);
         let engine = LlmEngine::new(Arc::new(StubProvider("x")), bus.clone());

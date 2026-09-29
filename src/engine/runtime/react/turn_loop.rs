@@ -361,27 +361,31 @@ impl RuntimeCore {
                         if let Some(msgs) = messages {
                             let token_count: usize =
                                 msgs.iter().map(ContextWindowManager::message_tokens).sum();
-                            if let Some(compacted) = compactor.compact(session_id, &msgs).await {
+                            if let Some(outcome) = compactor.compact(session_id, &msgs).await {
+                                // One grep-able line per action kind (issue #33):
+                                // a nudge append must never read as a compaction —
+                                // only a real replacement may. agent-base stays
+                                // strategy-free and merely relays the kind.
                                 tracing::info!(
                                     session_id = session_id.id,
                                     turn = turn_count,
                                     token_count,
-                                    "inline compaction triggered"
+                                    "{}",
+                                    outcome.kind.trigger_log()
                                 );
                                 self.with_session_mut(session_id, |session| {
-                                    if let Err(e) = session.set_chat_messages(compacted) {
+                                    if let Err(e) = session.set_chat_messages(outcome.messages) {
                                         tracing::warn!(
                                             session_id = session_id.id,
                                             error = %e,
-                                            "compaction produced invalid message sequence, discarding"
+                                            "compactor output rejected: invalid message sequence, discarding"
                                         );
                                     }
                                 })
                                 .await?;
-                                tracing::info!(
-                                    session_id = session_id.id,
-                                    "inline compaction completed"
-                                );
+                                if let Some(done) = outcome.kind.completion_log() {
+                                    tracing::info!(session_id = session_id.id, "{}", done);
+                                }
                             }
                         }
                     }
