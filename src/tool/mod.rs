@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use crate::engine::SessionStore;
-use crate::types::{AgentError, AgentResult, SessionId, UserEvent};
+use crate::types::{AgentError, AgentResult, RuntimeEvent, SessionId, UserEvent};
 
 pub mod auto_continue;
 pub mod policy;
@@ -47,8 +47,20 @@ pub struct ToolContext {
 
 impl ToolContext {
     /// Send a user-space event (progress, sub-agent forwarding, structured data).
+    ///
+    /// Dual-write: the event goes to `user_event_tx` (the tool select arm
+    /// renders it in real time) and to the event bus for external subscribers
+    /// (bridge remote clients, persistence). The bus copy carries `agent_id:
+    /// None` — the self-echo marker — so bus loopback drops it instead of
+    /// re-rendering (see `crate::engine::runtime::is_self_echo_user_event`).
     pub fn emit_user_event(&self, event: UserEvent) {
-        let _ = self.user_event_tx.send(event);
+        let _ = self.user_event_tx.send(event.clone());
+        self.event_bus.emit(RuntimeEvent::UserEvent {
+            session_id: self.session_id.clone(),
+            event,
+            agent_id: None,
+            trace_id: None,
+        });
     }
 
     /// Convenience: send a progress event with text.
@@ -532,6 +544,48 @@ mod tests {
                 assert!(is_partial);
             }
             other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    // Dual-write contract (Batch E follow-up): a tool UserEvent must reach
+    // event_bus subscribers (bridge remote clients, persistence) as well as the
+    // per-call user_event channel — and the bus copy must carry `agent_id: None`,
+    // the self-echo marker that tells bus loopback not to re-render it (see
+    // `engine::event_bus::is_self_echo_user_event`).
+    #[test]
+    fn emit_user_event_dual_writes_to_event_bus() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let ctx = ToolContext {
+            session_id: SessionId::new(7),
+            user_event_tx: tx,
+            llm_client: None,
+            session_store: None,
+            language: crate::types::Language::En,
+            cancel_token: tokio_util::sync::CancellationToken::new(),
+            max_output_chars: None,
+            event_bus: crate::engine::EventBus::new(4),
+        };
+        let mut bus_rx = ctx.event_bus.subscribe();
+        ctx.emit_progress("working");
+
+        // Direct channel still gets the event (real-time tool select arm).
+        assert!(
+            matches!(rx.try_recv().unwrap(), UserEvent::Progress { text } if text == "working")
+        );
+
+        // Bus copy for external subscribers, stamped and marked self-echo.
+        match bus_rx.try_recv().unwrap() {
+            crate::types::RuntimeEvent::UserEvent {
+                session_id,
+                event,
+                agent_id,
+                ..
+            } => {
+                assert_eq!(session_id, SessionId::new(7));
+                assert!(matches!(event, UserEvent::Progress { text } if text == "working"));
+                assert!(agent_id.is_none());
+            }
+            other => panic!("unexpected bus event: {other:?}"),
         }
     }
 

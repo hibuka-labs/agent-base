@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
 use crate::engine::middleware::UserMessageCtx;
+use crate::engine::runtime::is_self_echo_user_event;
 use crate::engine::runtime::plan_runner::RuntimeCore;
 use crate::types::{
     AgentResult, CheckpointData, CheckpointStep, MessageRole, RunOutcome, RuntimeEvent, SessionId,
@@ -10,6 +11,10 @@ use crate::types::{
 
 /// Drain events from a `broadcast::Receiver` and invoke a `Mutex<FnMut>` callback
 /// for each one.
+///
+/// Run-local `UserEvent` self-echoes (see
+/// [`is_self_echo_user_event`](crate::engine::runtime::is_self_echo_user_event))
+/// are dropped — the publisher already rendered them to `on_event`.
 pub(super) fn drain_locked<F>(
     event_rx: &mut broadcast::Receiver<RuntimeEvent>,
     on_event: &Mutex<F>,
@@ -36,6 +41,9 @@ where
         && let Ok(mut cb) = on_event.lock()
     {
         for ev in events {
+            if is_self_echo_user_event(&ev) {
+                continue;
+            }
             cb(ev)?;
         }
     }

@@ -249,15 +249,17 @@ impl LlmEngine {
         let mut aggregator = StreamAggregator::new();
         tracing::info!(session_id = session_id.id, "LLM process_stream start");
 
-        // Skip UserEvents that were already rendered by ctx.emit() during middleware
-        // execution (compression Progress/Started/Completed). ctx.emit() sends to
-        // both the renderer callback and the event bus — the bus copy arrives here
-        // and must be skipped to avoid double-rendering.
+        // Sweep self-echo UserEvent copies (dual-written by ctx.emit() during
+        // middleware — compression Progress/Started/Completed) before the main
+        // loop starts: they were already rendered to on_event and must not
+        // double-render here. Run-local echoes are recognized by
+        // `is_self_echo_user_event`; bridged child events (agent_id: Some) are
+        // bus-only and get delivered like any other event.
         loop {
             match event_rx.try_recv() {
-                Ok(RuntimeEvent::UserEvent { .. }) => continue,
+                Ok(event) if crate::engine::runtime::is_self_echo_user_event(&event) => continue,
                 Ok(event) => {
-                    // Non-UserEvent (e.g. Checkpoint) — push back by processing
+                    // Non-echo (e.g. Checkpoint) — push back by processing
                     // and let the main loop handle the next ones normally.
                     if let Ok(mut cb) = on_event.lock() {
                         cb(event)?;
@@ -274,6 +276,12 @@ impl LlmEngine {
                 recv_result = event_rx.recv() => {
                     match recv_result {
                         Ok(event) => {
+                            // Same dual-write rule as the sweep above: a
+                            // run-local UserEvent copy that slipped in mid-stream
+                            // must not re-render; everything else flows.
+                            if crate::engine::runtime::is_self_echo_user_event(&event) {
+                                continue;
+                            }
                             if let Ok(mut cb) = on_event.lock() {
                                 cb(event)?;
                             }

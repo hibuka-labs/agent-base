@@ -3778,6 +3778,335 @@ async fn notice_pump_stamps_and_delivers_guard_notice_before_run_finished() {
     );
 }
 
+// ── Bus visibility / dual-write (Batch E follow-up) ─────────────────────────
+// The pump dual-writes: notices and tool UserEvents also reach
+// `subscribe_runtime_events()` consumers (bridge remote clients), while
+// on_event sees each exactly once — the bus copy is a self-echo
+// (`agent_id: None`) that bus loopback must skip.
+
+#[tokio::test]
+async fn notice_is_published_to_event_bus_for_external_subscribers() {
+    use crate::types::{NoticeKind, UserEvent};
+
+    let guard = Arc::new(NoticeSendingGuard::new());
+    let runtime = AgentBuilder::new(Arc::new(ScriptedProvider::new(vec![vec![
+        StreamChunk::Text("All done.".to_string()),
+        StreamChunk::Stop {
+            finish_reason: Some("stop".to_string()),
+        },
+    ]])))
+    .guard_dyn(guard.clone())
+    .build()
+    .expect("build runtime");
+
+    let sid = runtime.create_session().await;
+    let mut bus_rx = runtime.subscribe_runtime_events();
+
+    runtime
+        .run_turn(sid.clone(), "do the thing", |_| Ok(()))
+        .await
+        .expect("run ok");
+
+    let bus_events: Vec<RuntimeEvent> = std::iter::from_fn(|| bus_rx.try_recv().ok()).collect();
+    let notices: Vec<&RuntimeEvent> = bus_events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                RuntimeEvent::UserEvent {
+                    event: UserEvent::Notice { .. },
+                    ..
+                }
+            )
+        })
+        .collect();
+    assert_eq!(
+        notices.len(),
+        1,
+        "exactly one notice on the event bus, got: {bus_events:?}"
+    );
+    assert!(
+        matches!(
+            notices[0],
+            RuntimeEvent::UserEvent {
+                session_id,
+                event: UserEvent::Notice { kind, source, text },
+                agent_id: None,
+                ..
+            } if *session_id == sid
+                && *kind == NoticeKind::Warning
+                && source == "guard"
+                && text == "judge unparsed — treating as complete"
+        ),
+        "bus copy must be session-stamped with agent_id: None (self-echo marker): {:?}",
+        notices[0]
+    );
+}
+
+#[tokio::test]
+async fn notice_reaches_on_event_exactly_once_despite_bus_loopback() {
+    use crate::types::UserEvent;
+
+    let guard = Arc::new(NoticeSendingGuard::new());
+    let runtime = AgentBuilder::new(Arc::new(ScriptedProvider::new(vec![vec![
+        StreamChunk::Text("All done.".to_string()),
+        StreamChunk::Stop {
+            finish_reason: Some("stop".to_string()),
+        },
+    ]])))
+    .guard_dyn(guard.clone())
+    .build()
+    .expect("build runtime");
+
+    let sid = runtime.create_session().await;
+    let events: Arc<Mutex<Vec<RuntimeEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    runtime
+        .run_turn(sid.clone(), "do the thing", move |event| {
+            events_clone.lock().unwrap().push(event);
+            Ok(())
+        })
+        .await
+        .expect("run ok");
+
+    let delivered = events.lock().unwrap().clone();
+    let notice_count = delivered
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                RuntimeEvent::UserEvent {
+                    event: UserEvent::Notice { text, .. },
+                    ..
+                } if text == "judge unparsed — treating as complete"
+            )
+        })
+        .count();
+    assert_eq!(
+        notice_count, 1,
+        "dual-write must not double-render the notice through bus loopback: {delivered:?}"
+    );
+}
+
+/// Tool stub that emits one progress UserEvent during execution.
+struct ProgressEmittingTool;
+
+#[async_trait]
+impl Tool for ProgressEmittingTool {
+    fn name(&self) -> &'static str {
+        "progress_tool"
+    }
+
+    fn description(&self) -> &'static str {
+        "Emits a progress user event"
+    }
+
+    fn schema(&self) -> Value {
+        serde_json::json!({ "type": "object", "properties": {} })
+    }
+
+    async fn call(&self, _args: &Value, ctx: &ToolContext) -> AgentResult<Vec<Content>> {
+        ctx.emit_progress("halfway");
+        Ok(vec![Content::text("done")])
+    }
+}
+
+#[tokio::test]
+async fn tool_user_event_dual_write_reaches_bus_and_renders_once() {
+    use crate::types::UserEvent;
+
+    let runtime = AgentBuilder::new(Arc::new(ScriptedProvider::new(vec![
+        vec![
+            StreamChunk::ToolCall(serde_json::json!({
+                "delta": {
+                    "tool_calls": [{
+                        "id": "call_prog_1",
+                        "function": { "name": "progress_tool", "arguments": "{}" }
+                    }]
+                }
+            })),
+            StreamChunk::Stop {
+                finish_reason: Some("tool_calls".to_string()),
+            },
+        ],
+        vec![
+            StreamChunk::Text("All done.".to_string()),
+            StreamChunk::Stop {
+                finish_reason: Some("stop".to_string()),
+            },
+        ],
+    ])))
+    .register_tool(ProgressEmittingTool)
+    .build()
+    .expect("build runtime");
+
+    let sid = runtime.create_session().await;
+    let mut bus_rx = runtime.subscribe_runtime_events();
+    let events: Arc<Mutex<Vec<RuntimeEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    runtime
+        .run_turn(sid.clone(), "run the tool", move |event| {
+            events_clone.lock().unwrap().push(event);
+            Ok(())
+        })
+        .await
+        .expect("run ok");
+
+    let is_progress = |e: &RuntimeEvent| {
+        matches!(
+            e,
+            RuntimeEvent::UserEvent {
+                event: UserEvent::Progress { text },
+                agent_id: None,
+                ..
+            } if text == "halfway"
+        )
+    };
+
+    let delivered = events.lock().unwrap().clone();
+    let rendered = delivered.iter().filter(|e| is_progress(e)).count();
+    assert_eq!(
+        rendered, 1,
+        "tool UserEvent must render on_event exactly once: {delivered:?}"
+    );
+
+    let bus_events: Vec<RuntimeEvent> = std::iter::from_fn(|| bus_rx.try_recv().ok()).collect();
+    let published = bus_events.iter().filter(|e| is_progress(e)).count();
+    assert_eq!(
+        published, 1,
+        "tool UserEvent must appear on the event bus exactly once: {bus_events:?}"
+    );
+}
+
+// ── Turn-boundary drain ────────────────────────────────────────────────────
+// A notice sent at turn N's `on_turn` must reach the consumer at the turn
+// boundary — before turn N+1 emits anything — not only at the terminal drain.
+
+/// Sends one notice on its first `on_turn` and keeps the run alive
+/// (`Continue`); completes on the second turn so the run ends cleanly.
+struct TurnBoundaryGuard {
+    handle: Mutex<Option<crate::engine::runtime::NoticeHandle>>,
+    turns: Mutex<usize>,
+}
+
+impl TurnBoundaryGuard {
+    fn new() -> Self {
+        Self {
+            handle: Mutex::new(None),
+            turns: Mutex::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl crate::engine::ReactLoopGuard for TurnBoundaryGuard {
+    async fn on_turn(&self, _ctx: &agent_types::GuardCtx) -> agent_types::GuardDecision {
+        let mut turns = self.turns.lock().unwrap();
+        *turns += 1;
+        if *turns == 1 {
+            if let Some(h) = self.handle.lock().unwrap().as_ref() {
+                h.send(
+                    crate::types::NoticeKind::Warning,
+                    "guard",
+                    "turn one notice",
+                );
+            }
+            agent_types::GuardDecision::Continue { nudge: None }
+        } else {
+            agent_types::GuardDecision::Complete
+        }
+    }
+
+    fn set_notice(&self, handle: crate::engine::runtime::NoticeHandle) {
+        *self.handle.lock().unwrap() = Some(handle);
+    }
+}
+
+#[tokio::test]
+async fn notice_sent_mid_run_is_delivered_at_turn_boundary_not_terminal_drain() {
+    use crate::types::{NoticeKind, UserEvent};
+
+    let guard = Arc::new(TurnBoundaryGuard::new());
+    let runtime = AgentBuilder::new(Arc::new(ScriptedProvider::new(vec![
+        vec![
+            StreamChunk::Text("turn one.".to_string()),
+            StreamChunk::Stop {
+                finish_reason: Some("stop".to_string()),
+            },
+        ],
+        vec![
+            StreamChunk::Text("turn two.".to_string()),
+            StreamChunk::Stop {
+                finish_reason: Some("stop".to_string()),
+            },
+        ],
+    ])))
+    .guard_dyn(guard.clone())
+    .build()
+    .expect("build runtime");
+
+    let sid = runtime.create_session().await;
+    let events: Arc<Mutex<Vec<RuntimeEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    runtime
+        .run_turn(sid.clone(), "start", move |event| {
+            events_clone.lock().unwrap().push(event);
+            Ok(())
+        })
+        .await
+        .expect("run ok");
+
+    let delivered = events.lock().unwrap().clone();
+    let notice_pos = delivered
+        .iter()
+        .position(|e| {
+            matches!(
+                e,
+                RuntimeEvent::UserEvent {
+                    event: UserEvent::Notice { text, .. },
+                    ..
+                } if text == "turn one notice"
+            )
+        })
+        .expect("notice must be delivered");
+    let turn_two_pos = delivered
+        .iter()
+        .position(
+            |e| matches!(e, RuntimeEvent::TextDelta { text, .. } if text.contains("turn two")),
+        )
+        .expect("turn two must stream");
+
+    // Turn-boundary semantics: the turn-1 notice lands before turn 2 emits.
+    assert!(
+        notice_pos < turn_two_pos,
+        "turn-1 notice ({notice_pos}) must arrive before turn-2 events ({turn_two_pos})"
+    );
+    // ...and the pump stamps it with the run's session id.
+    assert!(
+        matches!(
+            &delivered[notice_pos],
+            RuntimeEvent::UserEvent { session_id, .. } if *session_id == sid
+        ),
+        "notice must be stamped with the run's session id"
+    );
+    // Belt and braces: the run really was multi-turn (the boundary exists).
+    assert!(
+        matches!(
+            delivered
+                .iter()
+                .find(|e| matches!(e, RuntimeEvent::UserEvent { .. })),
+            Some(RuntimeEvent::UserEvent {
+                event: UserEvent::Notice {
+                    kind: NoticeKind::Warning,
+                    ..
+                },
+                ..
+            })
+        ),
+        "the delivered user event is the warning notice"
+    );
+}
+
 // ── Pump terminal-path coverage (review fixes) ────────────────────────────
 // Every terminal event (RunFinished / RunCancelled, Ok or Err) must be
 // preceded by a notice drain, and a notice sent outside a run must never be

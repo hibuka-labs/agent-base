@@ -13,7 +13,7 @@ use super::approval::ApprovalHandler;
 use crate::tool::ToolPolicy;
 
 mod event_bus;
-pub(crate) use event_bus::EventBus;
+pub(crate) use event_bus::{EventBus, is_self_echo_user_event};
 mod llm_engine;
 mod message_queue;
 mod notify;
@@ -70,6 +70,17 @@ impl AgentRuntime {
             .await
     }
 
+    /// Publish an event on the internal event bus.
+    ///
+    /// Events land on the bus: external subscribers (`subscribe_runtime_events`)
+    /// receive them, and the run's own bus loopback delivers them to the
+    /// `on_event` callback — **except** `UserEvent`s with `agent_id: None`,
+    /// which are treated as self-echoes of events the run already rendered
+    /// (see [`is_self_echo_user_event`]). Run-local `UserEvent`s should be
+    /// published through the dual-write APIs (`PreLlmCtx::emit`,
+    /// `ToolContext::emit_user_event`, `NoticeHandle`/the notice pump) instead;
+    /// events bridged from a child agent (`with_agent_id`) reach the renderer
+    /// through this method and its loopback.
     pub fn emit_event(&self, event: RuntimeEvent) {
         self.runner.event_bus.emit(event);
     }

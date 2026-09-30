@@ -221,6 +221,13 @@ impl RuntimeCore {
 
             drain_locked(event_rx, &on_event)?;
 
+            // Turn-boundary notice drain: a notice sent during the previous
+            // turn (guard degradation at `on_turn`, ...) is delivered here —
+            // before this turn emits anything — instead of waiting for the
+            // terminal drain. Pure synchronous call, no select-arm wiring
+            // (the fan-in loops stay untouched).
+            self.drain_notices(session_id, &on_event)?;
+
             let turn_span =
                 tracing::info_span!("turn", session_id = session_id.id, turn = turn_count);
             let _turn_guard = turn_span.enter();
@@ -271,16 +278,19 @@ impl RuntimeCore {
                 )
                 .await?;
 
-            // Drain UserEvent copies from event_rx that were written by
-            // ctx.emit() during middleware.  These were already delivered to
-            // on_event directly; leaving them in the bus would cause
+            // Sweep self-echo UserEvent copies from event_rx — dual-written by
+            // ctx.emit() (and other run-local publishers) whose direct on_event
+            // copy was already rendered. Leaving them in the bus would cause
             // double-rendering in process_stream or orphaning on error paths
-            // (e.g. LLM call fails before process_stream runs).
+            // (e.g. LLM call fails before process_stream runs). Bridged child
+            // events (agent_id: Some) are bus-only and are delivered normally.
             loop {
                 match event_rx.try_recv() {
-                    Ok(RuntimeEvent::UserEvent { .. }) => continue,
+                    Ok(event) if crate::engine::runtime::is_self_echo_user_event(&event) => {
+                        continue;
+                    }
                     Ok(event) => {
-                        // Non-UserEvent — deliver it (e.g. Checkpoint from
+                        // Non-echo — deliver it (e.g. Checkpoint from
                         // middleware that only went through event_bus.emit).
                         if let Ok(mut cb) = on_event.lock() {
                             cb(event)?;

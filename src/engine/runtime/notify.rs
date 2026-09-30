@@ -4,15 +4,18 @@
 //! [`NoticeHandle`] and send display-only [`Notice`]s. The pump (see
 //! [`RuntimeCore::drain_notices`]) stamps each notice with the current
 //! session id and forwards it into the event stream as
-//! `RuntimeEvent::UserEvent { event: UserEvent::Notice { .. } }`.
+//! `RuntimeEvent::UserEvent { event: UserEvent::Notice { .. } }` — delivered
+//! to the run's `on_event` callback and dual-written to the event bus so
+//! external subscribers (bridge remote clients, persistence) see it too.
 //!
-//! Delivery is deliberately synchronous (try_recv drain when the react loop
-//! completes and before each terminal event) rather than a spawned task: the
-//! guard decides during the final turn of a run, so a synchronous drain
-//! guarantees the notice is delivered before `RunFinished`/`RunCancelled`
-//! with no task-scheduling races — and touches none of the fan-in select
-//! loops. Consequence: a `Progress` notice surfaces at loop completion, not
-//! in real time (turn-boundary drain points are future work).
+//! Delivery is deliberately synchronous (try_recv drain at turn boundaries
+//! and before each terminal event) rather than a spawned task: the guard
+//! decides at `on_turn`, so a synchronous drain at the turn boundary
+//! guarantees the notice is delivered before the next turn emits anything —
+//! and touches none of the fan-in select loops. Terminal drains
+//! (`RunFinished`/`RunCancelled`) cover whatever the boundary drain has not
+//! delivered yet. Consequence: a notice sent mid-turn (e.g. during tool
+//! execution) surfaces at the next turn boundary, not in real time.
 //!
 //! Lifecycle: the channel is created once per engine. Any notice still
 //! pending when a new run starts is discarded (`discard_pending_notices`) so
@@ -70,9 +73,11 @@ impl RuntimeCore {
     /// Drain pending notices, stamping each with `session_id` and delivering
     /// it to the run's event callback as a `UserEvent::Notice`.
     ///
-    /// Called after the react loop completes and before every terminal event
+    /// Called at turn boundaries (react loop, before the next turn emits) and
+    /// after the react loop completes / before every terminal event
     /// (`RunFinished`/`RunCancelled`) — a notice is therefore always
-    /// delivered before the terminal event on every exit path, Ok or Err.
+    /// delivered before the terminal event on every exit path, Ok or Err,
+    /// and mid-run notices surface at the next turn boundary.
     ///
     /// Display-only contract: a consumer callback error is logged and the
     /// notice dropped — it never fails the run nor blocks later notices.
@@ -96,11 +101,17 @@ impl RuntimeCore {
                 agent_id: None,
                 trace_id: None,
             };
+            // Dual-write: deliver to on_event for the local renderer, and emit
+            // to the event bus so external subscribers (bridge remote clients,
+            // persistence) see the notice too. The bus copy carries
+            // `agent_id: None` — the self-echo marker — so bus loopback drops
+            // it instead of re-rendering (see `is_self_echo_user_event`).
             if let Ok(mut cb) = on_event.lock()
-                && let Err(e) = cb(event)
+                && let Err(e) = cb(event.clone())
             {
-                tracing::warn!(error = %e, "notice consumer callback failed — dropping notice");
+                tracing::warn!(error = %e, "notice consumer callback failed — notice still published to the event bus");
             }
+            self.event_bus.emit(event);
         }
         Ok(())
     }
