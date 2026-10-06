@@ -355,7 +355,22 @@ impl LlmEngine {
                                     .get("index")
                                     .and_then(Value::as_u64)
                                     .unwrap_or(0) as usize;
+                                // Liveness for the drafting window: tool-call
+                                // args stream in as fragments and nothing else
+                                // is observable until the whole turn's stream
+                                // is drained — multi-KB calls (a spawn_agent
+                                // task brief) leave every consumer blind for
+                                // tens of seconds. Emit a coarse draft on each
+                                // slot's first fragment, on function-name
+                                // arrival, and on every 512-char args bucket —
+                                // never the text itself, and never per
+                                // fragment (the bus is a bounded broadcast).
+                                const DRAFT_ARGS_BUCKET: usize = 512;
+                                let fresh_slot = !aggregator.partials.contains_key(&idx);
+                                let before_args_len =
+                                    aggregator.partials.get(&idx).map(|e| e.2.len()).unwrap_or(0);
                                 let entry = aggregator.partials.entry(idx).or_insert_with(|| (String::new(), String::new(), String::new()));
+                                let mut named_now = false;
                                 if let Some(id) = tool_call.get("id").and_then(Value::as_str)
                                     && !id.is_empty() {
                                         entry.0 = id.to_string();
@@ -363,11 +378,26 @@ impl LlmEngine {
                                 if let Some(func) = tool_call.get("function") {
                                     if let Some(name) = func.get("name").and_then(Value::as_str)
                                         && !name.is_empty() {
+                                            named_now = entry.1.is_empty();
                                             entry.1 = name.to_string();
                                         }
                                     if let Some(args) = func.get("arguments").and_then(Value::as_str) {
                                         entry.2.push_str(args);
                                     }
+                                }
+                                let args_len = entry.2.len();
+                                let grew_bucket =
+                                    args_len / DRAFT_ARGS_BUCKET > before_args_len / DRAFT_ARGS_BUCKET;
+                                if fresh_slot || named_now || grew_bucket {
+                                    self.event_bus.emit(RuntimeEvent::ToolCallDraft {
+                                        session_id: session_id.clone(),
+                                        index: idx,
+                                        name: entry.1.clone(),
+                                        args_len,
+                                        count: aggregator.partials.len(),
+                                        agent_id: None,
+                                        trace_id: None,
+                                    });
                                 }
                             }
                         }
@@ -798,6 +828,90 @@ mod tests {
         assert_eq!(
             tc["function"]["arguments"].as_str(),
             Some("{\"cmd\":\"ls\"")
+        );
+    }
+
+    #[tokio::test]
+    async fn process_stream_emits_throttled_tool_call_drafts() {
+        // Tool-call args arrive as fragments and are invisible to every
+        // consumer until the stream drains — multi-KB briefs (spawn_agent)
+        // were a tens-of-seconds black hole (session 20261006_9264ba3e).
+        // The draft is the liveness signal: throttled to slot creation,
+        // name arrival and each 512-char args bucket — never per fragment,
+        // and never carrying the args themselves.
+        let bus = EventBus::new(16);
+        let engine = LlmEngine::new(Arc::new(StubProvider("x")), bus.clone());
+        let args_400 = "x".repeat(400);
+        let args_200 = "y".repeat(200);
+        let args_50 = "z".repeat(50);
+        let chunks = vec![
+            // Fresh slot + name → one draft.
+            Ok(StreamChunk::ToolCall(serde_json::json!({
+                "delta": { "tool_calls": [
+                    { "index": 0, "id": "call_1", "function": { "name": "spawn_agent", "arguments": args_400 } }
+                ] }
+            }))),
+            // +200 chars → crosses the 512 bucket → one draft.
+            Ok(StreamChunk::ToolCall(serde_json::json!({
+                "delta": { "tool_calls": [
+                    { "index": 0, "function": { "arguments": args_200 } }
+                ] }
+            }))),
+            // +50 chars → inside the same bucket → silent.
+            Ok(StreamChunk::ToolCall(serde_json::json!({
+                "delta": { "tool_calls": [
+                    { "index": 0, "function": { "arguments": args_50 } }
+                ] }
+            }))),
+            // Second call: fresh slot + name → one draft, count 2.
+            Ok(StreamChunk::ToolCall(serde_json::json!({
+                "delta": { "tool_calls": [
+                    { "index": 1, "id": "call_2", "function": { "name": "shell", "arguments": "{}" } }
+                ] }
+            }))),
+        ];
+        let stream = Box::pin(futures_util::stream::iter(chunks));
+        let mut rx = bus.subscribe();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events_clone = events.clone();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let result = engine
+            .process_stream(
+                &SessionId::new(1),
+                stream,
+                tracing::Span::none(),
+                &mut rx,
+                std::sync::Arc::new(std::sync::Mutex::new(move |e| {
+                    events_clone.lock().unwrap().push(e);
+                    Ok(())
+                })),
+                &cancel,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.tool_calls.len(), 2);
+
+        let events = events.lock().unwrap();
+        let drafts: Vec<(usize, String, usize, usize)> = events
+            .iter()
+            .filter_map(|e| match e {
+                RuntimeEvent::ToolCallDraft {
+                    index,
+                    name,
+                    args_len,
+                    count,
+                    ..
+                } => Some((*index, name.clone(), *args_len, *count)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            drafts,
+            vec![
+                (0, "spawn_agent".to_string(), 400, 1),
+                (0, "spawn_agent".to_string(), 600, 1),
+                (1, "shell".to_string(), 2, 2),
+            ]
         );
     }
 

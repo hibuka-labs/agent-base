@@ -70,6 +70,31 @@ pub enum RuntimeEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         trace_id: Option<String>,
     },
+    /// A tool call that is still being streamed into existence.
+    ///
+    /// Tool-call arguments arrive as fragments and are only materialized into
+    /// a [`RuntimeEvent::ToolCallStarted`] once the whole turn's stream is
+    /// drained — multi-KB arguments (a `spawn_agent` task brief) are invisible
+    /// to every consumer until then. This event makes that window observable:
+    /// coarse progress on the call being drafted (`index`), enough for a UI to
+    /// say "writing tool calls" instead of looking hung. It carries no
+    /// argument text, only a size, and is throttled at the source.
+    ToolCallDraft {
+        session_id: SessionId,
+        /// The call's stream index within this turn (its eventual tool-call
+        /// id is not known yet).
+        index: usize,
+        /// Function name, empty until the fragment carrying it arrives.
+        name: String,
+        /// Argument characters accumulated for this call so far.
+        args_len: usize,
+        /// How many calls this turn has produced so far (drafts included).
+        count: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trace_id: Option<String>,
+    },
     ToolCallStarted {
         session_id: SessionId,
         tool_name: String,
@@ -155,6 +180,7 @@ impl RuntimeEvent {
         match self {
             RuntimeEvent::TextDelta { session_id, .. } => session_id,
             RuntimeEvent::ThoughtDelta { session_id, .. } => session_id,
+            RuntimeEvent::ToolCallDraft { session_id, .. } => session_id,
             RuntimeEvent::ToolCallStarted { session_id, .. } => session_id,
             RuntimeEvent::ToolCallFinished { session_id, .. } => session_id,
             RuntimeEvent::AwaitingApproval { session_id, .. } => session_id,
@@ -171,6 +197,7 @@ impl RuntimeEvent {
         match self {
             RuntimeEvent::TextDelta { agent_id, .. } => agent_id.as_deref(),
             RuntimeEvent::ThoughtDelta { agent_id, .. } => agent_id.as_deref(),
+            RuntimeEvent::ToolCallDraft { agent_id, .. } => agent_id.as_deref(),
             RuntimeEvent::ToolCallStarted { agent_id, .. } => agent_id.as_deref(),
             RuntimeEvent::ToolCallFinished { agent_id, .. } => agent_id.as_deref(),
             RuntimeEvent::AwaitingApproval { agent_id, .. } => agent_id.as_deref(),
@@ -187,6 +214,7 @@ impl RuntimeEvent {
         match self {
             RuntimeEvent::TextDelta { trace_id, .. } => trace_id.as_deref(),
             RuntimeEvent::ThoughtDelta { trace_id, .. } => trace_id.as_deref(),
+            RuntimeEvent::ToolCallDraft { trace_id, .. } => trace_id.as_deref(),
             RuntimeEvent::ToolCallStarted { trace_id, .. } => trace_id.as_deref(),
             RuntimeEvent::ToolCallFinished { trace_id, .. } => trace_id.as_deref(),
             RuntimeEvent::AwaitingApproval { trace_id, .. } => trace_id.as_deref(),
@@ -204,6 +232,7 @@ impl RuntimeEvent {
         match &mut self {
             RuntimeEvent::TextDelta { agent_id, .. }
             | RuntimeEvent::ThoughtDelta { agent_id, .. }
+            | RuntimeEvent::ToolCallDraft { agent_id, .. }
             | RuntimeEvent::ToolCallStarted { agent_id, .. }
             | RuntimeEvent::ToolCallFinished { agent_id, .. }
             | RuntimeEvent::AwaitingApproval { agent_id, .. }
@@ -316,6 +345,15 @@ mod tests {
                 agent_id: Some("a".into()),
                 trace_id: Some("t".into()),
             },
+            RuntimeEvent::ToolCallDraft {
+                session_id: sid(11),
+                index: 0,
+                name: "spawn_agent".into(),
+                args_len: 512,
+                count: 1,
+                agent_id: Some("a".into()),
+                trace_id: Some("t".into()),
+            },
         ];
 
         for (i, ev) in events.iter().enumerate() {
@@ -396,6 +434,15 @@ mod tests {
                 agent_id: None,
                 trace_id: None,
             },
+            RuntimeEvent::ToolCallDraft {
+                session_id: sid(11),
+                index: 0,
+                name: "spawn_agent".into(),
+                args_len: 512,
+                count: 1,
+                agent_id: None,
+                trace_id: None,
+            },
         ];
 
         for (i, ev) in events.into_iter().enumerate() {
@@ -437,6 +484,40 @@ mod tests {
         assert_eq!(back.session_id(), &SessionId::with_external_id(7, "ext"));
         assert_eq!(back.agent_id(), Some("a"));
         assert_eq!(back.trace_id(), None);
+    }
+
+    #[test]
+    fn tool_call_draft_serde_round_trip() {
+        let ev = RuntimeEvent::ToolCallDraft {
+            session_id: sid(3),
+            index: 2,
+            name: "spawn_agent".into(),
+            args_len: 640,
+            count: 4,
+            agent_id: None,
+            trace_id: None,
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["runtimeEventType"], "toolCallDraft");
+        assert_eq!(v["args_len"], 640);
+        assert!(v.get("agent_id").is_none(), "None ids stay skipped");
+
+        let back: RuntimeEvent = serde_json::from_value(v).unwrap();
+        match back {
+            RuntimeEvent::ToolCallDraft {
+                index,
+                name,
+                args_len,
+                count,
+                ..
+            } => {
+                assert_eq!(index, 2);
+                assert_eq!(name, "spawn_agent");
+                assert_eq!(args_len, 640);
+                assert_eq!(count, 4);
+            }
+            other => panic!("expected ToolCallDraft, got {other:?}"),
+        }
     }
 
     #[test]
