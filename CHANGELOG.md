@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-07
+
+### Added
+- **`ToolCallDraft`** — liveness events while tool-call arguments stream in
+- **Notice types** with engine channel; `UserEvent::Notice` dual-written to the
+  event bus with self-echo suppression
+
+### Fixed
+- Record `thinking_bytes` on tool-call turns; log compaction entries carry
+  their kind
+
 ## [0.8.0] - 2026-09-27
 
 ### Added
