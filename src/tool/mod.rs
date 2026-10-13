@@ -99,6 +99,29 @@ impl ToolContext {
             event_bus: crate::engine::EventBus::new(1),
         }
     }
+
+    /// Host-side constructor for host-initiated tool execution outside the
+    /// engine loop (e.g. a REPL driving a tool through the same approval path
+    /// as the engine). User events are accepted but dropped — there is no
+    /// engine event loop to render them.
+    pub fn new(
+        session_id: SessionId,
+        llm_client: Option<Arc<dyn crate::llm_trait::LlmProvider>>,
+        session_store: Option<Arc<dyn SessionStore>>,
+        cancel_token: tokio_util::sync::CancellationToken,
+    ) -> Self {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        ToolContext {
+            session_id,
+            user_event_tx: tx,
+            llm_client,
+            session_store,
+            language: crate::types::Language::En,
+            cancel_token,
+            max_output_chars: None,
+            event_bus: crate::engine::EventBus::new(1),
+        }
+    }
 }
 
 #[async_trait]
