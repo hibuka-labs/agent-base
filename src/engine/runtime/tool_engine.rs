@@ -1,5 +1,6 @@
 use std::sync::{Arc, Mutex};
 
+use futures_util::FutureExt;
 use serde_json::Value;
 use tokio::sync::{RwLock, broadcast, mpsc};
 
@@ -564,7 +565,17 @@ impl ToolEngine {
                     // Build a temporary ToolEngine-like context for execute_tool.
                     // We inline the execute_tool logic here to avoid holding &self
                     // across the parallel tasks.
-                    let result = Self::execute_tool_static(
+                    //
+                    // Panic isolation: a panicking tool future must not unwind
+                    // through join_all and silently kill the whole agent turn
+                    // (the TUI then spins forever, and the panic text lands on
+                    // the raw terminal). catch_unwind converts the panic into a
+                    // per-tool failure so the session survives and the LLM sees
+                    // an error result. AssertUnwindSafe is sound here: the only
+                    // shared state touched across the await points is behind
+                    // tokio RwLock / std Mutex guards that are released on
+                    // unwind, never left poisoned-in-use by this code path.
+                    let result = std::panic::AssertUnwindSafe(Self::execute_tool_static(
                         &self_tools,
                         &self_pipeline,
                         &self_error_recovery,
@@ -577,8 +588,45 @@ impl ToolEngine {
                         &ctx,
                         &mut local_rx,
                         on_event.clone(),
-                    )
-                    .await;
+                    ))
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|payload| {
+                        let panic_msg = payload
+                            .downcast_ref::<&str>()
+                            .map(|s| s.to_string())
+                            .or_else(|| payload.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "unknown panic".into());
+                        tracing::error!(
+                            session_id = session_id.id,
+                            tool_name = name,
+                            panic = %panic_msg,
+                            "Tool panicked during execution (parallel)"
+                        );
+                        // Mirror the ordinary error branch: emit
+                        // ToolCallFinished so UI panels can close the entry
+                        // instead of leaking a perpetual spinner.
+                        let error_summary = if ctx.language == Language::Zh {
+                            format!("❌ 执行失败: tool panicked: {panic_msg}")
+                        } else {
+                            format!("❌ Tool execution failed: tool panicked: {panic_msg}")
+                        };
+                        self_event_bus.emit(RuntimeEvent::ToolCallFinished {
+                            session_id: session_id.clone(),
+                            tool_name: name.to_string(),
+                            summary: error_summary,
+                            agent_id: None,
+                            trace_id: None,
+                            denied: false,
+                            details: None,
+                        });
+                        Err(AgentError::ToolExecution {
+                            name: name.to_string(),
+                            source: Box::new(AgentError::Internal(format!(
+                                "tool panicked: {panic_msg}"
+                            ))),
+                        })
+                    });
 
                     (id, name, result)
                 }
