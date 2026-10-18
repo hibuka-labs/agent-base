@@ -10,7 +10,7 @@ use crate::engine::recovery::ToolErrorRecovery;
 use crate::engine::runtime::event_bus::EventBus;
 use crate::engine::runtime::session_manager::SessionManager;
 use crate::tool::{
-    ActivationContext, Content, ToolContext, ToolPolicy, ToolRegistry, content_details,
+    ActivationContext, Content, ExecClock, ToolContext, ToolPolicy, ToolRegistry, content_details,
     content_text,
 };
 use crate::types::{AgentError, AgentResult, Language, RuntimeEvent, SessionId, UserEvent};
@@ -53,6 +53,16 @@ impl ToolEngine {
     /// Respects `Direct` / `Deferred` / `Hidden` visibility levels.
     pub async fn definitions_filtered(&self, ctx: &ActivationContext) -> Vec<Value> {
         self.tools.read().await.definitions_filtered(ctx)
+    }
+
+    /// Shared handle to the tool registry (test-only).
+    ///
+    /// Lets a test fixture hold the same `Arc` the engine executes against, so
+    /// it can register tools from inside `call` — the self-registration pattern
+    /// that deadlocked when the engine held the registry lock across a call.
+    #[cfg(test)]
+    pub(crate) fn tools_handle(&self) -> Arc<RwLock<ToolRegistry>> {
+        Arc::clone(&self.tools)
     }
 
     /// Does the named tool's JSON schema declare at least one required
@@ -133,6 +143,7 @@ impl ToolEngine {
             language: ctx.language.clone(),
             cancel_token: ctx.cancel_token.clone(),
             max_output_chars: ctx.max_output_chars,
+            exec_clock: ExecClock::default(),
             event_bus: self.event_bus.clone(),
         };
 
@@ -144,8 +155,14 @@ impl ToolEngine {
             tool = name,
             "looking up tool in registry"
         );
-        let tools_guard = self.tools.read().await;
-        let tool_result = match tools_guard.get(name) {
+        // Take an owned handle and **drop the registry lock before the call**.
+        // A tool that registers another tool from inside `call` (e.g. phimint's
+        // `add_tool` mounting a script tool) needs `registry.write()`, and a read
+        // lock held across the call deadlocks that write forever — observed as a
+        // bogus `[Tool Timeout]` after the mount had already saved its entry
+        // (acceptance session 20261018_29e1e182).
+        let tool = { self.tools.read().await.get(name) };
+        let tool_result = match tool {
             Some(tool) => {
                 tracing::debug!(
                     session_id = session_id.id,
@@ -379,7 +396,8 @@ impl ToolEngine {
                 );
                 let denial_summary =
                     format!("[Action Denied]: tool {} rejected by approval", tool_name);
-                // 不记录到 session 历史 — 用户拒绝是 UI 层交互，不需要 LLM 看到
+                // Not recorded to session history — a user denial is a UI-layer
+                // interaction; there is no need for the LLM to see it
                 self.event_bus.emit(RuntimeEvent::ToolCallFinished {
                     session_id: session_id.clone(),
                     tool_name: tool_name.to_string(),
@@ -431,13 +449,7 @@ impl ToolEngine {
             tracing::info!(
                 session_id = session_id.id,
                 tool_count = tool_calls.len(),
-                "phase1: acquiring tools read lock"
-            );
-            let tools_guard = self.tools.read().await;
-            tracing::info!(
-                session_id = session_id.id,
-                tool_count = tool_calls.len(),
-                "phase1: tools read lock acquired, starting loop"
+                "phase1: starting parse + approval loop"
             );
             for (id, name, args_str) in tool_calls {
                 tracing::info!(
@@ -481,7 +493,11 @@ impl ToolEngine {
                     tool = name,
                     "phase1: checking tool exists in registry"
                 );
-                if tools_guard.get(name).is_none() {
+                // Existence check under a short read lock — never hold the
+                // registry lock across `process_approval`, which can wait on a
+                // human and would stall every registry writer behind it.
+                let exists = { self.tools.read().await.get(name).is_some() };
+                if !exists {
                     tracing::warn!(
                         session_id = session_id.id,
                         tool = name,
@@ -521,9 +537,9 @@ impl ToolEngine {
                 session_id = session_id.id,
                 approved_count = approved.len(),
                 failure_count = failures.len(),
-                "phase1: loop done, dropping tools guard"
+                "phase1: loop done"
             );
-        } // tools_guard dropped here
+        }
 
         if approved.is_empty() {
             return Ok(OrchestrateOutcome {
@@ -708,6 +724,7 @@ impl ToolEngine {
             language: ctx.language.clone(),
             cancel_token: ctx.cancel_token.clone(),
             max_output_chars: ctx.max_output_chars,
+            exec_clock: ExecClock::default(),
             event_bus: event_bus.clone(),
         };
 
@@ -716,13 +733,16 @@ impl ToolEngine {
             tool = name,
             "execute_tool_static: acquiring tools read lock (parallel)"
         );
-        let tools_guard = tools.read().await;
+        // Owned handle out, lock released before the call — see `execute_tool`:
+        // the registry lock must not be held across `tool.call`, or a
+        // self-registering tool deadlocks on `registry.write()`.
+        let tool = { tools.read().await.get(name) };
         tracing::info!(
             session_id = session_id.id,
             tool = name,
             "execute_tool_static: tools read lock acquired (parallel)"
         );
-        let tool_result = match tools_guard.get(name) {
+        let tool_result = match tool {
             Some(tool) => {
                 tracing::info!(
                     session_id = session_id.id,
@@ -987,6 +1007,131 @@ mod tests {
             let text = args.get("text").and_then(Value::as_str).unwrap_or("");
             Ok(vec![Content::text(format!("echo: {text}"))])
         }
+    }
+
+    /// Registers `EchoTool` into the shared registry from inside `call` —
+    /// mirrors phimint's `add_tool`, which mounts a new tool while executing.
+    /// With the registry read lock held across the call this write deadlocked.
+    struct SelfRegisterTool {
+        registry: Arc<RwLock<ToolRegistry>>,
+    }
+
+    #[async_trait]
+    impl Tool for SelfRegisterTool {
+        fn name(&self) -> &'static str {
+            "self_register"
+        }
+
+        fn description(&self) -> &'static str {
+            "registers another tool while running"
+        }
+
+        fn schema(&self) -> Value {
+            serde_json::json!({})
+        }
+
+        async fn call(&self, _args: &Value, _ctx: &ToolContext) -> AgentResult<Vec<Content>> {
+            // Must complete promptly — the regression is a deadlock, so the
+            // write itself gets a watchdog too (clear failure, not a hung test).
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                self.registry.write().await.register(EchoTool);
+            })
+            .await
+            .map_err(|_| AgentError::internal("registry.write() deadlocked"))?;
+            Ok(vec![Content::text("registered")])
+        }
+    }
+
+    /// Self-registering tools must run to completion on the serial path and
+    /// the new tool must show up in the schema without a rebuild/restart.
+    #[tokio::test]
+    async fn self_registering_tool_does_not_deadlock_and_hot_refreshes() {
+        let engine = ToolEngine::new(
+            ToolRegistry::default(),
+            None,
+            None,
+            Arc::new(StopOnError),
+            EventBus::new(16),
+        );
+        let handle = engine.tools_handle();
+        handle.write().await.register(SelfRegisterTool {
+            registry: handle.clone(),
+        });
+
+        let mut event_rx = engine.event_bus.subscribe();
+        let sm = session_manager();
+        let c = ctx(&sm);
+        let sid = SessionId::new(1);
+
+        let call = engine.execute_tool(
+            &sid,
+            "call_1",
+            "self_register",
+            &Value::Null,
+            "{}",
+            &c,
+            &mut event_rx,
+            std::sync::Arc::new(std::sync::Mutex::new(|_| -> AgentResult<()> { Ok(()) })),
+        );
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), call)
+            .await
+            .expect("self-registering tool must not deadlock on registry.write()");
+        let result = result.expect("self_register should execute");
+        assert_eq!(content_text(&result.output), "registered");
+
+        // Hot refresh: the mounted tool is in the schema for the next turn.
+        let defs = engine.definitions().await;
+        let names: Vec<&str> = defs
+            .iter()
+            .filter_map(|d| d["function"]["name"].as_str())
+            .collect();
+        assert!(
+            names.contains(&"echo"),
+            "registered tool missing: {names:?}"
+        );
+    }
+
+    /// Same on the parallel orchestration path (`execute_tool_static`).
+    #[tokio::test]
+    async fn self_registering_tool_does_not_deadlock_on_the_parallel_path() {
+        let engine = ToolEngine::new(
+            ToolRegistry::default(),
+            None,
+            None,
+            Arc::new(StopOnError),
+            EventBus::new(16),
+        );
+        let handle = engine.tools_handle();
+        handle.write().await.register(SelfRegisterTool {
+            registry: handle.clone(),
+        });
+
+        let mut event_rx = engine.event_bus.subscribe();
+        let pipeline = DefaultPipeline::new(None, None, None);
+        let error_recovery: Arc<dyn ToolErrorRecovery> = Arc::new(StopOnError);
+        let sm = session_manager();
+        let c = ctx(&sm);
+        let sid = SessionId::new(1);
+
+        let call = ToolEngine::execute_tool_static(
+            &handle,
+            &pipeline,
+            &error_recovery,
+            &engine.event_bus,
+            &sid,
+            "call_1",
+            "self_register",
+            &Value::Null,
+            "{}",
+            &c,
+            &mut event_rx,
+            std::sync::Arc::new(std::sync::Mutex::new(|_| -> AgentResult<()> { Ok(()) })),
+        );
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), call)
+            .await
+            .expect("parallel path must not deadlock on registry.write()");
+        let result = result.expect("self_register should execute");
+        assert_eq!(content_text(&result.output), "registered");
     }
 
     /// Policy that always requests approval, so `process_approval` reaches the handler.

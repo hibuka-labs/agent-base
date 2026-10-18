@@ -154,7 +154,8 @@ impl RuntimeCore {
             }
         }
 
-        // Turn 结束：清理临时消息（包括错误路径，避免 ephemeral 残留到持久化）
+        // Turn end: clean up ephemeral messages (including on error paths, to
+        // avoid ephemeral residue leaking into persistence)
         if let Err(e) = self
             .with_session_mut(&session_id, |session| {
                 session.remove_ephemeral_messages();
@@ -487,7 +488,7 @@ impl RuntimeCore {
             _ => {}
         }
 
-        // Turn 结束：清理临时消息（包括错误路径）
+        // Turn end: clean up ephemeral messages (including on error paths)
         if let Err(e) = self
             .with_session_mut(&session_id, |session| {
                 session.remove_ephemeral_messages();

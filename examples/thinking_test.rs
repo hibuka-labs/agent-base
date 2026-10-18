@@ -49,7 +49,7 @@ async fn run_test(
         match chunk.map_err(|e| agent_base::AgentError::internal(e.to_string()))? {
             StreamChunk::Thought(text) => {
                 if !in_thought {
-                    print!("\n💭 [思考过程]: ");
+                    print!("\n💭 [Thought process]: ");
                     in_thought = true;
                 }
                 thought_len += text.len();
@@ -57,23 +57,23 @@ async fn run_test(
             }
             StreamChunk::Text(text) => {
                 if in_thought && !in_text {
-                    print!("\n\n📝 [回复内容]: ");
+                    print!("\n\n📝 [Reply]: ");
                     in_text = true;
                 } else if !in_text {
-                    print!("📝 [回复内容]: ");
+                    print!("📝 [Reply]: ");
                     in_text = true;
                 }
                 text_len += text.len();
                 print!("{}", text);
             }
             StreamChunk::Stop { .. } => {
-                println!("\n\n--- 流结束 ---");
+                println!("\n\n--- stream ended ---");
             }
             StreamChunk::ToolCall(_) => {
-                println!("\n🔧 [工具调用]");
+                println!("\n🔧 [Tool call]");
             }
             StreamChunk::Usage(usage) => {
-                println!("\n📊 Token 用量: {}", usage_summary(&usage));
+                println!("\n📊 Token usage: {}", usage_summary(&usage));
             }
             StreamChunk::ThinkingSignature(_) => {
                 // Thinking signature — not needed for this test
@@ -84,8 +84,8 @@ async fn run_test(
         }
     }
 
-    println!("思考内容: {} 字符", thought_len);
-    println!("回复内容: {} 字符", text_len);
+    println!("Thought content: {} chars", thought_len);
+    println!("Reply content: {} chars", text_len);
 
     Ok((thought_len, text_len))
 }
@@ -96,15 +96,17 @@ async fn main() -> AgentResult<()> {
 
     let api_key = std::env::var("OPENAI_API_KEY")
         .or_else(|_| std::env::var("DASHSCOPE_API_KEY"))
-        .map_err(|_| agent_base::AgentError::internal("OPENAI_API_KEY 未设置"))?;
+        .map_err(|_| agent_base::AgentError::internal("OPENAI_API_KEY is not set"))?;
 
     let model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "qwen-flash".to_string());
 
     let base_url = std::env::var("OPENAI_BASE_URL")
         .unwrap_or_else(|_| "https://dashscope.aliyuncs.com/compatible-mode/v1".to_string());
 
-    println!("=== thinking_budget 在 {} 上的效果测试 ===", model);
-    println!("enable_thinking 和 thinking_budget 都作为顶级参数传递（DashScope 正确用法）");
+    println!("=== thinking_budget effect test on {} ===", model);
+    println!(
+        "Both enable_thinking and thinking_budget are passed as top-level parameters (correct DashScope usage)"
+    );
     println!();
 
     let provider = create_provider(&llm_trait::LlmConfig {
@@ -121,11 +123,11 @@ async fn main() -> AgentResult<()> {
 
     let mut results = Vec::new();
 
-    // 测试1: enable_thinking=false（无思考，对照）
+    // Test 1: enable_thinking=false (no thinking, control)
     results.push(
         run_test(
             provider.as_ref(),
-            "测试1: enable_thinking=false",
+            "Test 1: enable_thinking=false",
             system_prompt,
             user_input,
             Some(false),
@@ -134,11 +136,11 @@ async fn main() -> AgentResult<()> {
         .await?,
     );
 
-    // 测试2: enable_thinking=true, 无 budget
+    // Test 2: enable_thinking=true, no budget
     results.push(
         run_test(
             provider.as_ref(),
-            "测试2: enable_thinking=true, 无 thinking_budget",
+            "Test 2: enable_thinking=true, no thinking_budget",
             system_prompt,
             user_input,
             Some(true),
@@ -147,11 +149,11 @@ async fn main() -> AgentResult<()> {
         .await?,
     );
 
-    // 测试3: enable_thinking=true, thinking_budget=128
+    // Test 3: enable_thinking=true, thinking_budget=128
     results.push(
         run_test(
             provider.as_ref(),
-            "测试3: thinking_budget=128",
+            "Test 3: thinking_budget=128",
             system_prompt,
             user_input,
             Some(true),
@@ -160,11 +162,11 @@ async fn main() -> AgentResult<()> {
         .await?,
     );
 
-    // 测试4: enable_thinking=true, thinking_budget=50（极低）
+    // Test 4: enable_thinking=true, thinking_budget=50 (very low)
     results.push(
         run_test(
             provider.as_ref(),
-            "测试4: thinking_budget=50",
+            "Test 4: thinking_budget=50",
             system_prompt,
             user_input,
             Some(true),
@@ -173,11 +175,11 @@ async fn main() -> AgentResult<()> {
         .await?,
     );
 
-    // 测试5: enable_thinking=true, thinking_budget=10（极低）
+    // Test 5: enable_thinking=true, thinking_budget=10 (very low)
     results.push(
         run_test(
             provider.as_ref(),
-            "测试5: thinking_budget=10",
+            "Test 5: thinking_budget=10",
             system_prompt,
             user_input,
             Some(true),
@@ -187,11 +189,11 @@ async fn main() -> AgentResult<()> {
     );
 
     println!("\n\n{}", "=".repeat(60));
-    println!("结果汇总");
+    println!("Results summary");
     println!("{}", "=".repeat(60));
     println!(
         "{:<6} {:<30} {:>12} {:>12}",
-        "测试", "配置", "思考(字符)", "回复(字符)"
+        "Test", "Config", "Thought(chars)", "Reply(chars)"
     );
     println!("{:-<6} {:-<30} {:->12} {:->12}", "", "", "", "");
     for (i, (t, r)) in results.iter().enumerate() {

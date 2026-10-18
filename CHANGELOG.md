@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-18
+
+### Added
+- **`ExecClock` / `ExecPauseGuard`** — a pause-aware execution clock on
+  `ToolContext` (`ToolContext::new` for host-initiated tool execution).
+  Tool-call timeouts now count only active time: waiting on a human (approval
+  prompts, paused runs) is excluded from the budget, and a pause mid-call keeps
+  the rest of the budget intact.
+
+### Fixed
+- **Self-registering tools no longer deadlock.** The tool registry is taken
+  under a short-lived read lock (an `Arc<dyn Tool>` snapshot) before the
+  pipeline runs, so a tool that registers another tool mid-call no longer
+  blocks forever on the write side — and the newly registered tool hot-refreshes
+  into the next round's definitions. Covers both serial and parallel execution
+  paths.
+- Panics inside parallel tool execution are contained instead of tearing down
+  the engine loop.
+
 ## [0.9.0] - 2026-10-07
 
 ### Added

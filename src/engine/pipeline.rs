@@ -76,17 +76,39 @@ impl ToolExecutionPipeline for DefaultPipeline {
         };
         let args = &*effective_args;
 
-        // 2. Execute with timeout: tool → global config → framework default
+        // 2. Execute with an **active-time** timeout: tool → global config →
+        // framework default. The budget measures active execution — stretches
+        // the tool paused while waiting on a human (see `ExecClock`, e.g. a
+        // confirmation popup) push the deadline out by exactly the paused time.
+        // Wall-clock timeouts here produce bogus `[Tool Timeout]` results while
+        // the user is still reading, with the side effects half-done.
         let timeout_ms = tool
             .timeout_ms()
             .or(self.tool_timeout_ms)
             .unwrap_or(self.default_tool_timeout_ms);
-        let output =
-            match tokio::time::timeout(Duration::from_millis(timeout_ms), tool.call(args, ctx))
-                .await
-            {
-                Ok(result) => result?,
-                Err(_) => {
+        let budget = Duration::from_millis(timeout_ms);
+        let started = std::time::Instant::now();
+        let call = tool.call(args, ctx);
+        tokio::pin!(call);
+        let output = loop {
+            let paused = ctx.exec_clock.paused_total();
+            let Some(deadline) = started.checked_add(budget.saturating_add(paused)) else {
+                // Absurd budget — run to completion (cancel still applies).
+                break call.as_mut().await;
+            };
+            tokio::select! {
+                result = &mut call => break result,
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                    // The deadline moves while the clock is paused, and a pause
+                    // can start or end after this sleep was armed. Only a
+                    // deadline that still holds with fresh accounting is a real
+                    // overrun.
+                    let holds = started
+                        .checked_add(budget.saturating_add(ctx.exec_clock.paused_total()))
+                        .is_some_and(|d| std::time::Instant::now() >= d);
+                    if !holds {
+                        continue;
+                    }
                     tracing::warn!(
                         tool = tool.name(),
                         timeout_ms = timeout_ms,
@@ -94,7 +116,9 @@ impl ToolExecutionPipeline for DefaultPipeline {
                     );
                     return Ok(vec![Content::text("[Tool Timeout]")]);
                 }
-            };
+            }
+        };
+        let output = output?;
 
         // 3. Output size limit — reject by default rather than silently
         // truncating (design §6.5). Tools that want to return a bounded
@@ -139,6 +163,7 @@ mod tests {
             language: Language::En,
             cancel_token: tokio_util::sync::CancellationToken::new(),
             max_output_chars: None,
+            exec_clock: crate::tool::ExecClock::default(),
             event_bus: crate::engine::EventBus::new(1),
         }
     }
@@ -308,6 +333,123 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(content_text(&output), "[Tool Timeout]");
+    }
+
+    /// Pauses the execution clock for a wall-clock stretch (a human wait),
+    /// then returns.
+    struct HumanWaitTool {
+        wait: Duration,
+    }
+    #[async_trait]
+    impl Tool for HumanWaitTool {
+        fn name(&self) -> &'static str {
+            "human_wait"
+        }
+        fn description(&self) -> &'static str {
+            "human_wait"
+        }
+        fn schema(&self) -> Value {
+            json!({})
+        }
+        fn timeout_ms(&self) -> Option<u64> {
+            Some(200) // 200ms of *active* time
+        }
+        async fn call(&self, _args: &Value, ctx: &ToolContext) -> AgentResult<Vec<Content>> {
+            let _paused = ctx.pause_execution_clock();
+            tokio::time::sleep(self.wait).await;
+            Ok(vec![Content::text("done")])
+        }
+    }
+
+    /// Burns `active` after an unpaused-start `lead`, with a `wait` pause in
+    /// between — models "tool works, pauses for the human, works again".
+    struct PauseThenRunTool {
+        lead: Duration,
+        wait: Duration,
+        active: Duration,
+    }
+    #[async_trait]
+    impl Tool for PauseThenRunTool {
+        fn name(&self) -> &'static str {
+            "pause_then_run"
+        }
+        fn description(&self) -> &'static str {
+            "pause_then_run"
+        }
+        fn schema(&self) -> Value {
+            json!({})
+        }
+        fn timeout_ms(&self) -> Option<u64> {
+            Some(200)
+        }
+        async fn call(&self, _args: &Value, ctx: &ToolContext) -> AgentResult<Vec<Content>> {
+            tokio::time::sleep(self.lead).await;
+            {
+                let _paused = ctx.pause_execution_clock();
+                tokio::time::sleep(self.wait).await;
+            }
+            tokio::time::sleep(self.active).await;
+            Ok(vec![Content::text("done")])
+        }
+    }
+
+    #[tokio::test]
+    async fn timeout_excludes_human_wait() {
+        // Wall clock: 600ms against a 200ms budget. Active time: ~0ms.
+        // The human wait must not count — no `[Tool Timeout]`.
+        let pipeline = DefaultPipeline::new(None, None, None);
+        let output = pipeline
+            .execute(
+                &HumanWaitTool {
+                    wait: Duration::from_millis(600),
+                },
+                &json!({}),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(content_text(&output), "done");
+    }
+
+    #[tokio::test]
+    async fn timeout_still_counts_active_time_after_a_pause() {
+        // 30ms active + 400ms paused + 900ms active: the second active stretch
+        // blows the 200ms budget and must time out even though the pause was
+        // longer than everything else.
+        let pipeline = DefaultPipeline::new(None, None, None);
+        let output = pipeline
+            .execute(
+                &PauseThenRunTool {
+                    lead: Duration::from_millis(30),
+                    wait: Duration::from_millis(400),
+                    active: Duration::from_millis(900),
+                },
+                &json!({}),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(content_text(&output), "[Tool Timeout]");
+    }
+
+    #[tokio::test]
+    async fn pause_mid_call_keeps_the_rest_of_the_budget() {
+        // 30ms active before the pause, 50ms after — both inside the 200ms
+        // budget once the 400ms human wait is excluded.
+        let pipeline = DefaultPipeline::new(None, None, None);
+        let output = pipeline
+            .execute(
+                &PauseThenRunTool {
+                    lead: Duration::from_millis(30),
+                    wait: Duration::from_millis(400),
+                    active: Duration::from_millis(50),
+                },
+                &json!({}),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(content_text(&output), "done");
     }
 
     #[tokio::test]

@@ -17,8 +17,8 @@ pub struct ApprovalRequest {
     pub action_key: Option<String>,
     pub risk_level: RiskLevel,
     pub raw: Option<Value>,
-    /// 发起方标识（子 agent 的 agent_path，如 "root/coder-1"）。
-    /// 主 agent 发起时为 None（serde default 保证旧 JSON 可反序列化）。
+    /// Identifier of the initiator (the sub-agent's agent_path, e.g. "root/coder-1").
+    /// None when initiated by the main agent (serde default ensures old JSON remains deserializable).
     #[serde(default)]
     pub source: Option<String>,
 }
@@ -34,8 +34,8 @@ pub enum ApprovalDecision {
 mod tests {
     use super::*;
 
-    /// 旧 JSON（无 source 字段）必须照常反序列化（serde default 向后兼容，
-    /// 设计文档 D4）。旧日志 / 旧调用方不受影响。
+    /// Old JSON (without the source field) must deserialize as before (serde default for
+    /// backward compatibility, design doc D4). Old logs / old callers are unaffected.
     #[test]
     fn deserializes_legacy_json_without_source() {
         let old = r#"{"title":"t","message":"m","action_key":null,"risk_level":"Safe","raw":null}"#;
@@ -43,7 +43,7 @@ mod tests {
         assert_eq!(req.source, None);
     }
 
-    /// 新 JSON 带 source 时正常携带。
+    /// New JSON with source carries it through normally.
     #[test]
     fn roundtrips_source_field() {
         let req = ApprovalRequest {

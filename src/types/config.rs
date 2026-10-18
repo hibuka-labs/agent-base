@@ -202,17 +202,17 @@ impl Default for ToolConfig {
 
 #[derive(Clone, Debug, Default)]
 pub struct SessionConfig {
-    /// 最大 session 数量，超过时 LRU 逐出整个 session（从内存卸载，数据保留）
-    /// None = 不限制
+    /// Maximum number of sessions; when exceeded, LRU evicts whole sessions (unloaded from memory, data preserved)
+    /// None = no limit
     pub max_sessions: Option<usize>,
 
-    /// 单个 session 最大保留轮数，超过从前面截掉最旧轮次
-    /// None = 不限制
+    /// Maximum turns retained per session; when exceeded, the oldest turns are truncated from the front
+    /// None = no limit
     pub max_turns_per_session: Option<usize>,
 
-    /// 单条消息 token 上限（安全阀），超过不存入 session 历史
-    /// 阈值应设很高（如 100k），只拦异常情况
-    /// None = 不限制
+    /// Per-message token cap (safety valve); messages exceeding it are not stored in the session history
+    /// The threshold should be set very high (e.g. 100k) to only catch abnormal cases
+    /// None = no limit
     pub max_message_tokens: Option<usize>,
 }
 

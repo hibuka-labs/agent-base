@@ -68,7 +68,7 @@ impl Tool for AddTool {
 }
 
 // ---------------------------------------------------------------------------
-// Anti-Hallucination Middleware (业务层自行实现)
+// Anti-Hallucination Middleware (implemented at the business layer)
 // ---------------------------------------------------------------------------
 
 struct AntiHallucinationMiddleware {
@@ -88,17 +88,17 @@ impl AntiHallucinationMiddleware {
 #[async_trait]
 impl Middleware for AntiHallucinationMiddleware {
     async fn on_post_llm(&self, ctx: &mut PostLlmCtx) -> AgentResult<()> {
-        // 只在"有工具可用但尚未执行过任何工具"时触发
+        // Only triggers when "tools are available but no tool has been executed yet"
         if ctx.available_tools.is_empty() || ctx.total_tool_calls > 0 {
             return Ok(());
         }
 
-        // 如果 LLM 已经调用了工具，不需要处理
+        // If the LLM has already called a tool, nothing to do
         if ctx.is_tool_call {
             return Ok(());
         }
 
-        // 如果 LLM 没有返回文本，也不需要处理
+        // If the LLM returned no text, nothing to do either
         if ctx.full_text.is_empty() {
             return Ok(());
         }
@@ -106,7 +106,7 @@ impl Middleware for AntiHallucinationMiddleware {
         let count = self.nudge_count.fetch_add(1, Ordering::SeqCst);
 
         if count >= self.max_nudges {
-            // 超过最大 nudge 次数，不抑制，让 LLM 的文本正常输出
+            // Exceeded the maximum nudge count: do not suppress, let the LLM text output normally
             return Ok(());
         }
 
@@ -114,10 +114,10 @@ impl Middleware for AntiHallucinationMiddleware {
             "[Middleware] Nudge #{count}: suppressing hallucination text, injecting follow-up message"
         );
 
-        // 静默丢弃当前 assistant 消息
+        // Silently drop the current assistant message
         ctx.skip_push = true;
 
-        // 设置 nudge 跟进消息，react 会注入并 continue
+        // Set the nudge follow-up message; react will inject it and continue
         ctx.follow_up_message = Some(
             "CRITICAL: You have tools available but did not call any. \
              Do NOT describe what you would do — actually DO it by calling tools. \
@@ -130,7 +130,7 @@ impl Middleware for AntiHallucinationMiddleware {
 }
 
 // ---------------------------------------------------------------------------
-// 敏感内容撤回 Middleware (另一个 skip_push 使用场景)
+// Sensitive content retraction Middleware (another skip_push use case)
 // ---------------------------------------------------------------------------
 
 struct SensitiveContentFilter {

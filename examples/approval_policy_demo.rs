@@ -1,21 +1,21 @@
 use serde_json::{Value, json};
 use std::collections::HashMap;
-/// 演示 ToolPolicy 如何根据计划状态决定是否需要审批
+/// Demonstrates how ToolPolicy decides whether approval is needed based on the plan status
 ///
-/// 问题场景：
-/// - create_plan 成功后，react 自动执行 execute_plan
-/// - 但 ToolPolicy 不知道用户已确认，仍然请求审批
+/// Problem scenario:
+/// - After create_plan succeeds, react automatically runs execute_plan
+/// - But ToolPolicy doesn't know the user has confirmed, and still requests approval
 ///
-/// 解决方案：
-/// - ToolPolicy 检查计划状态
-/// - 如果计划状态是 "awaiting_confirmation"，跳过审批
+/// Solution:
+/// - ToolPolicy checks the plan status
+/// - If the plan status is "awaiting_confirmation", skip approval
 ///
-/// 运行方式：
+/// How to run:
 /// cargo run --example approval_policy_demo
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-/// 模拟 PlanStore
+/// Mock PlanStore
 struct MockPlanStore {
     plans: RwLock<HashMap<String, PlanData>>,
 }
@@ -53,7 +53,7 @@ impl MockPlanStore {
     }
 }
 
-/// 模拟 ToolPolicy
+/// Mock ToolPolicy
 struct TestToolPolicy {
     plan_store: Arc<MockPlanStore>,
 }
@@ -63,7 +63,7 @@ impl TestToolPolicy {
         Self { plan_store }
     }
 
-    /// 评估是否需要审批
+    /// Evaluate whether approval is needed
     async fn evaluate_approval(&self, tool_name: &str, args: &Value) -> Option<String> {
         if tool_name != "execute_plan" {
             return None;
@@ -71,17 +71,19 @@ impl TestToolPolicy {
 
         let plan_id = args.get("plan_id")?.as_str()?;
 
-        // 加载计划
+        // Load the plan
         let plan_data = self.plan_store.load_plan(plan_id).await?;
 
-        // 检查计划状态
+        // Check the plan status
         if plan_data.status == "approved" {
-            // 用户已确认计划，跳过审批
-            println!("[ToolPolicy] 计划状态为 approved，跳过审批（用户已确认）");
+            // The user has confirmed the plan; skip approval
+            println!(
+                "[ToolPolicy] Plan status is approved, skipping approval (user has confirmed)"
+            );
             return None;
         }
 
-        // 检查命令风险等级
+        // Check the command risk levels
         let has_sensitive = plan_data.steps.iter().any(|s| s.risk_level == "sensitive");
         let has_destructive = plan_data
             .steps
@@ -89,29 +91,29 @@ impl TestToolPolicy {
             .any(|s| s.risk_level == "destructive");
 
         if has_destructive {
-            println!("[ToolPolicy] 检测到破坏性命令，需要审批");
+            println!("[ToolPolicy] Destructive command detected, approval required");
             return Some("destructive".to_string());
         }
 
         if has_sensitive {
-            println!("[ToolPolicy] 检测到敏感命令，需要审批");
+            println!("[ToolPolicy] Sensitive command detected, approval required");
             return Some("sensitive".to_string());
         }
 
-        println!("[ToolPolicy] 所有命令都是安全的，跳过审批");
+        println!("[ToolPolicy] All commands are safe, skipping approval");
         None
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== ToolPolicy 审批决策演示 ===\n");
+    println!("=== ToolPolicy Approval Decision Demo ===\n");
 
     let plan_store = Arc::new(MockPlanStore::new());
     let policy = TestToolPolicy::new(plan_store.clone());
 
-    // 场景 1: 计划状态为 approved（用户已确认）
-    println!("--- 场景 1: 用户已确认计划（状态为 approved）---");
+    // Scenario 1: plan status is approved (user has confirmed)
+    println!("--- Scenario 1: user has confirmed the plan (status is approved) ---");
     plan_store
         .save_plan(PlanData {
             plan_id: "plan-1".to_string(),
@@ -126,10 +128,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = json!({"plan_id": "plan-1"});
     let result = policy.evaluate_approval("execute_plan", &args).await;
-    println!("结果: {:?}\n", result);
+    println!("Result: {:?}\n", result);
 
-    // 场景 2: 计划状态为 awaiting_confirmation（等待用户确认），包含敏感命令
-    println!("--- 场景 2: 等待用户确认，计划包含敏感命令 ---");
+    // Scenario 2: plan status is awaiting_confirmation (waiting for user confirmation), with a sensitive command
+    println!(
+        "--- Scenario 2: waiting for user confirmation, plan contains a sensitive command ---"
+    );
     plan_store
         .save_plan(PlanData {
             plan_id: "plan-2".to_string(),
@@ -144,10 +148,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = json!({"plan_id": "plan-2"});
     let result = policy.evaluate_approval("execute_plan", &args).await;
-    println!("结果: {:?}\n", result);
+    println!("Result: {:?}\n", result);
 
-    // 场景 3: 计划状态为 awaiting_confirmation（等待用户确认），所有命令都是安全的
-    println!("--- 场景 3: 等待用户确认，所有命令都是安全的 ---");
+    // Scenario 3: plan status is awaiting_confirmation (waiting for user confirmation), all commands are safe
+    println!("--- Scenario 3: waiting for user confirmation, all commands are safe ---");
     plan_store
         .save_plan(PlanData {
             plan_id: "plan-3".to_string(),
@@ -169,10 +173,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = json!({"plan_id": "plan-3"});
     let result = policy.evaluate_approval("execute_plan", &args).await;
-    println!("结果: {:?}\n", result);
+    println!("Result: {:?}\n", result);
 
-    // 场景 4: 计划状态为 awaiting_confirmation（等待用户确认），包含破坏性命令
-    println!("--- 场景 4: 等待用户确认，包含破坏性命令 ---");
+    // Scenario 4: plan status is awaiting_confirmation (waiting for user confirmation), with a destructive command
+    println!("--- Scenario 4: waiting for user confirmation, contains a destructive command ---");
     plan_store
         .save_plan(PlanData {
             plan_id: "plan-4".to_string(),
@@ -187,15 +191,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = json!({"plan_id": "plan-4"});
     let result = policy.evaluate_approval("execute_plan", &args).await;
-    println!("结果: {:?}\n", result);
+    println!("Result: {:?}\n", result);
 
-    println!("=== 演示完成 ===");
-    println!("\n结论:");
-    println!("- ToolPolicy 根据计划状态和命令风险等级决定是否需要审批");
-    println!("- 如果计划状态是 approved（用户已确认），跳过审批");
-    println!("- 如果计划状态是 awaiting_confirmation（等待确认），需要审批");
-    println!("- 如果命令是安全的，跳过审批");
-    println!("- 如果命令是敏感的或破坏性的，需要审批");
+    println!("=== Demo complete ===");
+    println!("\nConclusion:");
+    println!(
+        "- ToolPolicy decides whether approval is needed based on the plan status and command risk levels"
+    );
+    println!("- If the plan status is approved (user has confirmed), skip approval");
+    println!(
+        "- If the plan status is awaiting_confirmation (waiting for confirmation), approval is required"
+    );
+    println!("- If the commands are safe, skip approval");
+    println!("- If the commands are sensitive or destructive, approval is required");
 
     Ok(())
 }

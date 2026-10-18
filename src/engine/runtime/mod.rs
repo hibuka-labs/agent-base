@@ -140,7 +140,7 @@ impl AgentRuntime {
         self.runner.config.read().await.system_prompt.clone()
     }
 
-    /// 设置 reasoning effort（异步版本）
+    /// Set the reasoning effort (async version)
     pub async fn set_reasoning_effort(&self, effort: crate::llm::ReasoningEffort) {
         let mut config = self.runner.config.write().await;
         let mut reasoning = config.reasoning.take().unwrap_or_default();
@@ -148,7 +148,7 @@ impl AgentRuntime {
         config.reasoning = Some(reasoning);
     }
 
-    /// 设置 reasoning effort（同步版本，只在同步上下文中使用）
+    /// Set the reasoning effort (sync version, only for use in synchronous contexts)
     pub fn set_reasoning_effort_sync(&self, effort: crate::llm::ReasoningEffort) {
         let mut config = self.runner.config.blocking_write();
         let mut reasoning = config.reasoning.take().unwrap_or_default();
@@ -305,7 +305,7 @@ impl AgentRuntime {
     /// Replace the chat messages for a session — only for persistence restore.
     /// Validates message sequence before applying.
     ///
-    /// 仅供持久化恢复使用。
+    /// For persistence restore use only.
     pub async fn set_messages(
         &self,
         session_id: &SessionId,

@@ -56,7 +56,7 @@ pub struct GuardCtx {
     pub last_tool_calls_invalid: bool,
     /// All user messages in the current session, ordered oldest-first.
     /// Guards can use this to reconstruct full conversation context
-    /// (e.g. "继续" after a multi-turn discussion).
+    /// (e.g. "continue" after a multi-turn discussion).
     pub all_user_inputs: Vec<String>,
     // Scene hints (runtime detected, guard can trust or ignore)
     pub is_reasoning_only: bool,

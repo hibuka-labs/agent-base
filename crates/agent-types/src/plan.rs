@@ -29,7 +29,7 @@ pub struct PlanItem {
 pub struct UpdatePlanArgs {
     /// A one-sentence summary of the user's goal.
     /// Optional on subsequent calls — the tool remembers the last objective.
-    /// Example: "安装 Casdoor 身份认证系统"
+    /// Example: "Install the Casdoor authentication system"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub objective: Option<String>,
     /// Optional explanation of why the plan changed.

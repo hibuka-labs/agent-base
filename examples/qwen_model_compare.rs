@@ -1,9 +1,10 @@
-/// 对比 qwen-flash / qwen-plus / qwen3.7-max 在 thinking 模式下的行为差异。
+/// Compare the behavioral differences of qwen-flash / qwen-plus / qwen3.7-max in thinking mode.
 ///
-/// 重点验证：模型思考完后是否产生 text content，还是只有 reasoning_content。
-/// 这决定了 react 是否会把响应当作"空响应"而无限重试。
+/// Key check: whether the model produces text content after thinking, or only
+/// reasoning_content. This determines whether react treats the response as an
+/// "empty response" and retries indefinitely.
 ///
-/// 运行：cargo run --example qwen_model_compare
+/// Run: cargo run --example qwen_model_compare
 use agent_base::{AgentResult, ChatMessage};
 use llm_trait::{ChatRequest, LlmProvider, ReasoningConfig, StreamChunk};
 use llm_unified::create_provider;
@@ -17,7 +18,7 @@ fn usage_summary(usage: &llm_trait::UsageInfo) -> String {
     )
 }
 
-/// 单次测试结果
+/// Result of a single test run
 #[allow(dead_code)]
 struct TestResult {
     thought_chars: usize,
@@ -27,7 +28,7 @@ struct TestResult {
     elapsed_ms: u128,
 }
 
-/// 对单个模型执行一次流式请求，收集 thinking / text / tool_call 数据。
+/// Run one streaming request against a single model, collecting thinking / text / tool_call data.
 async fn probe_model(
     provider: &dyn LlmProvider,
     model_label: &str,
@@ -85,7 +86,7 @@ async fn probe_model(
     let mut text_chars: usize = 0;
     let mut tool_calls: usize = 0;
     let mut has_stop = false;
-    let mut thought_sample = String::new(); // 保留前 200 字符做样本
+    let mut thought_sample = String::new(); // Keep the first 200 chars as a sample
     let mut text_sample = String::new();
 
     while let Some(chunk) = stream.next().await {
@@ -122,28 +123,30 @@ async fn probe_model(
 
     let elapsed_ms = start.elapsed().as_millis();
 
-    // 打印摘要
+    // Print summary
     println!("  ⏱  {}ms", elapsed_ms);
-    println!("  💭 思考: {} 字符", thought_chars);
+    println!("  💭 Thought: {} chars", thought_chars);
     if !thought_sample.is_empty() {
         let preview: String = thought_sample.chars().take(150).collect();
-        println!("     样本: {}...", preview);
+        println!("     sample: {}...", preview);
     }
-    println!("  📝 回复: {} 字符", text_chars);
+    println!("  📝 Reply: {} chars", text_chars);
     if !text_sample.is_empty() {
         let preview: String = text_sample.chars().take(200).collect();
-        println!("     样本: {}...", preview);
+        println!("     sample: {}...", preview);
     }
-    println!("  🔧 工具调用: {}", tool_calls);
+    println!("  🔧 Tool calls: {}", tool_calls);
     println!("  🏁 Stop: {}", has_stop);
 
-    // 关键判断
+    // Key verdict
     if thought_chars > 0 && text_chars == 0 && tool_calls == 0 {
-        println!("  ⚠️  问题：有思考但无正文无工具调用 → react 会当作空响应!");
+        println!(
+            "  ⚠️  Problem: thought but no body text and no tool calls → react will treat it as an empty response!"
+        );
     } else if text_chars > 0 {
-        println!("  ✅ 正常：有正文输出");
+        println!("  ✅ OK: body text output present");
     } else if tool_calls > 0 {
-        println!("  ✅ 正常：有工具调用");
+        println!("  ✅ OK: tool calls present");
     }
 
     Ok(TestResult {
@@ -161,7 +164,7 @@ async fn main() -> AgentResult<()> {
 
     let api_key = std::env::var("DASHSCOPE_API_KEY")
         .or_else(|_| std::env::var("OPENAI_API_KEY"))
-        .map_err(|_| agent_base::AgentError::internal("DASHSCOPE_API_KEY 未设置"))?;
+        .map_err(|_| agent_base::AgentError::internal("DASHSCOPE_API_KEY is not set"))?;
 
     let base_url = std::env::var("DASHSCOPE_BASE_URL")
         .or_else(|_| std::env::var("OPENAI_BASE_URL"))
@@ -171,7 +174,7 @@ async fn main() -> AgentResult<()> {
         "你是运维工程师助手。回复简洁直接。如果需要执行命令来回答用户问题，请调用工具。";
     let user_input = "看下磁盘空间";
 
-    // 三个模型，分别测试 thinking=false 和 thinking=true
+    // Three models, each tested with thinking=false and thinking=true
     let models = vec![
         ("qwen-flash", "千问 Flash"),
         ("qwen-plus", "千问 Plus"),
@@ -192,11 +195,11 @@ async fn main() -> AgentResult<()> {
 
         let mut results = Vec::new();
 
-        // 测试 A: 不开 thinking（对照组）
+        // Test A: thinking off (control group)
         results.push(
             probe_model(
                 provider.as_ref(),
-                &format!("{} (无思考)", model_label),
+                &format!("{} (no thinking)", model_label),
                 system_prompt,
                 user_input,
                 false,
@@ -205,11 +208,11 @@ async fn main() -> AgentResult<()> {
             .await?,
         );
 
-        // 测试 B: 开 thinking，不限 budget
+        // Test B: thinking on, no budget limit
         results.push(
             probe_model(
                 provider.as_ref(),
-                &format!("{} (thinking=on, 无budget)", model_label),
+                &format!("{} (thinking=on, no budget)", model_label),
                 system_prompt,
                 user_input,
                 true,
@@ -218,7 +221,7 @@ async fn main() -> AgentResult<()> {
             .await?,
         );
 
-        // 测试 C: 开 thinking，budget=2000（和 ops-omni 实际配置一致）
+        // Test C: thinking on, budget=2000 (same as the actual ops-omni configuration)
         results.push(
             probe_model(
                 provider.as_ref(),
@@ -234,13 +237,13 @@ async fn main() -> AgentResult<()> {
         all_results.push((model_label, results));
     }
 
-    // 汇总表格
+    // Summary table
     println!("\n\n{}", "=".repeat(90));
-    println!("汇总对比");
+    println!("Summary comparison");
     println!("{}", "=".repeat(90));
     println!(
         "{:<14} {:<32} {:>10} {:>10} {:>8} {:>8}",
-        "模型", "配置", "思考(字符)", "回复(字符)", "工具调用", "耗时ms"
+        "Model", "Config", "Thought(chars)", "Reply(chars)", "Tool calls", "Elapsed ms"
     );
     println!(
         "{:-<14} {:-<32} {:->10} {:->10} {:->8} {:->8}",
@@ -248,8 +251,8 @@ async fn main() -> AgentResult<()> {
     );
 
     let configs = [
-        "无思考",
-        "thinking=on, 无budget",
+        "no thinking",
+        "thinking=on, no budget",
         "thinking=on, budget=2000",
     ];
     for (label, results) in &all_results {
@@ -266,7 +269,9 @@ async fn main() -> AgentResult<()> {
         }
     }
 
-    println!("\n⚠️  = 有思考但无正文无工具调用，react 会当作空响应无限重试");
+    println!(
+        "\n⚠️  = thought but no body text and no tool calls; react treats it as an empty response and retries indefinitely"
+    );
 
     Ok(())
 }

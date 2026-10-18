@@ -22,6 +22,90 @@ pub use agent_types::{
     ActivationContext, Content, ToolExposure, ToolMetadata, content_details, content_text,
 };
 
+/// Per-call execution-clock control, shared between the tool and the
+/// pipeline's timeout ([`crate::engine::DefaultPipeline`]).
+///
+/// The timeout measures **active** execution time: stretches spent waiting on
+/// a human are excluded ([`ExecClock::pause`]), so a tool that asks the user a
+/// question is never killed by its own execution budget while the user is
+/// still reading. Every [`ToolContext`] built per call gets a fresh clock —
+/// pauses never leak into a later call.
+#[derive(Clone, Default)]
+pub struct ExecClock {
+    inner: Arc<ExecClockInner>,
+}
+
+#[derive(Default)]
+struct ExecClockInner {
+    state: std::sync::Mutex<ExecClockState>,
+}
+
+#[derive(Default)]
+struct ExecClockState {
+    /// Live pause guards. Non-zero ⇒ the clock is paused (nesting supported).
+    live: usize,
+    /// When the current pause began (`Some` while paused).
+    started: Option<std::time::Instant>,
+    /// Paused time already banked from closed pauses.
+    total: std::time::Duration,
+}
+
+impl ExecClock {
+    /// Hold the clock paused for as long as the returned guard lives.
+    /// Nesting is fine: the clock resumes when the outermost guard drops.
+    pub fn pause(&self) -> ExecPauseGuard {
+        let mut state = self.lock();
+        state.live += 1;
+        if state.live == 1 {
+            state.started = Some(std::time::Instant::now());
+        }
+        ExecPauseGuard {
+            clock: self.clone(),
+        }
+    }
+
+    /// Paused time so far, including the open pause if any. The pipeline's
+    /// deadline is `start + budget + paused_total()`, so a pause pushes the
+    /// timeout out by exactly the time the human spent.
+    pub fn paused_total(&self) -> std::time::Duration {
+        let state = self.lock();
+        state.total
+            + state
+                .started
+                .map_or(std::time::Duration::ZERO, |s| s.elapsed())
+    }
+
+    fn resume(&self) {
+        let mut state = self.lock();
+        state.live = state.live.saturating_sub(1);
+        if state.live == 0
+            && let Some(started) = state.started.take()
+        {
+            state.total += started.elapsed();
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ExecClockState> {
+        // A panic while holding the clock must not poison it — worst case the
+        // accounting is slightly off, never "the tool can never time out".
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// RAII pause handle — see [`ExecClock::pause`].
+pub struct ExecPauseGuard {
+    clock: ExecClock,
+}
+
+impl Drop for ExecPauseGuard {
+    fn drop(&mut self) {
+        self.clock.resume();
+    }
+}
+
 #[derive(Clone)]
 pub struct ToolContext {
     pub session_id: SessionId,
@@ -40,12 +124,23 @@ pub struct ToolContext {
     /// `read_file`) should self-truncate to this bound and mark the cut, so
     /// the engine's hard reject (§6.5) never fires for a paginated read.
     pub max_output_chars: Option<usize>,
+    /// Execution clock for this call — see [`ExecClock`]. Pause it while the
+    /// tool waits on a human ([`ToolContext::pause_execution_clock`]).
+    pub exec_clock: ExecClock,
     /// Internal runtime event bus (framework tools emit `RuntimeEvent`s here).
     /// `pub(crate)` — engine-internal; user tools should use `emit_user_event()`.
     pub(crate) event_bus: crate::engine::EventBus,
 }
 
 impl ToolContext {
+    /// Pause this call's execution clock for as long as the guard lives.
+    ///
+    /// Call this while waiting on a human (a confirmation popup, a login):
+    /// the pipeline's tool timeout does not count the paused stretch.
+    pub fn pause_execution_clock(&self) -> ExecPauseGuard {
+        self.exec_clock.pause()
+    }
+
     /// Send a user-space event (progress, sub-agent forwarding, structured data).
     ///
     /// Dual-write: the event goes to `user_event_tx` (the tool select arm
@@ -96,6 +191,7 @@ impl ToolContext {
             language: crate::types::Language::En,
             cancel_token: tokio_util::sync::CancellationToken::new(),
             max_output_chars: None,
+            exec_clock: ExecClock::default(),
             event_bus: crate::engine::EventBus::new(1),
         }
     }
@@ -119,6 +215,7 @@ impl ToolContext {
             language: crate::types::Language::En,
             cancel_token,
             max_output_chars: None,
+            exec_clock: ExecClock::default(),
             event_bus: crate::engine::EventBus::new(1),
         }
     }
@@ -390,6 +487,61 @@ mod tests {
     use super::*;
 
     #[test]
+    fn exec_clock_pause_accounting() {
+        let clock = ExecClock::default();
+        assert_eq!(clock.paused_total(), std::time::Duration::ZERO);
+
+        let guard = clock.pause();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        // An open pause counts in-flight — the pipeline's deadline moves live.
+        assert!(clock.paused_total() >= std::time::Duration::from_millis(30));
+        drop(guard);
+        let banked = clock.paused_total();
+        assert!(banked >= std::time::Duration::from_millis(30));
+
+        // Closed pauses stay banked; a later pause adds to them.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert_eq!(clock.paused_total(), banked);
+        let g2 = clock.pause();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(clock.paused_total() >= banked + std::time::Duration::from_millis(20));
+        drop(g2);
+    }
+
+    #[test]
+    fn exec_clock_nested_guards_resume_once() {
+        let clock = ExecClock::default();
+        let outer = clock.pause();
+        let inner = clock.pause();
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        drop(inner);
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        // Still paused via `outer` — the in-flight pause keeps growing.
+        let during = clock.paused_total();
+        assert!(during >= std::time::Duration::from_millis(30));
+        drop(outer);
+        let after = clock.paused_total();
+        assert!(after >= during);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert_eq!(clock.paused_total(), after);
+    }
+
+    #[test]
+    fn exec_clock_guard_drop_unwinds_from_panic() {
+        // A panic while holding the guard must not poison the clock.
+        let clock = ExecClock::default();
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = clock.pause();
+            panic!("boom");
+        }));
+        assert!(caught.is_err());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let banked = clock.paused_total();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert_eq!(clock.paused_total(), banked, "clock must be resumed");
+    }
+
+    #[test]
     fn content_text_ctor_and_into_vec() {
         let c = Content::text("hello");
         let v: Vec<Content> = c.clone().into();
@@ -553,6 +705,7 @@ mod tests {
             language: crate::types::Language::En,
             cancel_token: tokio_util::sync::CancellationToken::new(),
             max_output_chars: None,
+            exec_clock: ExecClock::default(),
             event_bus: crate::engine::EventBus::new(1),
         };
         ctx.emit_partial_result("tc1", "partial", true);
@@ -586,6 +739,7 @@ mod tests {
             language: crate::types::Language::En,
             cancel_token: tokio_util::sync::CancellationToken::new(),
             max_output_chars: None,
+            exec_clock: ExecClock::default(),
             event_bus: crate::engine::EventBus::new(4),
         };
         let mut bus_rx = ctx.event_bus.subscribe();

@@ -3,9 +3,9 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 
-/// 用于捕获请求参数的 Mock LLM Provider
+/// Mock LLM provider used to capture request parameters.
 struct CaptureLlmProvider {
-    /// 捕获到的请求 body（JSON 格式）
+    /// Captured request bodies (JSON format)
     captured_bodies: Mutex<Vec<Value>>,
 }
 
@@ -27,7 +27,7 @@ impl agent_base::llm_trait::LlmProvider for CaptureLlmProvider {
         &self,
         request: agent_base::llm_trait::ChatRequest,
     ) -> Result<agent_base::llm_trait::ChatStream, agent_base::llm_trait::LlmError> {
-        // 构造一个模拟的请求 body 来验证参数传递
+        // Construct a mock request body to verify parameter passing
         let mut body = json!({
             "model": "test-model",
             "messages": [],
@@ -50,7 +50,7 @@ impl agent_base::llm_trait::LlmProvider for CaptureLlmProvider {
 
         self.captured_bodies.lock().unwrap().push(body);
 
-        // 返回一个空的流
+        // Return an empty stream
         let stream = futures_util::stream::iter(vec![Ok(StreamChunk::Stop {
             finish_reason: Some("stop".to_string()),
         })]);
@@ -110,13 +110,13 @@ async fn test_thinking_budget_parameter_passed() {
         serde_json::to_string_pretty(body).unwrap()
     );
 
-    // 验证 enable_thinking 被正确设置
+    // Verify enable_thinking is set correctly
     assert_eq!(
         body["enable_thinking"], true,
         "enable_thinking should be true"
     );
 
-    // 验证 thinking_budget 被正确设置
+    // Verify thinking_budget is set correctly
     assert_eq!(
         body["thinking_budget"], 128,
         "thinking_budget should be 128"
@@ -149,7 +149,7 @@ async fn test_extra_body_format_for_thinking() {
         serde_json::to_string_pretty(body).unwrap()
     );
 
-    // 验证参数存在
+    // Verify the parameters are present
     assert!(
         body.get("enable_thinking").is_some(),
         "enable_thinking should be present"

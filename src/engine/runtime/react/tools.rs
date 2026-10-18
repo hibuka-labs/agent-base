@@ -105,16 +105,22 @@ impl RuntimeCore {
             invalid_indices = (0..tool_calls.len()).collect();
         }
 
-        // ── Markup salvage：从文本通道泄漏的模板 markup 中救回参数 ──
-        // mimo 家族 provider 偶发把同一个调用写在两个通道：native tool_call
-        // 流的 arguments 中途截断（finish 谎报 Stop），而 content 文本里泄漏
-        // 出聊天模板 markup `<tool_call><function=…><parameter=…>…`（实测
-        // session 20260923_263149bf：native 死在 15 字节 `{"fork_turns":"`，
-        // 泄漏文本却带着完整 task 串）。泄漏副本是模型的真实意图，优先于
-        // 烧掉一次 re-issue strike（重发大概率再截断）。finish_reason=length
-        // 时跳过：那里生成整体被预算砍断，markup 与 args 同残，救回无意义。
-        // schema 校验（required 齐全 + 类型转换）不过关的仍走 re-issue，
-        // 避免把死螺旋入口从"截断"换成"缺参执行失败"。
+        // ── Markup salvage: recover parameters from template markup leaked
+        // through the text channel ──
+        // mimo-family providers occasionally write the same call on two
+        // channels: the native tool_call stream's arguments are truncated
+        // mid-way (finish falsely reports Stop), while the content text leaks
+        // the chat-template markup `<tool_call><function=…><parameter=…>…`
+        // (observed in session 20260923_263149bf: the native stream died on a
+        // 15-byte `{"fork_turns":"`, while the leaked text carried the complete
+        // task string). The leaked copy is the model's real intent and takes
+        // priority over burning a re-issue strike (a re-send will most likely
+        // be truncated again). Skip when finish_reason=length: generation was
+        // cut off wholesale by the budget there, so markup and args are
+        // truncated together and salvaging is pointless. Leaks that fail schema
+        // validation (required fields present + type coercion) still go to
+        // re-issue, to avoid swapping the death-spiral entry from "truncation"
+        // to "missing-argument execution failure".
         if !truncated_by_limit && !invalid_indices.is_empty() {
             let leaked = super::text_toolcall::harvest(&full_text);
             if !leaked.is_empty() {
@@ -529,7 +535,8 @@ impl RuntimeCore {
         let error_text = e.to_string();
         let retry_prompt_template: Option<String> = config.tool.tool_error_retry_prompt.clone();
 
-        // 用户主动拒绝（输入 n）→ 立即停止，不走 recovery 重试逻辑
+        // User actively rejects (types n) → stop immediately, without going
+        // through the recovery retry logic
         if matches!(e, AgentError::ApprovalDenied { .. }) {
             tracing::info!(
                 session_id = session_id.id,

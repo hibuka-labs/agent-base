@@ -1,6 +1,7 @@
-/// 模拟 ops-omni 的实际场景：模型已调完工具，拿到 df -h 结果，需要写文字总结。
+/// Simulate the real ops-omni scenario: the model has already called a tool, got the
+/// df -h result, and now needs to write a text summary.
 ///
-/// 测试 qwen3.7-max 在"总结回复"场景下是否会产生 content。
+/// Test whether qwen3.7-max produces content in the "summarize the reply" scenario.
 use agent_base::{AgentResult, ChatMessage};
 use llm_trait::{ChatRequest, LlmProvider, ReasoningConfig, StreamChunk};
 use llm_unified::create_provider;
@@ -14,11 +15,11 @@ async fn test_summarize(
     println!("{} — thinking={}", label, enable_thinking);
     println!("{}", "=".repeat(70));
 
-    // 模拟 ops-omni 的多轮对话：用户问 → 模型调工具 → 工具返回结果 → 模型需要总结
+    // Simulate ops-omni's multi-turn conversation: user asks -> model calls a tool -> tool returns a result -> model needs to summarize
     let messages = vec![
         ChatMessage::system("你是运维工程师助手，回复简洁直接。"),
         ChatMessage::user("看下磁盘空间"),
-        // 模型之前的回复（调了工具）
+        // The model's previous reply (it called a tool)
         ChatMessage::Assistant {
             content: None,
             reasoning_content: None,
@@ -29,7 +30,7 @@ async fn test_summarize(
             }]),
             thinking_signature: None,
         },
-        // 工具返回的结果
+        // Result returned by the tool
         ChatMessage::Tool {
             tool_call_id: "call_001".to_string(),
             name: None,
@@ -84,24 +85,26 @@ async fn test_summarize(
         }
     }
 
-    println!("  💭 思考: {} 字符", thought.len());
+    println!("  💭 Thought: {} chars", thought.len());
     if !thought.is_empty() {
         let preview: String = thought.chars().take(200).collect();
         println!("     {}", preview);
     }
-    println!("  📝 回复: {} 字符", text.len());
+    println!("  📝 Reply: {} chars", text.len());
     if !text.is_empty() {
         let preview: String = text.chars().take(300).collect();
         println!("     {}", preview);
     }
-    println!("  🔧 工具调用: {} | 🏁 Stop: {}", tool_calls, has_stop);
+    println!("  🔧 Tool calls: {} | 🏁 Stop: {}", tool_calls, has_stop);
 
     if text.is_empty() && tool_calls == 0 {
-        println!("  ⚠️  空响应！react 会重试");
+        println!("  ⚠️  Empty response! react will retry");
     } else if text.is_empty() && !thought.is_empty() {
-        println!("  ⚠️  有思考无正文（思考内容应该作为兜底输出）");
+        println!(
+            "  ⚠️  Thought but no body text (the thought content should serve as fallback output)"
+        );
     } else {
-        println!("  ✅ 正常");
+        println!("  ✅ OK");
     }
 
     Ok(())
@@ -113,7 +116,7 @@ async fn main() -> AgentResult<()> {
 
     let api_key = std::env::var("DASHSCOPE_API_KEY")
         .or_else(|_| std::env::var("OPENAI_API_KEY"))
-        .map_err(|_| agent_base::AgentError::internal("API key 未设置"))?;
+        .map_err(|_| agent_base::AgentError::internal("API key is not set"))?;
 
     let base_url = std::env::var("DASHSCOPE_BASE_URL")
         .or_else(|_| std::env::var("OPENAI_BASE_URL"))

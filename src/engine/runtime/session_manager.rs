@@ -451,8 +451,9 @@ mod tests {
         assert!(m.cached_approval(&id, "read_file").await);
     }
 
-    /// D4 不变式：AllowAlways 缓存键控在 (session_id, action_key)——子 agent
-    /// 的 "always" 授权绝不泄漏到父/兄弟 session（子 agent 持独立 session_id）。
+    /// D4 invariant: the AllowAlways cache is keyed on (session_id, action_key) — a
+    /// sub-agent's "always" authorization must never leak into parent/sibling sessions
+    /// (a sub-agent holds its own session_id).
     #[tokio::test]
     async fn approval_cache_is_scoped_per_session() {
         let m = manager();
@@ -462,16 +463,16 @@ mod tests {
             .await;
         assert!(
             m.cached_approval(&child, "write_file:src/x.rs").await,
-            "同 session 命中"
+            "must hit within the same session"
         );
         assert!(
             !m.cached_approval(&parent, "write_file:src/x.rs").await,
-            "跨 session 必须未命中（子 always 不影响父）"
+            "must miss across sessions (child's always must not affect the parent)"
         );
         let sibling = m.create_session(None).await;
         assert!(
             !m.cached_approval(&sibling, "write_file:src/x.rs").await,
-            "跨 session 必须未命中（子 always 不影响兄弟）"
+            "must miss across sessions (child's always must not affect siblings)"
         );
     }
 

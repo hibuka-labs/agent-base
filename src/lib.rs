@@ -17,8 +17,8 @@ pub mod prelude {
     pub use crate::llm::LlmProvider as LlmProviderTrait;
     pub use crate::llm::{ChatResponse, ChatStream};
     pub use crate::tool::{
-        AutoContinueTool, Content, DenyAllToolPolicy, Tool, ToolContext, ToolDecision,
-        ToolMetadata, ToolPolicy, ToolRegistry, TypedTool,
+        AutoContinueTool, Content, DenyAllToolPolicy, ExecClock, ExecPauseGuard, Tool, ToolContext,
+        ToolDecision, ToolMetadata, ToolPolicy, ToolRegistry, TypedTool,
     };
     pub use crate::types::{
         AgentConfig, AgentError, AgentResult, ChatMessage, FinishReason, Language, Message,
@@ -56,8 +56,9 @@ pub use engine::{
 // Tools
 // ---------------------------------------------------------------------------
 pub use tool::{
-    ActivationContext, AutoContinueTool, Content, DenyAllToolPolicy, Tool, ToolContext,
-    ToolDecision, ToolExposure, ToolMetadata, ToolPolicy, ToolRegistry, TypedTool, UpdatePlanTool,
+    ActivationContext, AutoContinueTool, Content, DenyAllToolPolicy, ExecClock, ExecPauseGuard,
+    Tool, ToolContext, ToolDecision, ToolExposure, ToolMetadata, ToolPolicy, ToolRegistry,
+    TypedTool, UpdatePlanTool,
 };
 
 // ---------------------------------------------------------------------------

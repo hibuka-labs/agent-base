@@ -221,7 +221,7 @@ impl AgentSession {
         &self.chat_messages
     }
 
-    /// 可变引用，仅用于需要直接操作消息的高级场景。
+    /// Mutable reference, for advanced scenarios that need to operate on messages directly.
     pub fn chat_messages_mut(&mut self) -> &mut Vec<ChatMessage> {
         &mut self.chat_messages
     }
@@ -318,9 +318,11 @@ impl AgentSession {
         ));
     }
 
-    /// 转义并截取参数前 `max_chars` 个字符，供截断 WARN 直接展示原始内容。
-    /// Rust debug 转义让未闭合 JSON、控制字符与 CJK 边界清晰可辨，线上
-    /// 排查 provider 截断时不必再间接还原线内容。
+    /// Escape and truncate the arguments to their first `max_chars` characters, so the
+    /// truncation WARN can display the raw content directly. Rust debug escaping keeps
+    /// unclosed JSON, control characters, and CJK boundaries clearly distinguishable, so
+    /// troubleshooting provider truncation in production no longer requires indirectly
+    /// reconstructing the content.
     fn preview_args(args: &str, max_chars: usize) -> String {
         format!("{:?}", args.chars().take(max_chars).collect::<String>())
     }
@@ -375,9 +377,9 @@ impl AgentSession {
             .push(ChatMessage::tool(tool_call_id, content));
     }
 
-    /// 移除所有临时消息（ephemeral=true）。
+    /// Remove all ephemeral messages (ephemeral=true).
     ///
-    /// 在 turn 结束时调用，确保注入的临时内容不残留到下一轮。
+    /// Called at the end of a turn to ensure injected ephemeral content does not linger into the next turn.
     pub fn remove_ephemeral_messages(&mut self) {
         let before = self.chat_messages.len();
         self.chat_messages.retain(|m| !m.is_ephemeral());
@@ -486,7 +488,7 @@ impl AgentSession {
     /// Replace chat messages — only for persistence restore.
     /// Validates message sequence before replacing.
     ///
-    /// 仅供持久化恢复使用。调用方必须保证 messages 序列合法。
+    /// For persistence restore use only. Callers must ensure the `messages` sequence is valid.
     pub fn set_chat_messages(&mut self, messages: Vec<ChatMessage>) -> Result<(), String> {
         validate_message_sequence(&messages)?;
         // Recalculate total_tool_calls from the incoming messages so middleware
@@ -853,7 +855,7 @@ mod tests {
 
         s.set_system_prompt("real prompt");
 
-        // 非临时 System 不存在 → 插到最前；ephemeral nudge 保留原。
+        // No non-ephemeral System exists → insert at the very front; the ephemeral nudge stays where it is.
         let msgs = s.chat_messages();
         assert_eq!(msgs.len(), 3);
         assert!(
@@ -1607,9 +1609,9 @@ mod proptest_tests {
 
         #[test]
         fn preview_args_escapes_and_caps_at_max_chars(payload in "[a-z\u{4e00}-\u{9fff}\n\t]{0,400}") {
-            // 截断 WARN 的 args_preview：按字符截取（不是字节），控制字符以
-            // debug 形式转义（每个输入字符最多膨胀为 2 个字符），长度封顶在
-            // min(80, len) * 2 + 成对引号。
+            // args_preview for the truncation WARN: truncate by characters (not bytes),
+            // escape control characters in debug form (each input character expands to
+            // at most 2 characters), with length capped at min(80, len) * 2 + the paired quotes.
             let preview = AgentSession::preview_args(&payload, 80);
             let expected_cap = 2 * payload.chars().count().min(80) + 2;
             assert!(
