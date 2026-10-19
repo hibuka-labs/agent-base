@@ -76,24 +76,28 @@ impl ToolExecutionPipeline for DefaultPipeline {
         };
         let args = &*effective_args;
 
-        // 2. Execute with an **active-time** timeout: tool → global config →
-        // framework default. The budget measures active execution — stretches
-        // the tool paused while waiting on a human (see `ExecClock`, e.g. a
-        // confirmation popup) push the deadline out by exactly the paused time.
-        // Wall-clock timeouts here produce bogus `[Tool Timeout]` results while
-        // the user is still reading, with the side effects half-done.
+        // 2. Execute with an **active-time** timeout: per-call → tool → global
+        // config → framework default. The budget measures active execution —
+        // stretches the tool paused while waiting on a human (see `ExecClock`,
+        // e.g. a confirmation popup) push the deadline out by exactly the
+        // paused time. Wall-clock timeouts here produce bogus `[Tool Timeout]`
+        // results while the user is still reading, with the side effects
+        // half-done. `0` is unbounded: the tool arms its own fuse (or the call
+        // is fire-and-forget), so no watchdog is needed.
         let timeout_ms = tool
-            .timeout_ms()
+            .call_timeout_ms(args)
             .or(self.tool_timeout_ms)
             .unwrap_or(self.default_tool_timeout_ms);
-        let budget = Duration::from_millis(timeout_ms);
+        let budget = (timeout_ms > 0).then(|| Duration::from_millis(timeout_ms));
         let started = std::time::Instant::now();
         let call = tool.call(args, ctx);
         tokio::pin!(call);
         let output = loop {
             let paused = ctx.exec_clock.paused_total();
-            let Some(deadline) = started.checked_add(budget.saturating_add(paused)) else {
-                // Absurd budget — run to completion (cancel still applies).
+            let Some(deadline) = budget.and_then(|b| started.checked_add(b.saturating_add(paused)))
+            else {
+                // Unbounded budget, or an absurd one — run to completion
+                // (cancel still applies).
                 break call.as_mut().await;
             };
             tokio::select! {
@@ -103,8 +107,10 @@ impl ToolExecutionPipeline for DefaultPipeline {
                     // can start or end after this sleep was armed. Only a
                     // deadline that still holds with fresh accounting is a real
                     // overrun.
-                    let holds = started
-                        .checked_add(budget.saturating_add(ctx.exec_clock.paused_total()))
+                    let holds = budget
+                        .and_then(|b| {
+                            started.checked_add(b.saturating_add(ctx.exec_clock.paused_total()))
+                        })
                         .is_some_and(|d| std::time::Instant::now() >= d);
                     if !holds {
                         continue;
@@ -330,6 +336,84 @@ mod tests {
         let pipeline = DefaultPipeline::new(None, Some(50), None); // 50ms timeout
         let output = pipeline
             .execute(&SlowTool, &json!({}), &test_ctx())
+            .await
+            .unwrap();
+        assert_eq!(content_text(&output), "[Tool Timeout]");
+    }
+
+    /// Sleeps `delay`; its budget comes from a per-call `timeout_ms` arg via
+    /// [`Tool::call_timeout_ms`], mirroring `execute_command`.
+    struct PerCallBudgetTool {
+        delay: Duration,
+    }
+    #[async_trait]
+    impl Tool for PerCallBudgetTool {
+        fn name(&self) -> &'static str {
+            "per_call_budget"
+        }
+        fn description(&self) -> &'static str {
+            "per_call_budget"
+        }
+        fn schema(&self) -> Value {
+            json!({})
+        }
+        async fn call(&self, _args: &Value, _ctx: &ToolContext) -> AgentResult<Vec<Content>> {
+            tokio::time::sleep(self.delay).await;
+            Ok(vec![Content::text("done")])
+        }
+        fn call_timeout_ms(&self, args: &Value) -> Option<u64> {
+            args.get("timeout_ms").and_then(Value::as_u64)
+        }
+    }
+
+    #[tokio::test]
+    async fn call_timeout_overrides_framework_default() {
+        // Framework default is 50ms; the per-call budget of 5s must win, or the
+        // 200ms sleep gets cut (session 20261018_7844215b: a 660s
+        // `execute_command` budget was killed at the 600s default).
+        let pipeline = DefaultPipeline::new(None, Some(50), None);
+        let output = pipeline
+            .execute(
+                &PerCallBudgetTool {
+                    delay: Duration::from_millis(200),
+                },
+                &json!({"timeout_ms": 5000}),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(content_text(&output), "done");
+    }
+
+    #[tokio::test]
+    async fn call_timeout_zero_is_unbounded() {
+        // 0 = "never kill": no watchdog, even though the default is 50ms.
+        let pipeline = DefaultPipeline::new(None, Some(50), None);
+        let output = pipeline
+            .execute(
+                &PerCallBudgetTool {
+                    delay: Duration::from_millis(200),
+                },
+                &json!({"timeout_ms": 0}),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(content_text(&output), "done");
+    }
+
+    #[tokio::test]
+    async fn call_timeout_absent_falls_back_to_default() {
+        // No per-call budget → the 50ms default cuts the 200ms sleep.
+        let pipeline = DefaultPipeline::new(None, Some(50), None);
+        let output = pipeline
+            .execute(
+                &PerCallBudgetTool {
+                    delay: Duration::from_millis(200),
+                },
+                &json!({}),
+                &test_ctx(),
+            )
             .await
             .unwrap();
         assert_eq!(content_text(&output), "[Tool Timeout]");

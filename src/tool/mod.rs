@@ -240,6 +240,22 @@ pub trait Tool: Send + Sync {
         None // Use framework default
     }
 
+    /// Execution budget for a specific call, derived from its `args`.
+    ///
+    /// The pipeline watchdog consults this before arming: `Some(ms)` overrides
+    /// [`Tool::timeout_ms`] for this invocation, and `Some(0)` means unbounded
+    /// (no watchdog — the tool enforces its own limits, or the call is
+    /// fire-and-forget). `None` falls back to [`Tool::timeout_ms`] / config.
+    ///
+    /// Tools whose arguments carry a per-call timeout (e.g. `timeout_ms`)
+    /// MUST surface it here. Otherwise the pipeline arms its own watchdog
+    /// from the tool-level default and can kill a call that the tool was
+    /// explicitly promised more time for (session 20261018_7844215b: a
+    /// 660s `execute_command` budget was cut at the 600s framework default).
+    fn call_timeout_ms(&self, _args: &Value) -> Option<u64> {
+        self.timeout_ms()
+    }
+
     /// Machine-readable metadata for tool introspection.
     ///
     /// The default implementation derives `name` and `description` from
