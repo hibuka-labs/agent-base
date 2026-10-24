@@ -30,10 +30,10 @@ impl Default for RepeatToolLimitConfig {
         Self {
             nudge_after: DEFAULT_NUDGE_AFTER,
             block_after: DEFAULT_BLOCK_AFTER,
-            nudge_message: "You have repeatedly issued the same tool call with the same arguments \
-                (e.g. polling list_agents for progress). Sub-agent reports are pushed to you \
-                automatically the moment your turn ends — polling cannot speed them up and only \
-                burns tokens. End your turn now with a brief progress note and no further tool calls."
+            nudge_message: "You have issued the exact same tool call with the same arguments \
+                repeatedly. Identical repetition cannot change the outcome: if the call keeps \
+                failing, fix the payload or take a different action; if the work is done, \
+                write your response and end the turn."
                 .to_string(),
             block_message: "You have issued this identical tool call far too many times. The \
                 pending calls were discarded. Based on everything you already know, write your \
