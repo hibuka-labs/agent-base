@@ -728,6 +728,20 @@ impl RuntimeCore {
             .orchestrate(session_id, tool_calls, &ctx, event_rx, on_event.clone())
             .await?;
 
+        // Per-batch park tracking: whether this batch left a human step pending
+        // (e.g. a design-canvas screen awaiting a pick). Assignment, not
+        // accumulation — a later batch of real tools means the model worked on
+        // after the park, so the run is no longer simply waiting. Must land
+        // before the failure early-return below so a mixed batch (parked call
+        // plus a failed one) still records the park.
+        {
+            let awaiting = outcome.results.iter().any(|r| r.waiting_for_human);
+            self.with_session_mut(session_id, |session| {
+                session.run_state.awaiting_human = awaiting;
+            })
+            .await?;
+        }
+
         // Push assistant tool calls to session after all approvals pass
         {
             let tc: Vec<(String, String, String)> = tool_calls.to_vec();

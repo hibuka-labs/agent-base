@@ -63,6 +63,14 @@ pub struct RunState {
     /// retrying and fail with an actionable message.
     #[serde(default)]
     pub truncation_strikes: usize,
+
+    /// The latest tool batch parked on a human step (a design-canvas screen
+    /// awaiting a pick) and no tool ran after it. Overwritten per batch by
+    /// `handle_tool_calls`. When true at the end of a run, the run is
+    /// *waiting for the user* — the guard must complete instead of nudging
+    /// "continue working" over their pending answer.
+    #[serde(default)]
+    pub awaiting_human: bool,
 }
 
 impl RunState {
@@ -75,6 +83,7 @@ impl RunState {
         self.nudge_count = 0;
         self.thinking_disabled_for_rest_of_run = false;
         self.truncation_strikes = 0;
+        self.awaiting_human = false;
         // Note: original_thinking_enabled is NOT reset here
         // It should be set once when the session starts
     }
@@ -1059,6 +1068,7 @@ mod validate_tests {
             thinking_disabled_for_rest_of_run: true,
             original_thinking_enabled: true,
             truncation_strikes: 4,
+            awaiting_human: true,
         };
 
         rs.reset_for_new_run();
@@ -1070,6 +1080,7 @@ mod validate_tests {
         assert_eq!(rs.nudge_count, 0);
         assert_eq!(rs.truncation_strikes, 0);
         assert!(!rs.thinking_disabled_for_rest_of_run);
+        assert!(!rs.awaiting_human);
         // original_thinking_enabled is NOT reset
         assert!(rs.original_thinking_enabled);
     }
@@ -1518,6 +1529,7 @@ mod proptest_tests {
                 thinking_disabled_for_rest_of_run: true,
                 original_thinking_enabled: true,
                 truncation_strikes: 5,
+                awaiting_human: true,
             };
             rs.reset_for_new_run();
             assert_eq!(rs.turn_tool_calls, 0);
@@ -1527,6 +1539,7 @@ mod proptest_tests {
             assert_eq!(rs.nudge_count, 0);
             assert_eq!(rs.truncation_strikes, 0);
             assert!(!rs.thinking_disabled_for_rest_of_run);
+            assert!(!rs.awaiting_human);
             // original_thinking_enabled is NOT reset
             assert!(rs.original_thinking_enabled);
         }

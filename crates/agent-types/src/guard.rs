@@ -62,6 +62,15 @@ pub struct GuardCtx {
     pub is_reasoning_only: bool,
     pub is_empty_response: bool,
     pub is_text_only: bool,
+    /// The run ended with a human step pending: the latest tool batch parked
+    /// on human input (a design-canvas screen awaiting a pick) and no tool ran
+    /// after it. Ending here is *waiting for the user*, not an incomplete task
+    /// — the next input is their answer. A "continue working" nudge in this
+    /// state steamrolls interactive flows (session 20261022_bb8c2dc3: the
+    /// completion judge pushed the model on and it decided the user's design
+    /// choices for them).
+    #[serde(default)]
+    pub awaiting_human: bool,
     // Environment state
     pub thinking_disabled: bool,
     /// Original thinking configuration (for restoration)

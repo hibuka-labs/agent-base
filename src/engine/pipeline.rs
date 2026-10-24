@@ -170,6 +170,7 @@ mod tests {
             cancel_token: tokio_util::sync::CancellationToken::new(),
             max_output_chars: None,
             exec_clock: crate::tool::ExecClock::default(),
+            waiting_for_human: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             event_bus: crate::engine::EventBus::new(1),
         }
     }

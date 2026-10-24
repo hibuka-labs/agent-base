@@ -59,9 +59,10 @@ impl RuntimeCore {
                     s.run_state.run_has_tool_calls,
                     s.run_state.original_thinking_enabled,
                     s.run_state.truncation_strikes > 0,
+                    s.run_state.awaiting_human,
                 )
             })
-            .unwrap_or((0, 0, false, false, false));
+            .unwrap_or((0, 0, false, false, false, false));
 
         GuardCtx {
             session_id: turn_ctx.session_id.clone(),
@@ -78,6 +79,7 @@ impl RuntimeCore {
             is_reasoning_only,
             is_empty_response,
             is_text_only,
+            awaiting_human: session_data.5,
             thinking_disabled,
             original_thinking_enabled: session_data.3,
             remaining_turns: turn_ctx.max_turns.saturating_sub(turn_ctx.turn_count),
@@ -182,6 +184,7 @@ mod tests {
             is_reasoning_only: false,
             is_empty_response: false,
             is_text_only: false,
+            awaiting_human: false,
             thinking_disabled: false,
             original_thinking_enabled: true,
             remaining_turns: 50,
@@ -209,6 +212,7 @@ mod tests {
             is_reasoning_only: true,
             is_empty_response: false,
             is_text_only: false,
+            awaiting_human: false,
             thinking_disabled: true,
             original_thinking_enabled: true,
             remaining_turns: 50,
@@ -240,6 +244,7 @@ mod tests {
             is_reasoning_only: false,
             is_empty_response: false,
             is_text_only: false,
+            awaiting_human: false,
             thinking_disabled: false,
             original_thinking_enabled: true,
             remaining_turns: 50,
