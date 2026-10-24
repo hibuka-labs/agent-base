@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -127,6 +128,10 @@ pub struct ToolContext {
     /// Execution clock for this call — see [`ExecClock`]. Pause it while the
     /// tool waits on a human ([`ToolContext::pause_execution_clock`]).
     pub exec_clock: ExecClock,
+    /// Set by [`ToolContext::mark_waiting_for_human`] when the call left a
+    /// human step pending (a pick, a confirmation) instead of finishing the
+    /// work. The engine folds it into the run state after the call.
+    pub waiting_for_human: Arc<AtomicBool>,
     /// Internal runtime event bus (framework tools emit `RuntimeEvent`s here).
     /// `pub(crate)` — engine-internal; user tools should use `emit_user_event()`.
     pub(crate) event_bus: crate::engine::EventBus,
@@ -139,6 +144,14 @@ impl ToolContext {
     /// the pipeline's tool timeout does not count the paused stretch.
     pub fn pause_execution_clock(&self) -> ExecPauseGuard {
         self.exec_clock.pause()
+    }
+
+    /// Mark that this call left a human step pending (a design-canvas screen
+    /// awaiting a pick, a confirmation). The engine records it on the run: a
+    /// run that ends here is *waiting for the user*, not an incomplete task,
+    /// so the guard must not nudge "continue working" over the human's turn.
+    pub fn mark_waiting_for_human(&self) {
+        self.waiting_for_human.store(true, Ordering::Relaxed);
     }
 
     /// Send a user-space event (progress, sub-agent forwarding, structured data).
@@ -192,6 +205,7 @@ impl ToolContext {
             cancel_token: tokio_util::sync::CancellationToken::new(),
             max_output_chars: None,
             exec_clock: ExecClock::default(),
+            waiting_for_human: Arc::new(AtomicBool::new(false)),
             event_bus: crate::engine::EventBus::new(1),
         }
     }
@@ -216,6 +230,7 @@ impl ToolContext {
             cancel_token,
             max_output_chars: None,
             exec_clock: ExecClock::default(),
+            waiting_for_human: Arc::new(AtomicBool::new(false)),
             event_bus: crate::engine::EventBus::new(1),
         }
     }
@@ -722,6 +737,7 @@ mod tests {
             cancel_token: tokio_util::sync::CancellationToken::new(),
             max_output_chars: None,
             exec_clock: ExecClock::default(),
+            waiting_for_human: Arc::new(AtomicBool::new(false)),
             event_bus: crate::engine::EventBus::new(1),
         };
         ctx.emit_partial_result("tc1", "partial", true);
@@ -756,6 +772,7 @@ mod tests {
             cancel_token: tokio_util::sync::CancellationToken::new(),
             max_output_chars: None,
             exec_clock: ExecClock::default(),
+            waiting_for_human: Arc::new(AtomicBool::new(false)),
             event_bus: crate::engine::EventBus::new(4),
         };
         let mut bus_rx = ctx.event_bus.subscribe();

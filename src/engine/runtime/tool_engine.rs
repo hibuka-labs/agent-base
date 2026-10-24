@@ -135,6 +135,7 @@ impl ToolEngine {
 
         // Build ToolContext with UserEvent channel for tool-produced events
         let (user_event_tx, mut user_event_rx) = mpsc::unbounded_channel::<UserEvent>();
+        let waiting_for_human = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let tool_context = ToolContext {
             session_id: session_id.clone(),
             user_event_tx,
@@ -144,6 +145,7 @@ impl ToolEngine {
             cancel_token: ctx.cancel_token.clone(),
             max_output_chars: ctx.max_output_chars,
             exec_clock: ExecClock::default(),
+            waiting_for_human: waiting_for_human.clone(),
             event_bus: self.event_bus.clone(),
         };
 
@@ -281,6 +283,7 @@ impl ToolEngine {
             id: id.to_string(),
             name: name.to_string(),
             output: tool_result,
+            waiting_for_human: waiting_for_human.load(std::sync::atomic::Ordering::Relaxed),
         })
     }
 
@@ -716,6 +719,7 @@ impl ToolEngine {
 
         // Build ToolContext with UserEvent channel for tool-produced events
         let (user_event_tx, mut user_event_rx) = mpsc::unbounded_channel::<UserEvent>();
+        let waiting_for_human = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let tool_context = ToolContext {
             session_id: session_id.clone(),
             user_event_tx,
@@ -725,6 +729,7 @@ impl ToolEngine {
             cancel_token: ctx.cancel_token.clone(),
             max_output_chars: ctx.max_output_chars,
             exec_clock: ExecClock::default(),
+            waiting_for_human: waiting_for_human.clone(),
             event_bus: event_bus.clone(),
         };
 
@@ -863,6 +868,7 @@ impl ToolEngine {
             id: id.to_string(),
             name: name.to_string(),
             output: tool_result,
+            waiting_for_human: waiting_for_human.load(std::sync::atomic::Ordering::Relaxed),
         })
     }
 
@@ -889,6 +895,9 @@ pub struct ToolExecutionResult {
     #[allow(dead_code)]
     pub name: String,
     pub output: Vec<Content>,
+    /// The call left a human step pending (see
+    /// [`crate::tool::ToolContext::mark_waiting_for_human`]).
+    pub waiting_for_human: bool,
 }
 
 /// One failed tool call within an orchestrated batch.

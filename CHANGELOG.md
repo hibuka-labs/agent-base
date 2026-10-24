@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-10-24
+
+### Added
+- **Per-call timeout budget reaches the pipeline watchdog** —
+  `Tool::call_timeout_ms(args)` surfaces a per-call `timeout_ms` argument
+  (default `timeout_ms()`; `Some(0)` is unbounded) and `DefaultPipeline`
+  resolves the per-call budget first, then tool/config defaults. Previously
+  the watchdog armed only from the tool-level timeout, so a per-call budget
+  (execute_command's 660s) was killed at the 600s framework default before
+  its own fuse could fire.
+- **`RunState.awaiting_human` / `GuardCtx.awaiting_human`** (`agent-types`
+  0.4.0) — the latest tool batch parked on a human step (a design-canvas
+  screen awaiting a pick) and no tool ran after it: the run is *waiting for
+  the user*, not an incomplete task. Tracked per batch (assignment, not
+  accumulation) and recorded before failure early-returns, so a mixed batch
+  (parked call plus a failed one) still carries the park.
+
+### Changed
+- Repeat-tool-limit nudge reworded to cover identical repetition generally
+  (it named polling `list_agents` specifically).
+
 ## [0.10.0] - 2026-10-18
 
 ### Added
