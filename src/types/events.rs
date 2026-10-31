@@ -73,13 +73,14 @@ pub enum RuntimeEvent {
     /// A tool call that is still being streamed into existence.
     ///
     /// Tool-call arguments arrive as fragments and are only materialized into
-    /// a [`RuntimeEvent::ToolCallStarted`] once the whole turn's stream is
+    /// a [`RuntimeEvent::ActionStarted`] once the whole turn's stream is
     /// drained — multi-KB arguments (a `spawn_agent` task brief) are invisible
     /// to every consumer until then. This event makes that window observable:
     /// coarse progress on the call being drafted (`index`), enough for a UI to
     /// say "writing tool calls" instead of looking hung. It carries no
     /// argument text, only a size, and is throttled at the source.
-    ToolCallDraft {
+    #[serde(alias = "toolCallDraft")]
+    ActionDraft {
         session_id: SessionId,
         /// The call's stream index within this turn (its eventual tool-call
         /// id is not known yet).
@@ -95,7 +96,8 @@ pub enum RuntimeEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         trace_id: Option<String>,
     },
-    ToolCallStarted {
+    #[serde(alias = "toolCallStarted")]
+    ActionStarted {
         session_id: SessionId,
         tool_name: String,
         args_json: String,
@@ -104,7 +106,8 @@ pub enum RuntimeEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         trace_id: Option<String>,
     },
-    ToolCallFinished {
+    #[serde(alias = "toolCallFinished")]
+    ActionFinished {
         session_id: SessionId,
         tool_name: String,
         summary: String,
@@ -131,7 +134,9 @@ pub enum RuntimeEvent {
     },
     Checkpoint {
         session_id: SessionId,
-        checkpoint: CheckpointData,
+        /// Boxed so the announcement event stays small on the hot path (every
+        /// RuntimeEvent copy is as big as its largest variant).
+        checkpoint: Box<CheckpointData>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -180,9 +185,9 @@ impl RuntimeEvent {
         match self {
             RuntimeEvent::TextDelta { session_id, .. } => session_id,
             RuntimeEvent::ThoughtDelta { session_id, .. } => session_id,
-            RuntimeEvent::ToolCallDraft { session_id, .. } => session_id,
-            RuntimeEvent::ToolCallStarted { session_id, .. } => session_id,
-            RuntimeEvent::ToolCallFinished { session_id, .. } => session_id,
+            RuntimeEvent::ActionDraft { session_id, .. } => session_id,
+            RuntimeEvent::ActionStarted { session_id, .. } => session_id,
+            RuntimeEvent::ActionFinished { session_id, .. } => session_id,
             RuntimeEvent::AwaitingApproval { session_id, .. } => session_id,
             RuntimeEvent::Checkpoint { session_id, .. } => session_id,
             RuntimeEvent::RunFinished { session_id, .. } => session_id,
@@ -197,9 +202,9 @@ impl RuntimeEvent {
         match self {
             RuntimeEvent::TextDelta { agent_id, .. } => agent_id.as_deref(),
             RuntimeEvent::ThoughtDelta { agent_id, .. } => agent_id.as_deref(),
-            RuntimeEvent::ToolCallDraft { agent_id, .. } => agent_id.as_deref(),
-            RuntimeEvent::ToolCallStarted { agent_id, .. } => agent_id.as_deref(),
-            RuntimeEvent::ToolCallFinished { agent_id, .. } => agent_id.as_deref(),
+            RuntimeEvent::ActionDraft { agent_id, .. } => agent_id.as_deref(),
+            RuntimeEvent::ActionStarted { agent_id, .. } => agent_id.as_deref(),
+            RuntimeEvent::ActionFinished { agent_id, .. } => agent_id.as_deref(),
             RuntimeEvent::AwaitingApproval { agent_id, .. } => agent_id.as_deref(),
             RuntimeEvent::Checkpoint { agent_id, .. } => agent_id.as_deref(),
             RuntimeEvent::RunFinished { agent_id, .. } => agent_id.as_deref(),
@@ -214,9 +219,9 @@ impl RuntimeEvent {
         match self {
             RuntimeEvent::TextDelta { trace_id, .. } => trace_id.as_deref(),
             RuntimeEvent::ThoughtDelta { trace_id, .. } => trace_id.as_deref(),
-            RuntimeEvent::ToolCallDraft { trace_id, .. } => trace_id.as_deref(),
-            RuntimeEvent::ToolCallStarted { trace_id, .. } => trace_id.as_deref(),
-            RuntimeEvent::ToolCallFinished { trace_id, .. } => trace_id.as_deref(),
+            RuntimeEvent::ActionDraft { trace_id, .. } => trace_id.as_deref(),
+            RuntimeEvent::ActionStarted { trace_id, .. } => trace_id.as_deref(),
+            RuntimeEvent::ActionFinished { trace_id, .. } => trace_id.as_deref(),
             RuntimeEvent::AwaitingApproval { trace_id, .. } => trace_id.as_deref(),
             RuntimeEvent::Checkpoint { trace_id, .. } => trace_id.as_deref(),
             RuntimeEvent::RunFinished { trace_id, .. } => trace_id.as_deref(),
@@ -232,9 +237,9 @@ impl RuntimeEvent {
         match &mut self {
             RuntimeEvent::TextDelta { agent_id, .. }
             | RuntimeEvent::ThoughtDelta { agent_id, .. }
-            | RuntimeEvent::ToolCallDraft { agent_id, .. }
-            | RuntimeEvent::ToolCallStarted { agent_id, .. }
-            | RuntimeEvent::ToolCallFinished { agent_id, .. }
+            | RuntimeEvent::ActionDraft { agent_id, .. }
+            | RuntimeEvent::ActionStarted { agent_id, .. }
+            | RuntimeEvent::ActionFinished { agent_id, .. }
             | RuntimeEvent::AwaitingApproval { agent_id, .. }
             | RuntimeEvent::Checkpoint { agent_id, .. }
             | RuntimeEvent::RunFinished { agent_id, .. }
@@ -249,7 +254,9 @@ impl RuntimeEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{CheckpointStep, PlanStepStatus, RiskLevel};
+    use crate::types::{
+        ActionFormat, CheckpointStep, MigrationKind, PlanStepStatus, RiskLevel, RunState,
+    };
 
     fn sid(id: u64) -> SessionId {
         SessionId::new(id)
@@ -267,11 +274,43 @@ mod tests {
     }
 
     fn checkpoint() -> CheckpointData {
-        CheckpointData {
-            session_id: sid(42),
-            user_input: "input".to_string(),
-            step: CheckpointStep::AfterUserInput,
-            turn_count: 0,
+        CheckpointData::new(
+            sid(42),
+            "input",
+            CheckpointStep::AfterUserInput,
+            0,
+            ActionFormat::ToolCall,
+            RunState::default(),
+        )
+    }
+
+    #[test]
+    fn checkpoint_event_reads_pre_m3_jsonl_fixture() {
+        // A journal line written by a pre-M3 binary: tool-call triples, no
+        // version/backend fields. Must decode with its migration mark intact
+        // (旧 checkpoint/JSONL fixture → 新二进制可读).
+        let line = r#"{"runtimeEventType":"checkpoint","session_id":{"id":7,"external_id":"s7"},"checkpoint":{"session_id":{"id":7,"external_id":"s7"},"user_input":"resume me","step":{"BeforeToolCalls":{"tool_calls":[["call_1","echo","{\"text\":\"hi\"}"]]}},"turn_count":2}}"#;
+        let event: RuntimeEvent = serde_json::from_str(line).unwrap();
+        match event {
+            RuntimeEvent::Checkpoint { checkpoint, .. } => {
+                assert_eq!(checkpoint.version, 0);
+                assert_eq!(checkpoint.backend, ActionFormat::ToolCall);
+                let mark = checkpoint
+                    .migrated_from
+                    .as_ref()
+                    .expect("legacy payload must carry its source mark");
+                assert_eq!(mark.kind, MigrationKind::ToolCallTriplesV0);
+                match &checkpoint.step {
+                    CheckpointStep::BeforeActions { actions } => {
+                        assert_eq!(actions.len(), 1);
+                        assert_eq!(actions[0].id, "call_1");
+                        assert_eq!(actions[0].name, "echo");
+                        assert_eq!(actions[0].raw_args(), r#"{"text":"hi"}"#);
+                    }
+                    other => panic!("expected BeforeActions, got {other:?}"),
+                }
+            }
+            other => panic!("expected Checkpoint event, got {other:?}"),
         }
     }
 
@@ -290,14 +329,14 @@ mod tests {
                 agent_id: Some("a".into()),
                 trace_id: Some("t".into()),
             },
-            RuntimeEvent::ToolCallStarted {
+            RuntimeEvent::ActionStarted {
                 session_id: sid(3),
                 tool_name: "read".into(),
                 args_json: "{}".into(),
                 agent_id: Some("a".into()),
                 trace_id: Some("t".into()),
             },
-            RuntimeEvent::ToolCallFinished {
+            RuntimeEvent::ActionFinished {
                 session_id: sid(4),
                 tool_name: "read".into(),
                 summary: "ok".into(),
@@ -314,7 +353,7 @@ mod tests {
             },
             RuntimeEvent::Checkpoint {
                 session_id: sid(6),
-                checkpoint: checkpoint(),
+                checkpoint: Box::new(checkpoint()),
                 agent_id: Some("a".into()),
                 trace_id: Some("t".into()),
             },
@@ -345,7 +384,7 @@ mod tests {
                 agent_id: Some("a".into()),
                 trace_id: Some("t".into()),
             },
-            RuntimeEvent::ToolCallDraft {
+            RuntimeEvent::ActionDraft {
                 session_id: sid(11),
                 index: 0,
                 name: "spawn_agent".into(),
@@ -379,14 +418,14 @@ mod tests {
                 agent_id: None,
                 trace_id: None,
             },
-            RuntimeEvent::ToolCallStarted {
+            RuntimeEvent::ActionStarted {
                 session_id: sid(3),
                 tool_name: "read".into(),
                 args_json: "{}".into(),
                 agent_id: None,
                 trace_id: None,
             },
-            RuntimeEvent::ToolCallFinished {
+            RuntimeEvent::ActionFinished {
                 session_id: sid(4),
                 tool_name: "read".into(),
                 summary: "ok".into(),
@@ -403,7 +442,7 @@ mod tests {
             },
             RuntimeEvent::Checkpoint {
                 session_id: sid(6),
-                checkpoint: checkpoint(),
+                checkpoint: Box::new(checkpoint()),
                 agent_id: None,
                 trace_id: None,
             },
@@ -434,7 +473,7 @@ mod tests {
                 agent_id: None,
                 trace_id: None,
             },
-            RuntimeEvent::ToolCallDraft {
+            RuntimeEvent::ActionDraft {
                 session_id: sid(11),
                 index: 0,
                 name: "spawn_agent".into(),
@@ -466,7 +505,7 @@ mod tests {
 
     #[test]
     fn runtime_event_serde_uses_camel_case_tag() {
-        let ev = RuntimeEvent::ToolCallStarted {
+        let ev = RuntimeEvent::ActionStarted {
             session_id: SessionId::with_external_id(7, "ext"),
             tool_name: "read".into(),
             args_json: "{}".into(),
@@ -474,7 +513,7 @@ mod tests {
             trace_id: None,
         };
         let v = serde_json::to_value(&ev).unwrap();
-        assert_eq!(v["runtimeEventType"], "toolCallStarted");
+        assert_eq!(v["runtimeEventType"], "actionStarted");
         assert_eq!(v["session_id"]["id"], serde_json::json!(7));
         assert_eq!(v["session_id"]["external_id"], "ext");
         // trace_id is None → field skipped
@@ -488,7 +527,7 @@ mod tests {
 
     #[test]
     fn tool_call_draft_serde_round_trip() {
-        let ev = RuntimeEvent::ToolCallDraft {
+        let ev = RuntimeEvent::ActionDraft {
             session_id: sid(3),
             index: 2,
             name: "spawn_agent".into(),
@@ -498,13 +537,19 @@ mod tests {
             trace_id: None,
         };
         let v = serde_json::to_value(&ev).unwrap();
-        assert_eq!(v["runtimeEventType"], "toolCallDraft");
+        assert_eq!(v["runtimeEventType"], "actionDraft");
         assert_eq!(v["args_len"], 640);
         assert!(v.get("agent_id").is_none(), "None ids stay skipped");
 
+        // Old wire names (pre-M3 rename) still deserialize via serde alias.
+        let mut old = v.clone();
+        old["runtimeEventType"] = serde_json::json!("toolCallDraft");
+        let legacy: RuntimeEvent = serde_json::from_value(old).unwrap();
+        assert!(matches!(legacy, RuntimeEvent::ActionDraft { .. }));
+
         let back: RuntimeEvent = serde_json::from_value(v).unwrap();
         match back {
-            RuntimeEvent::ToolCallDraft {
+            RuntimeEvent::ActionDraft {
                 index,
                 name,
                 args_len,
@@ -516,7 +561,7 @@ mod tests {
                 assert_eq!(args_len, 640);
                 assert_eq!(count, 4);
             }
-            other => panic!("expected ToolCallDraft, got {other:?}"),
+            other => panic!("expected ActionDraft, got {other:?}"),
         }
     }
 

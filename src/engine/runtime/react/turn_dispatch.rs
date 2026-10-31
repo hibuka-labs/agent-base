@@ -2,10 +2,16 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::broadcast;
 
+use crate::engine::executor::{ExecError, ParseOutcome};
 use crate::engine::runtime::llm_engine::LlmTurnResult;
 use crate::engine::runtime::plan_runner::RuntimeCore;
-use crate::types::{AgentResult, FinishReason, MessageRole, RunOutcome, RuntimeEvent, SessionId};
+use crate::types::{
+    Action, ActionFormat, ActionOutcome, AgentError, AgentResult, BatchStatus, CheckpointData,
+    CheckpointStep, FinishReason, MessageRole, Observation, RunOutcome, RuntimeEvent, SessionId,
+};
 
+use super::entry::drain_locked;
+use super::tool_executor::ToolCallExecutor;
 use super::turn_end::TurnEndCtx;
 use super::turn_guard::{TurnCtx, TurnMetrics};
 use super::turn_loop::PostLlmMwResult;
@@ -34,18 +40,7 @@ impl RuntimeCore {
     where
         F: FnMut(RuntimeEvent) -> AgentResult<()> + Send + 'static,
     {
-        let LlmTurnResult {
-            full_text,
-            reasoning_text,
-            is_tool_call,
-            tool_calls,
-            usage,
-            finish_reason,
-            ttft_ms,
-            llm_duration_ms,
-            reasoning_only,
-            thinking_signature: _,
-        } = match result {
+        let turn = match result {
             Ok(r) => r,
             Err(e) => {
                 return self
@@ -61,42 +56,38 @@ impl RuntimeCore {
             }
         };
 
-        let finish_reason = FinishReason::from_raw(finish_reason.as_deref());
+        let finish_reason = FinishReason::from_raw(turn.finish_reason.as_deref());
         tracing::info!(
             session_id = session_id.id,
             turn = turn_count,
-            text_len = full_text.len(),
-            is_tool_call = is_tool_call,
-            tool_call_count = tool_calls.len(),
+            text_len = turn.full_text.len(),
+            is_tool_call = turn.is_tool_call,
+            tool_call_count = turn.tool_calls.len(),
             "LLM turn result"
         );
 
-        let text_len = full_text.len() as u64;
-        let has_thinking = !reasoning_text.is_empty();
-        let thinking_bytes = reasoning_text.len() as u64;
-        let tool_calls_parsed: Vec<(String, String, String)> = tool_calls
-            .iter()
-            .map(|tc| {
-                let id = tc
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let name = tc
-                    .get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let args = tc
-                    .get("function")
-                    .and_then(|f| f.get("arguments"))
-                    .and_then(|a| a.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                (id, name, args)
-            })
-            .collect();
+        let text_len = turn.full_text.len() as u64;
+        let has_thinking = !turn.reasoning_text.is_empty();
+        let thinking_bytes = turn.reasoning_text.len() as u64;
+        // Four-state parse (M3 seam, D4+OV-7). The built-in tool-call backend
+        // owns envelope turns; a text turn goes to the mounted action backend
+        // (T10c) — it claims its own shape. A backend that cannot classify a
+        // turn its own parse routed to it is a routing bug and fails the run
+        // loudly (never a silent nudge).
+        let parse = if turn.is_tool_call {
+            ToolCallExecutor::new(self, session_id.clone()).classify(&turn)
+        } else if let Some(backend) = &self.action_backend {
+            match backend.lock().await.parse(&turn) {
+                Ok(parse) => parse,
+                Err(e) => {
+                    return Err(AgentError::internal(format!(
+                        "action backend failed to classify a text turn: {e}"
+                    )));
+                }
+            }
+        } else {
+            ToolCallExecutor::new(self, session_id.clone()).classify(&turn)
+        };
         let available_tools: Vec<String> = tool_definitions
             .iter()
             .filter_map(|d| {
@@ -106,6 +97,19 @@ impl RuntimeCore {
                     .map(|s| s.to_string())
             })
             .collect();
+
+        let LlmTurnResult {
+            full_text,
+            reasoning_text,
+            usage,
+            ttft_ms,
+            llm_duration_ms,
+            reasoning_only,
+            is_tool_call: _,
+            tool_calls: _,
+            finish_reason: _,
+            thinking_signature: _,
+        } = turn;
 
         let turn_ctx = TurnCtx {
             session_id,
@@ -136,8 +140,7 @@ impl RuntimeCore {
             &metrics,
             full_text,
             reasoning_text,
-            is_tool_call,
-            tool_calls_parsed,
+            parse,
             &available_tools,
             turn_count,
             finish_reason,
@@ -156,16 +159,20 @@ impl RuntimeCore {
         turn_ctx: &TurnCtx<'_>,
         metrics: &TurnMetrics<'_>,
     ) -> AgentResult<TurnFlow> {
-        let strikes = self
+        let (strikes, thinking_disabled) = self
             .with_session_mut(turn_ctx.session_id, |session| {
-                session.run_state.record_reasoning_only()
+                let strikes = session.run_state.record_reasoning_only();
+                (strikes, session.run_state.thinking_disabled_for_rest_of_run)
             })
             .await?;
-        let thinking_disabled = self
-            .with_session_mut(turn_ctx.session_id, |session| {
-                session.run_state.thinking_disabled_for_rest_of_run
-            })
-            .await?;
+        if thinking_disabled {
+            // The observability for the strike-3 flip lives here: RunState is
+            // a pure type (agent-types stays I/O-free).
+            tracing::info!(
+                strikes,
+                "reasoning_only_strikes reached 3, disabling thinking for rest of run"
+            );
+        }
         tracing::warn!(
             session_id = turn_ctx.session_id.id,
             turn = turn_ctx.turn_count,
@@ -183,7 +190,7 @@ impl RuntimeCore {
     }
 
     /// Normal LLM response: apply post-LLM middleware, push messages, then
-    /// dispatch to the appropriate outcome branch.
+    /// dispatch on the backend's four-state parse verdict (M3 seam).
     #[allow(clippy::too_many_arguments)]
     async fn handle_post_llm_result<F>(
         &self,
@@ -191,8 +198,7 @@ impl RuntimeCore {
         metrics: &TurnMetrics<'_>,
         full_text: String,
         reasoning_text: String,
-        is_tool_call: bool,
-        tool_calls_parsed: Vec<(String, String, String)>,
+        parse: ParseOutcome,
         available_tools: &[String],
         turn_count: u32,
         finish_reason: FinishReason,
@@ -206,28 +212,34 @@ impl RuntimeCore {
             .apply_post_llm_mw(
                 turn_ctx.session_id,
                 full_text,
-                is_tool_call,
-                tool_calls_parsed,
+                parse,
                 available_tools,
                 turn_count,
                 finish_reason.clone(),
             )
             .await?;
 
-        // Push text-only assistant message (when there are NO tool calls).
-        if !result.skip_push && !result.full_text.is_empty() && !result.is_tool_call {
+        let PostLlmMwResult {
+            full_text,
+            parse,
+            skip_push,
+            follow_up_message,
+        } = result;
+
+        // Push text-only assistant message (when there is no action intent).
+        if !skip_push && !full_text.is_empty() && !parse.has_action_intent() {
             let reasoning = reasoning_text.clone();
             self.with_session_mut(turn_ctx.session_id, |session| {
                 if !reasoning.is_empty() {
-                    session.push_assistant_with_reasoning(&result.full_text, &reasoning);
+                    session.push_assistant_with_reasoning(&full_text, &reasoning);
                 } else {
-                    session.push_message(MessageRole::Assistant, &result.full_text);
+                    session.push_message(MessageRole::Assistant, &full_text);
                 }
             })
             .await?;
         }
 
-        if let Some(follow_up) = result.follow_up_message {
+        if let Some(follow_up) = follow_up_message {
             self.with_session_mut(turn_ctx.session_id, |session| {
                 session.push_message(MessageRole::User, &follow_up);
             })
@@ -235,29 +247,45 @@ impl RuntimeCore {
             return Ok(TurnFlow::Continue);
         }
 
-        if result.full_text.is_empty() && !result.is_tool_call {
-            return self.handle_empty_response(turn_ctx, metrics).await;
+        // Four-state dispatch (D4+OV-7) — behavior-identical to the old
+        // is_tool_call/tool_calls chain. Empty text wins over Malformed: a
+        // truncated finish with no text still takes the old empty branch.
+        match parse {
+            ParseOutcome::Actions(actions) if !actions.is_empty() => {
+                // Tool-format actions run the tool flow (the built-in
+                // backend's own protocol: truncation rescue, breaker,
+                // recovery). Any other format came from the mounted action
+                // backend and runs its flow (T10c).
+                if actions[0].format == ActionFormat::ToolCall {
+                    self.handle_tool_call_branch(
+                        turn_ctx,
+                        metrics,
+                        actions,
+                        full_text,
+                        reasoning_text,
+                        event_rx,
+                        on_event,
+                    )
+                    .await
+                } else {
+                    self.handle_backend_action_branch(
+                        turn_ctx, metrics, actions, event_rx, on_event,
+                    )
+                    .await
+                }
+            }
+            ParseOutcome::Incomplete | ParseOutcome::Actions(_) => {
+                self.handle_incomplete_tool_call(turn_ctx, metrics).await
+            }
+            ParseOutcome::Empty | ParseOutcome::Malformed => {
+                if full_text.is_empty() {
+                    self.handle_empty_response(turn_ctx, metrics).await
+                } else {
+                    self.handle_finish_anomaly(turn_ctx, metrics, &finish_reason, &full_text)
+                        .await
+                }
+            }
         }
-
-        if result.is_tool_call && !result.tool_calls.is_empty() {
-            return self
-                .handle_tool_call_branch(
-                    turn_ctx,
-                    metrics,
-                    result,
-                    reasoning_text,
-                    event_rx,
-                    on_event,
-                )
-                .await;
-        }
-
-        if result.is_tool_call && result.tool_calls.is_empty() {
-            return self.handle_incomplete_tool_call(turn_ctx, metrics).await;
-        }
-
-        self.handle_finish_anomaly(turn_ctx, metrics, &finish_reason, &result.full_text)
-            .await
     }
 
     /// Empty response: no text, no reasoning, no tool call. Nudge the model;
@@ -288,11 +316,13 @@ impl RuntimeCore {
     }
 
     /// Tool call branch: notify guard, handle RestoreThinking, then execute.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_tool_call_branch<F>(
         &self,
         turn_ctx: &TurnCtx<'_>,
         metrics: &TurnMetrics<'_>,
-        result: PostLlmMwResult,
+        actions: Vec<Action>,
+        full_text: String,
         reasoning_text: String,
         event_rx: &mut broadcast::Receiver<RuntimeEvent>,
         on_event: Arc<Mutex<F>>,
@@ -322,21 +352,270 @@ impl RuntimeCore {
         }
 
         // 3. Execute tools regardless of guard decision
-        self.run_tool_turn(
-            turn_ctx.session_id,
-            turn_ctx.user_input,
-            turn_ctx.turn_count,
-            turn_ctx.turn_start,
-            turn_ctx.model,
-            result.tool_calls,
-            turn_ctx.finish_reason,
-            reasoning_text,
-            result.full_text,
-            metrics,
-            event_rx,
-            on_event,
-        )
-        .await
+        ToolCallExecutor::new(self, turn_ctx.session_id.clone())
+            .run_actions(
+                turn_ctx.user_input,
+                turn_ctx.turn_count,
+                turn_ctx.turn_start,
+                turn_ctx.model,
+                actions,
+                turn_ctx.finish_reason,
+                reasoning_text,
+                full_text,
+                metrics,
+                event_rx,
+                on_event,
+            )
+            .await
+    }
+
+    /// Mounted-backend action branch (T10c): the same turn plumbing the tool
+    /// backend gets — guard notification, 账+数 checkpoints, turn-end metrics —
+    /// around the backend's own `execute` and history protocol. The tool
+    /// backend's truncation rescue / markup salvage / circuit breaker is its
+    /// protocol and does not run here (flow-face unification stays the named
+    /// T10 debt). An interrupt mid-batch leaves the batch dangling from
+    /// `BeforeActions` on — resume synthesizes its fates (OV-4).
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_backend_action_branch<F>(
+        &self,
+        turn_ctx: &TurnCtx<'_>,
+        metrics: &TurnMetrics<'_>,
+        actions: Vec<Action>,
+        event_rx: &mut broadcast::Receiver<RuntimeEvent>,
+        on_event: Arc<Mutex<F>>,
+    ) -> AgentResult<TurnFlow>
+    where
+        F: FnMut(RuntimeEvent) -> AgentResult<()> + Send + 'static,
+    {
+        let session_id = turn_ctx.session_id;
+        let Some(backend) = &self.action_backend else {
+            return Err(AgentError::internal(
+                "non-tool actions with no action backend mounted (routing bug)",
+            ));
+        };
+
+        // 1. Notify the guard about the action batch (D5 counts actions the
+        //    same way calls are counted) and honor RestoreThinking — the same
+        //    turn plumbing the tool branch runs.
+        let thinking_disabled = self
+            .session_manager
+            .session_or_err(session_id)
+            .await
+            .map(|s| s.run_state.thinking_disabled_for_rest_of_run)
+            .unwrap_or(false);
+        let guard_ctx = self
+            .build_guard_ctx(turn_ctx, "", false, false, false, thinking_disabled)
+            .await;
+        let decision = self.guard.on_tool_call(&guard_ctx).await;
+        if matches!(
+            decision,
+            crate::engine::react_loop_guard::GuardDecision::RestoreThinking
+        ) {
+            self.execute_guard_decision(decision, turn_ctx, metrics)
+                .await?;
+        }
+
+        let mut slot = backend.lock().await;
+        // 2. Session liveness (D10): one rebuild attempt, never a loop.
+        if !slot.is_alive() {
+            slot.rebuild().await.map_err(|e| {
+                AgentError::internal(format!("action backend session rebuild failed: {e}"))
+            })?;
+        }
+        let format = slot.format();
+
+        // 3. 账+数 in one write (D5+OV-11): the step and the counting state
+        //    that goes with it land on the journal together.
+        let run_state = self
+            .with_session_mut(session_id, |session| session.run_state.clone())
+            .await?;
+        self.event_bus.emit(RuntimeEvent::Checkpoint {
+            session_id: session_id.clone(),
+            checkpoint: Box::new(CheckpointData::new(
+                session_id.clone(),
+                turn_ctx.user_input.to_string(),
+                CheckpointStep::BeforeActions {
+                    actions: actions.clone(),
+                },
+                turn_ctx.turn_count,
+                format,
+                run_state,
+            )),
+            agent_id: None,
+            trace_id: None,
+        });
+
+        // 4. Execute against the run's ExecCtx (cancel + interaction). A
+        //    user interrupt releases the batch mid-compute.
+        let tool_start = std::time::Instant::now();
+        let ctx = self.exec_ctx();
+        let executed = tokio::select! {
+            biased;
+            out = slot.execute(actions.clone(), &ctx) => Some(out),
+            _ = ctx.cancel.cancelled() => None,
+        };
+        let n = actions.len() as u32;
+        let names: Vec<String> = actions.iter().map(|a| a.name.clone()).collect();
+        let duration_ms = tool_start.elapsed().as_millis() as u64;
+        match executed {
+            None => {
+                // Interrupt: nothing after BeforeActions is written, so the
+                // batch stays dangling and resume reconstructs its fates (D3).
+                // Same terminal shape as the tool flow's cancelled error:
+                // drain, persist, ride up (RunCancelled comes from run_turn).
+                drop(slot);
+                drain_locked(event_rx, &on_event)?;
+                let session = self.session_manager.session_or_err(session_id).await?;
+                if let Err(e) = self.session_manager.session_store().save(&session).await {
+                    tracing::warn!(session_id = session_id.id, error = %e, "Failed to persist session");
+                    let config = self.config_snapshot_async().await;
+                    if config.execution.fail_on_persist_error {
+                        return Err(AgentError::internal(format!(
+                            "Session persistence failed: {e}"
+                        )));
+                    }
+                }
+                Err(AgentError::Cancelled)
+            }
+            Some(Ok(observation)) => {
+                // The backend's protocol pair, pushed verbatim (D7 — the
+                // kernel never interprets history_messages).
+                self.with_session_mut(session_id, |session| {
+                    for msg in &observation.history_messages {
+                        session.push_chat_message(msg.clone());
+                    }
+                })
+                .await?;
+                // 5. Counting + AfterActions in one write (D5+OV-11): the
+                //    batch ran to fates (D15), so it counts as one batch.
+                let run_state = self
+                    .with_session_mut(session_id, |session| {
+                        session.run_state.record_actions(actions.len());
+                        session.run_state.clone()
+                    })
+                    .await?;
+                let ok = observation.outcomes.iter().filter(|o| o.ok).count() as u32;
+                self.event_bus.emit(RuntimeEvent::Checkpoint {
+                    session_id: session_id.clone(),
+                    checkpoint: Box::new(CheckpointData::new(
+                        session_id.clone(),
+                        turn_ctx.user_input.to_string(),
+                        CheckpointStep::AfterActions {
+                            actions,
+                            observation: Some(observation),
+                        },
+                        turn_ctx.turn_count,
+                        format,
+                        run_state,
+                    )),
+                    agent_id: None,
+                    trace_id: None,
+                });
+                self.fire_turn_end(TurnEndCtx {
+                    ttft_ms: metrics.ttft_ms,
+                    llm_duration_ms: metrics.llm_duration_ms,
+                    tool_duration_ms: duration_ms,
+                    usage: metrics.usage,
+                    text_length: metrics.text_len,
+                    has_thinking: metrics.has_thinking,
+                    thinking_bytes: metrics.thinking_bytes,
+                    tool_call_count: n,
+                    tools_used: &names,
+                    tool_success: ok,
+                    tool_failed: n - ok,
+                    llm_calls: 1,
+                    ..TurnEndCtx::new(
+                        session_id,
+                        turn_ctx.turn_count,
+                        turn_ctx.turn_start,
+                        turn_ctx.model,
+                        turn_ctx.user_input,
+                        RunOutcome::Completed,
+                    )
+                })
+                .await;
+                Ok(TurnFlow::Continue)
+            }
+            Some(Err(ExecError::NothingRan { reason })) => {
+                // D15: not one action got off the ground. The fates say so —
+                // the backend renders them in its own shape — and the batch
+                // still lands as a checkpoint pair, so resume replays this
+                // story verbatim instead of synthesizing a second one. The
+                // tool backend's consecutive-failure recovery is tool
+                // protocol and does not apply here; the model reads the
+                // reason and adapts.
+                let fates: Vec<ActionOutcome> = actions
+                    .iter()
+                    .map(|a| ActionOutcome {
+                        action_id: a.id.clone(),
+                        name: a.name.clone(),
+                        ok: false,
+                        denied: false,
+                        summary: format!("not run ({reason})"),
+                        details: None,
+                    })
+                    .collect();
+                let history_messages = slot.render_fates(&actions, &fates);
+                drop(slot);
+                self.with_session_mut(session_id, |session| {
+                    for msg in &history_messages {
+                        session.push_chat_message(msg.clone());
+                    }
+                })
+                .await?;
+                let run_state = self
+                    .with_session_mut(session_id, |session| session.run_state.clone())
+                    .await?;
+                self.event_bus.emit(RuntimeEvent::Checkpoint {
+                    session_id: session_id.clone(),
+                    checkpoint: Box::new(CheckpointData::new(
+                        session_id.clone(),
+                        turn_ctx.user_input.to_string(),
+                        CheckpointStep::AfterActions {
+                            actions,
+                            observation: Some(Observation {
+                                outcomes: fates,
+                                events: vec![],
+                                history_messages,
+                                batch_status: BatchStatus::Completed,
+                            }),
+                        },
+                        turn_ctx.turn_count,
+                        format,
+                        run_state,
+                    )),
+                    agent_id: None,
+                    trace_id: None,
+                });
+                self.fire_turn_end(TurnEndCtx {
+                    ttft_ms: metrics.ttft_ms,
+                    llm_duration_ms: metrics.llm_duration_ms,
+                    tool_duration_ms: duration_ms,
+                    usage: metrics.usage,
+                    text_length: metrics.text_len,
+                    has_thinking: metrics.has_thinking,
+                    thinking_bytes: metrics.thinking_bytes,
+                    tool_call_count: n,
+                    tools_used: &names,
+                    tool_failed: n,
+                    error_message: Some(&reason),
+                    llm_calls: 1,
+                    ..TurnEndCtx::new(
+                        session_id,
+                        turn_ctx.turn_count,
+                        turn_ctx.turn_start,
+                        turn_ctx.model,
+                        turn_ctx.user_input,
+                        RunOutcome::Failed {
+                            error: reason.clone(),
+                        },
+                    )
+                })
+                .await;
+                Ok(TurnFlow::Continue)
+            }
+        }
     }
 
     /// Incomplete tool call: model signalled tool_use but no complete tool calls

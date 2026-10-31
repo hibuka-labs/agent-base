@@ -1,8 +1,10 @@
 use std::sync::{Arc, Mutex, RwLock as StdRwLock};
+use std::time::Duration;
 use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::engine::context::{ContextCompaction, ContextWindowManager};
+use crate::engine::executor::{ActionBackend, ExecCtx, InteractionChannel};
 use crate::engine::middleware::MiddlewareRef;
 use crate::engine::react_loop_guard::{NoopGuard, ReactLoopGuard};
 use crate::engine::runtime::event_bus::EventBus;
@@ -11,7 +13,7 @@ use crate::engine::runtime::message_queue::MessageQueue;
 use crate::engine::runtime::session_manager::SessionManager;
 use crate::engine::runtime::tool_engine::ToolEngine;
 use crate::types::ConvertToLlmFn;
-use crate::types::{AgentConfig, AgentError, AgentResult, SessionId, TurnContext};
+use crate::types::{ActionFormat, AgentConfig, AgentError, AgentResult, SessionId, TurnContext};
 
 /// Turn-end callback type: receives TurnContext, no return value.
 pub type TurnEndCallback = Arc<dyn Fn(&TurnContext) + Send + Sync>;
@@ -40,6 +42,16 @@ pub(crate) struct RuntimeCore {
     /// pending notices into the event stream at run end; the sender side is
     /// cloned out to guards via `ReactLoopGuard::set_notice`.
     pub(crate) notice_rx: Mutex<mpsc::UnboundedReceiver<crate::types::Notice>>,
+    /// The mounted action backend (T10c): text turns route to it, envelope
+    /// turns keep the built-in tool-call backend. One per runtime — build one
+    /// runtime per session when the backend holds a resident engine.
+    pub(crate) action_backend: Option<tokio::sync::Mutex<Box<dyn ActionBackend>>>,
+    /// Product interaction surface for the action backend's `ExecCtx` (OV-6);
+    /// fail-closed stand-in when the product mounts none.
+    pub(crate) interact: Arc<dyn InteractionChannel>,
+    /// Per-interaction deadline for the action backend's `ExecCtx` (`None` =
+    /// unbounded human time — the run's cancel token is the only guard).
+    pub(crate) interact_timeout: Option<Duration>,
 }
 
 impl RuntimeCore {
@@ -55,6 +67,9 @@ impl RuntimeCore {
         convert_to_llm: Option<ConvertToLlmFn>,
         guard: Option<Arc<dyn ReactLoopGuard>>,
         context_compactor: Option<Arc<dyn ContextCompaction>>,
+        action_backend: Option<Box<dyn ActionBackend>>,
+        interact: Arc<dyn InteractionChannel>,
+        interact_timeout: Option<Duration>,
     ) -> Self {
         // Engine notice channel (Batch E): guards get the sender via
         // set_notice; drain_notices forwards pending notices at run end.
@@ -77,7 +92,28 @@ impl RuntimeCore {
             guard: guard.unwrap_or_else(|| Arc::new(NoopGuard)),
             context_compactor,
             notice_rx: Mutex::new(notice_rx),
+            action_backend: action_backend.map(tokio::sync::Mutex::new),
+            interact,
+            interact_timeout,
         }
+    }
+
+    /// One run's execution context for a mounted action backend (T10c): the
+    /// run's cancel token plus the product's interaction surface, under the
+    /// configured per-interaction deadline.
+    pub(crate) fn exec_ctx(&self) -> ExecCtx {
+        ExecCtx::new(self.cancel_token(), Arc::clone(&self.interact))
+            .with_interact_timeout(self.interact_timeout)
+    }
+
+    /// The action formats this runtime can resume (T5/T10c): the built-in
+    /// tool-call backend plus the mounted one, if any.
+    pub(crate) async fn resume_formats(&self) -> Vec<ActionFormat> {
+        let mut formats = vec![ActionFormat::ToolCall];
+        if let Some(backend) = &self.action_backend {
+            formats.push(backend.lock().await.format());
+        }
+        formats
     }
 
     /// Get a clone of the current cancel token

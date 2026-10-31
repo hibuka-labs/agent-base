@@ -1,10 +1,16 @@
+use crate::engine::executor::{
+    ActionBackend, ActionExecutor, ExecCtx, ExecError, ParseError, ParseOutcome, SessionError,
+    SessionHandle,
+};
 use crate::engine::middleware::{Middleware, PostLlmCtx, PreLlmCtx, UserMessageCtx};
-use crate::engine::{AgentBuilder, DenyAllApprovalHandler, RetryOnError};
+use crate::engine::runtime::LlmTurnResult;
+use crate::engine::{AgentBuilder, AgentRuntime, DenyAllApprovalHandler, RetryOnError};
 use crate::llm::StreamChunk;
 use crate::tool::{Content, Tool, ToolContext, ToolPolicy};
 use crate::types::{
-    AgentError, AgentResult, ApprovalRequest, ChatMessage, CheckpointData, CheckpointStep,
-    RiskLevel, RunOutcome, RuntimeEvent, SessionId, TurnContext,
+    Action, ActionFormat, ActionOutcome, AgentError, AgentResult, ApprovalRequest, BatchStatus,
+    ChatMessage, CheckpointData, CheckpointStep, MigrationKind, MigrationSource, Observation,
+    RiskLevel, RunOutcome, RunState, RuntimeEvent, SessionId, ToolResultData, TurnContext,
 };
 use async_trait::async_trait;
 use futures_core::Stream;
@@ -1721,14 +1727,14 @@ async fn run_turn_executes_tool_call_and_returns_text() {
     assert!(
         events
             .iter()
-            .any(|e| matches!(e, RuntimeEvent::ToolCallStarted { .. })),
-        "run_turn should emit ToolCallStarted"
+            .any(|e| matches!(e, RuntimeEvent::ActionStarted { .. })),
+        "run_turn should emit ActionStarted"
     );
     assert!(
         events
             .iter()
-            .any(|e| matches!(e, RuntimeEvent::ToolCallFinished { .. })),
-        "run_turn should emit ToolCallFinished"
+            .any(|e| matches!(e, RuntimeEvent::ActionFinished { .. })),
+        "run_turn should emit ActionFinished"
     );
 }
 
@@ -2077,10 +2083,562 @@ async fn run_turn_approval_denied_completes_without_executing() {
     );
 }
 
+/// Tool double whose only behavior is counting executions — side-effect
+/// evidence for the D3 "never re-execute" contract.
+struct CountingTool {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for CountingTool {
+    fn name(&self) -> &'static str {
+        "count"
+    }
+
+    fn description(&self) -> &'static str {
+        "Count invocations"
+    }
+
+    fn schema(&self) -> Value {
+        serde_json::json!({ "type": "object", "properties": {} })
+    }
+
+    async fn call(&self, _args: &Value, _ctx: &ToolContext) -> AgentResult<Vec<Content>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(vec![Content::text("counted")])
+    }
+}
+
+// --- D12 recovery group — the three assertions, tool-call backend -----------
+// (1) never re-execute: zero side-effect replay, dangling actions get
+//     synthetic fates (resume_does_not_reexecute_dangling_actions,
+//     resume_replays_recorded_observation_without_executing).
+// (2) counting trusts the persisted values, crash window included
+//     (resume_turn_count_trusts_the_persisted_value,
+//     resume_counters_trust_the_persisted_run_state,
+//     checkpoint_run_state_matches_the_recorded_batch).
+// (3) history rebuilds correctly
+//     (resume_rebuild_pairs_every_call_with_exactly_one_result,
+//     resume_migrated_after_batch_replays_legacy_summaries).
+// Cross-backend resume refusal is pinned below. The same group runs a second
+// time on the CodeCellExecutor backend when it lands (T10).
+
 #[tokio::test]
-async fn resume_from_checkpoint_executes_pending_tool_calls() {
+async fn resume_does_not_reexecute_dangling_actions() {
+    // D3: side effects are one-shot. A dangling batch (crash window) is
+    // synthesized as「已中断/未执行」— the tool never runs again.
+    let calls = Arc::new(AtomicUsize::new(0));
     let runtime = AgentBuilder::new(Arc::new(ScriptedProvider::new(vec![vec![
         StreamChunk::Text("resumed answer".to_string()),
+        StreamChunk::Stop {
+            finish_reason: Some("stop".to_string()),
+        },
+    ]])))
+    .system_prompt("test")
+    .register_tool(CountingTool {
+        calls: calls.clone(),
+    })
+    .build()
+    .expect("build runtime");
+
+    let sid = runtime.create_session().await;
+
+    let checkpoint = CheckpointData::new(
+        sid.clone(),
+        "resume",
+        CheckpointStep::BeforeActions {
+            actions: vec![crate::types::Action::from_tool_call(
+                "call_resume",
+                "count",
+                "{}",
+            )],
+        },
+        0,
+        ActionFormat::ToolCall,
+        RunState::default(),
+    );
+
+    let result = runtime
+        .runner
+        .resume_from_checkpoint(checkpoint, |_| Ok(()))
+        .await;
+
+    assert!(
+        matches!(result, Ok(RunOutcome::Completed)),
+        "resume_from_checkpoint should complete: {:?}",
+        result.err()
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "dangling action must never execute"
+    );
+
+    let session = runtime.session(&sid).await.expect("session exists");
+    assert!(
+        session.chat_messages().iter().any(
+            |m| matches!(m, ChatMessage::Tool { content, .. } if content.contains("已中断/未执行"))
+        ),
+        "the model must be told plainly that nothing ran"
+    );
+    assert!(
+        !session
+            .chat_messages()
+            .iter()
+            .any(|m| matches!(m, ChatMessage::Tool { content, .. } if content.contains("counted"))),
+        "no tool output may appear for a batch that never ran"
+    );
+}
+
+#[tokio::test]
+async fn resume_replays_recorded_observation_without_executing() {
+    // D3: an AfterActions checkpoint carries its observation — resume
+    // rebuilds history from it instead of re-running the batch.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let runtime = AgentBuilder::new(Arc::new(ScriptedProvider::new(vec![vec![
+        StreamChunk::Text("resumed answer".to_string()),
+        StreamChunk::Stop {
+            finish_reason: Some("stop".to_string()),
+        },
+    ]])))
+    .system_prompt("test")
+    .register_tool(CountingTool {
+        calls: calls.clone(),
+    })
+    .build()
+    .expect("build runtime");
+
+    let sid = runtime.create_session().await;
+
+    let observation = Observation {
+        outcomes: vec![ActionOutcome {
+            action_id: "call_resume".to_string(),
+            name: "count".to_string(),
+            ok: true,
+            denied: false,
+            summary: "stored result".to_string(),
+            details: None,
+        }],
+        events: vec![],
+        history_messages: vec![ChatMessage::tool("call_resume", "stored result")],
+        batch_status: BatchStatus::Completed,
+    };
+    let checkpoint = CheckpointData::new(
+        sid.clone(),
+        "resume",
+        CheckpointStep::AfterActions {
+            actions: vec![crate::types::Action::from_tool_call(
+                "call_resume",
+                "count",
+                "{}",
+            )],
+            observation: Some(observation),
+        },
+        1,
+        ActionFormat::ToolCall,
+        RunState::default(),
+    );
+
+    let result = runtime
+        .runner
+        .resume_from_checkpoint(checkpoint, |_| Ok(()))
+        .await;
+
+    assert!(
+        matches!(result, Ok(RunOutcome::Completed)),
+        "resume_from_checkpoint should complete: {:?}",
+        result.err()
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "recorded observation must be replayed, not re-executed"
+    );
+
+    let session = runtime.session(&sid).await.expect("session exists");
+    assert!(
+        session.chat_messages().iter().any(
+            |m| matches!(m, ChatMessage::Tool { content, .. } if content.contains("stored result"))
+        ),
+        "the stored observation's history is rebuilt verbatim"
+    );
+}
+
+#[tokio::test]
+async fn resume_rebuild_pairs_every_call_with_exactly_one_result() {
+    // 历史重建正确: the replayed protocol pair keeps provider validation
+    // sound — one assistant tool-call message, then one result per call.
+    let runtime = AgentBuilder::new(Arc::new(ScriptedProvider::new(vec![vec![
+        StreamChunk::Text("resumed answer".to_string()),
+        StreamChunk::Stop {
+            finish_reason: Some("stop".to_string()),
+        },
+    ]])))
+    .system_prompt("test")
+    .register_tool(CountingTool {
+        calls: Arc::new(AtomicUsize::new(0)),
+    })
+    .build()
+    .expect("build runtime");
+
+    let sid = runtime.create_session().await;
+
+    let checkpoint = CheckpointData::new(
+        sid.clone(),
+        "resume",
+        CheckpointStep::BeforeActions {
+            actions: vec![
+                crate::types::Action::from_tool_call("call_a", "count", "{}"),
+                crate::types::Action::from_tool_call("call_b", "count", "{}"),
+            ],
+        },
+        0,
+        ActionFormat::ToolCall,
+        RunState::default(),
+    );
+
+    let result = runtime
+        .runner
+        .resume_from_checkpoint(checkpoint, |_| Ok(()))
+        .await;
+    assert!(
+        matches!(result, Ok(RunOutcome::Completed)),
+        "resume_from_checkpoint should complete: {:?}",
+        result.err()
+    );
+
+    let session = runtime.session(&sid).await.expect("session exists");
+    let messages = session.chat_messages();
+    let assistant_pos = messages
+        .iter()
+        .position(
+            |m| matches!(m, ChatMessage::Assistant { tool_calls: Some(calls), .. } if calls.len() == 2),
+        )
+        .expect("assistant tool-call message present");
+    for id in ["call_a", "call_b"] {
+        let hits: Vec<usize> = messages
+            .iter()
+            .enumerate()
+            .filter(
+                |(_, m)| matches!(m, ChatMessage::Tool { tool_call_id, .. } if tool_call_id == id),
+            )
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(hits.len(), 1, "exactly one result for {id}: {hits:?}");
+        assert!(
+            hits[0] > assistant_pos,
+            "result for {id} must come after the assistant message"
+        );
+    }
+}
+
+#[tokio::test]
+async fn resume_turn_count_trusts_the_persisted_value() {
+    // D12 (2): counting continues from the checkpoint's persisted value,
+    // never restarting at zero.
+    let runtime = AgentBuilder::new(Arc::new(ScriptedProvider::new(vec![vec![
+        StreamChunk::Text("resumed answer".to_string()),
+        StreamChunk::Stop {
+            finish_reason: Some("stop".to_string()),
+        },
+    ]])))
+    .system_prompt("test")
+    .register_tool(CountingTool {
+        calls: Arc::new(AtomicUsize::new(0)),
+    })
+    .build()
+    .expect("build runtime");
+
+    let sid = runtime.create_session().await;
+    let checkpoint = CheckpointData::new(
+        sid.clone(),
+        "resume",
+        CheckpointStep::AfterUserInput,
+        7,
+        ActionFormat::ToolCall,
+        RunState::default(),
+    );
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    let result = runtime
+        .runner
+        .resume_from_checkpoint(checkpoint, move |event| {
+            events_clone.lock().unwrap().push(event);
+            Ok(())
+        })
+        .await;
+    assert!(
+        matches!(result, Ok(RunOutcome::Completed)),
+        "resume_from_checkpoint should complete: {:?}",
+        result.err()
+    );
+
+    let events = events.lock().unwrap();
+    let llm_turns: Vec<u32> = events
+        .iter()
+        .filter_map(|e| match e {
+            RuntimeEvent::Checkpoint { checkpoint, .. } => match &checkpoint.step {
+                CheckpointStep::BeforeLlm { .. } => Some(checkpoint.turn_count),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        llm_turns,
+        vec![8],
+        "the resumed loop continues at persisted turn + 1"
+    );
+}
+
+#[tokio::test]
+async fn resume_counters_trust_the_persisted_run_state() {
+    // D12 (2) + D5+OV-11: counting restores the RunState co-written in the
+    // checkpoint. The dangling batch (2 actions) is replayed as
+    // 「已中断/未执行」 and must NOT move the counts — neither the replayed
+    // assistant tool_calls (message lens → 2) nor a "count what was pending"
+    // read (7 + 2 = 9) is the truth. The persisted value is.
+    let runtime = AgentBuilder::new(Arc::new(ScriptedProvider::new(vec![vec![
+        StreamChunk::Text("resumed answer".to_string()),
+        StreamChunk::Stop {
+            finish_reason: Some("stop".to_string()),
+        },
+    ]])))
+    .system_prompt("test")
+    .register_tool(CountingTool {
+        calls: Arc::new(AtomicUsize::new(0)),
+    })
+    .build()
+    .expect("build runtime");
+
+    let sid = runtime.create_session().await;
+    let run_state = RunState {
+        turn_actions: 7,
+        total_actions: 11,
+        run_has_actions: true,
+        ..RunState::default()
+    };
+    let checkpoint = CheckpointData::new(
+        sid.clone(),
+        "resume",
+        CheckpointStep::BeforeActions {
+            actions: vec![
+                crate::types::Action::from_tool_call("call_a", "count", "{}"),
+                crate::types::Action::from_tool_call("call_b", "count", "{}"),
+            ],
+        },
+        7,
+        ActionFormat::ToolCall,
+        run_state,
+    );
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    let result = runtime
+        .runner
+        .resume_from_checkpoint(checkpoint, move |event| {
+            events_clone.lock().unwrap().push(event);
+            Ok(())
+        })
+        .await;
+    assert!(
+        matches!(result, Ok(RunOutcome::Completed)),
+        "resume_from_checkpoint should complete: {:?}",
+        result.err()
+    );
+
+    let events = events.lock().unwrap();
+    let first_llm = events
+        .iter()
+        .find_map(|e| match e {
+            RuntimeEvent::Checkpoint { checkpoint, .. }
+                if matches!(checkpoint.step, CheckpointStep::BeforeLlm { .. }) =>
+            {
+                Some(checkpoint)
+            }
+            _ => None,
+        })
+        .expect("the resumed loop reaches BeforeLlm");
+    let rs = first_llm
+        .run_state
+        .as_ref()
+        .expect("native checkpoints co-write RunState");
+    assert_eq!(
+        rs.turn_actions, 7,
+        "counts come from the persisted value, not the replayed batch"
+    );
+    assert_eq!(
+        rs.total_actions, 11,
+        "the session total is restored, not recounted from messages"
+    );
+    assert!(rs.run_has_actions);
+}
+
+#[tokio::test]
+async fn checkpoint_run_state_matches_the_recorded_batch() {
+    // D5+OV-11 对账: the AfterActions line carries the batch (账) and the
+    // post-bump counts (数) in one write — they can never disagree. The
+    // BeforeActions line carries the pre-batch counts.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let runtime = AgentBuilder::new(Arc::new(ScriptedProvider::new(vec![
+        vec![
+            StreamChunk::ToolCall(serde_json::json!({
+                "delta": {
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "function": {
+                            "name": "count",
+                            "arguments": "{}"
+                        }
+                    }]
+                }
+            })),
+            StreamChunk::Stop {
+                finish_reason: Some("tool_calls".to_string()),
+            },
+        ],
+        vec![
+            StreamChunk::Text("done".to_string()),
+            StreamChunk::Stop {
+                finish_reason: Some("stop".to_string()),
+            },
+        ],
+    ])))
+    .system_prompt("test")
+    .register_tool(CountingTool {
+        calls: calls.clone(),
+    })
+    .build()
+    .expect("build runtime");
+
+    let sid = runtime.create_session().await;
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    let result = runtime
+        .run_turn(sid.clone(), "count once", move |event| {
+            events_clone.lock().unwrap().push(event);
+            Ok(())
+        })
+        .await;
+    assert!(
+        matches!(result, Ok(RunOutcome::Completed)),
+        "run should complete: {:?}",
+        result.err()
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "the tool ran exactly once");
+
+    let events = events.lock().unwrap();
+    let mut before = None;
+    let mut after = None;
+    for e in events.iter() {
+        if let RuntimeEvent::Checkpoint { checkpoint, .. } = e {
+            match &checkpoint.step {
+                CheckpointStep::BeforeActions { actions } => {
+                    before = Some((actions.len(), checkpoint.run_state.clone()));
+                }
+                CheckpointStep::AfterActions { actions, .. } => {
+                    after = Some((actions.len(), checkpoint.run_state.clone()));
+                }
+                _ => {}
+            }
+        }
+    }
+    let (before_actions, before_rs) = before.expect("BeforeActions checkpoint emitted");
+    let (after_actions, after_rs) = after.expect("AfterActions checkpoint emitted");
+    assert_eq!(before_actions, 1, "the line records the batch (账)");
+    assert_eq!(after_actions, 1, "the line records the batch (账)");
+
+    let before_rs = before_rs.expect("native checkpoints co-write RunState");
+    let after_rs = after_rs.expect("native checkpoints co-write RunState");
+    // Pre-batch: nothing counted yet. Post-batch: the batch is counted.
+    assert_eq!(before_rs.turn_actions, 0, "pre-batch counts on the line");
+    assert_eq!(before_rs.total_actions, 0, "pre-batch counts on the line");
+    assert_eq!(
+        after_rs.turn_actions, after_actions,
+        "数 on the line matches the 账 on the line"
+    );
+    assert_eq!(
+        after_rs.total_actions, after_actions,
+        "数 on the line matches the 账 on the line"
+    );
+    assert!(after_rs.run_has_actions);
+}
+
+#[tokio::test]
+async fn resume_migrated_after_batch_replays_legacy_summaries() {
+    // T5 mark + T6: a pre-M3 `AfterToolCalls { results }` payload recorded
+    // result summaries — those are evidence and are replayed as-is, not
+    // rewritten into「已中断/未执行」.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let runtime = AgentBuilder::new(Arc::new(ScriptedProvider::new(vec![vec![
+        StreamChunk::Text("resumed answer".to_string()),
+        StreamChunk::Stop {
+            finish_reason: Some("stop".to_string()),
+        },
+    ]])))
+    .system_prompt("test")
+    .register_tool(CountingTool {
+        calls: calls.clone(),
+    })
+    .build()
+    .expect("build runtime");
+
+    let sid = runtime.create_session().await;
+    let checkpoint = CheckpointData {
+        session_id: sid.clone(),
+        user_input: "resume".to_string(),
+        step: CheckpointStep::AfterActions {
+            actions: vec![crate::types::Action::from_tool_call(
+                "call_2", "count", "{}",
+            )],
+            observation: None,
+        },
+        turn_count: 1,
+        version: 0,
+        backend: ActionFormat::ToolCall,
+        migrated_from: Some(MigrationSource {
+            kind: MigrationKind::ToolCallTriplesV0,
+            legacy_results: vec![ToolResultData {
+                tool_call_id: "call_2".to_string(),
+                tool_name: "count".to_string(),
+                summary: "file list".to_string(),
+            }],
+        }),
+        // A converted legacy payload carries no counting state (不猜不回填).
+        run_state: None,
+    };
+
+    let result = runtime
+        .runner
+        .resume_from_checkpoint(checkpoint, |_| Ok(()))
+        .await;
+    assert!(
+        matches!(result, Ok(RunOutcome::Completed)),
+        "resume_from_checkpoint should complete: {:?}",
+        result.err()
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "replay never executes");
+
+    let session = runtime.session(&sid).await.expect("session exists");
+    assert!(
+        session.chat_messages().iter().any(
+            |m| matches!(m, ChatMessage::Tool { content, .. } if content.contains("file list"))
+        ),
+        "legacy summaries are recorded evidence — replayed verbatim"
+    );
+    assert!(
+        !session.chat_messages().iter().any(
+            |m| matches!(m, ChatMessage::Tool { content, .. } if content.contains("已中断/未执行"))
+        ),
+        "a completed pre-M3 batch must not be reported as interrupted"
+    );
+}
+
+#[tokio::test]
+async fn resume_from_checkpoint_refuses_cross_backend_checkpoints() {
+    let runtime = AgentBuilder::new(Arc::new(ScriptedProvider::new(vec![vec![
+        StreamChunk::Text("must not run".to_string()),
         StreamChunk::Stop {
             finish_reason: Some("stop".to_string()),
         },
@@ -2092,18 +2650,290 @@ async fn resume_from_checkpoint_executes_pending_tool_calls() {
 
     let sid = runtime.create_session().await;
 
-    let checkpoint = CheckpointData {
-        session_id: sid.clone(),
-        user_input: "resume".to_string(),
-        step: CheckpointStep::BeforeToolCalls {
-            tool_calls: vec![(
-                "call_resume".to_string(),
-                "echo".to_string(),
-                r#"{"text":"resume"}"#.to_string(),
-            )],
+    // A checkpoint pinned to the code_act backend. This runtime executes
+    // tool-call actions — the resume must refuse before doing anything, and
+    // the refusal must name both sides (跨后端恢复被拒且明说).
+    let checkpoint = CheckpointData::new(
+        sid.clone(),
+        "resume",
+        CheckpointStep::BeforeActions {
+            actions: vec![crate::types::Action {
+                id: "cell_1".to_string(),
+                name: "code_cell".to_string(),
+                args: Value::String(r#"{"code":"1+1"}"#.to_string()),
+                identity: r#"code_cell::{"code":"1+1"}"#.to_string(),
+                format: ActionFormat::CodeAct,
+            }],
         },
-        turn_count: 0,
+        0,
+        ActionFormat::CodeAct,
+        RunState::default(),
+    );
+
+    let result = runtime
+        .runner
+        .resume_from_checkpoint(checkpoint, |_| Ok(()))
+        .await;
+
+    let err = match result {
+        Ok(outcome) => panic!("cross-backend resume must be refused, got {outcome:?}"),
+        Err(e) => e,
     };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("CodeAct"),
+        "refusal names the pinned backend: {msg}"
+    );
+    assert!(
+        msg.contains("ToolCall"),
+        "refusal names the resuming backend: {msg}"
+    );
+    assert!(msg.contains("refused"), "refusal is explicit: {msg}");
+}
+
+// --- D12 recovery group, second run — the mounted action backend (T10c) -----
+// The same three assertions as the tool-call group above (never re-execute,
+// counting trusts the persisted values, history rebuilds correctly), on a
+// runtime with an action backend mounted. The double below proves the kernel
+// ROUTING (parse → flow → 账+数 checkpoints → observation replay); the real
+// CodeAct shape-A history pin lives in agent-works' adapter tests.
+
+/// Mounted action backend double: claims `code:`-prefixed text turns as one
+/// CodeAct cell each, counts executions, and renders its own synthesis shape.
+/// Envelope turns never reach it — the kernel routes those to tools.
+struct FakeCodeBackend {
+    executed: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl ActionExecutor for FakeCodeBackend {
+    fn parse(&self, turn: &LlmTurnResult) -> Result<ParseOutcome, ParseError> {
+        match turn.full_text.strip_prefix("code:") {
+            Some(code) => Ok(ParseOutcome::Actions(vec![Action::from_code_cell(
+                "cell_1",
+                "test",
+                code.trim(),
+            )])),
+            None => Ok(ParseOutcome::Empty),
+        }
+    }
+
+    async fn execute(
+        &mut self,
+        actions: Vec<Action>,
+        _ctx: &ExecCtx,
+    ) -> Result<Observation, ExecError> {
+        self.executed.fetch_add(1, Ordering::SeqCst);
+        Ok(Observation {
+            outcomes: actions
+                .iter()
+                .map(|a| ActionOutcome {
+                    action_id: a.id.clone(),
+                    name: a.name.clone(),
+                    ok: true,
+                    denied: false,
+                    summary: "ran".to_string(),
+                    details: None,
+                })
+                .collect(),
+            events: vec![],
+            history_messages: vec![
+                ChatMessage::assistant("[cell]"),
+                ChatMessage::user("[observation]\nran"),
+            ],
+            batch_status: BatchStatus::Completed,
+        })
+    }
+}
+
+#[async_trait]
+impl SessionHandle for FakeCodeBackend {
+    fn is_alive(&self) -> bool {
+        true
+    }
+
+    async fn rebuild(&mut self) -> Result<(), SessionError> {
+        Ok(())
+    }
+}
+
+impl ActionBackend for FakeCodeBackend {
+    fn format(&self) -> ActionFormat {
+        ActionFormat::CodeAct
+    }
+
+    fn render_fates(&self, actions: &[Action], fates: &[ActionOutcome]) -> Vec<ChatMessage> {
+        // The double's own history shape (the shape is the backend's
+        // protocol; the fate text inside it is the kernel's vocabulary).
+        let blocks: Vec<String> = actions.iter().map(|a| format!("[cell {}]", a.id)).collect();
+        let mut pane = String::from("[observation]\n");
+        for fate in fates {
+            pane.push_str(&fate.summary);
+            pane.push('\n');
+        }
+        vec![
+            ChatMessage::assistant(blocks.join("\n")),
+            ChatMessage::user(pane),
+        ]
+    }
+}
+
+/// One runtime with the double mounted and a scripted single answer for the
+/// resumed loop.
+fn code_backend_runtime(executed: Arc<AtomicUsize>) -> AgentRuntime {
+    AgentBuilder::new(Arc::new(ScriptedProvider::new(vec![vec![
+        StreamChunk::Text("resumed answer".to_string()),
+        StreamChunk::Stop {
+            finish_reason: Some("stop".to_string()),
+        },
+    ]])))
+    .system_prompt("test")
+    .action_backend(Box::new(FakeCodeBackend { executed }))
+    .build()
+    .expect("build runtime")
+}
+
+#[tokio::test]
+async fn resume_does_not_reexecute_dangling_code_actions() {
+    // D3 twin: a dangling CodeAct batch (crash window) is synthesized in the
+    // mounted backend's shape with the kernel's「已中断/未执行」fates — the
+    // cell never runs again.
+    let executed = Arc::new(AtomicUsize::new(0));
+    let runtime = code_backend_runtime(executed.clone());
+    let sid = runtime.create_session().await;
+
+    let checkpoint = CheckpointData::new(
+        sid.clone(),
+        "resume",
+        CheckpointStep::BeforeActions {
+            actions: vec![Action::from_code_cell("cell_1", "task", "print(1)")],
+        },
+        0,
+        ActionFormat::CodeAct,
+        RunState::default(),
+    );
+
+    let result = runtime
+        .runner
+        .resume_from_checkpoint(checkpoint, |_| Ok(()))
+        .await;
+
+    assert!(
+        matches!(result, Ok(RunOutcome::Completed)),
+        "resume_from_checkpoint should complete: {:?}",
+        result.err()
+    );
+    assert_eq!(
+        executed.load(Ordering::SeqCst),
+        0,
+        "dangling action must never execute"
+    );
+
+    let session = runtime.session(&sid).await.expect("session exists");
+    assert!(
+        session.chat_messages().iter().any(
+            |m| matches!(m, ChatMessage::User { content, .. } if content.contains("已中断/未执行"))
+        ),
+        "the model must be told plainly that nothing ran"
+    );
+    assert!(
+        !session
+            .chat_messages()
+            .iter()
+            .any(|m| matches!(m, ChatMessage::User { content, .. } if content.contains("ran\n"))),
+        "no execution output may appear for a batch that never ran"
+    );
+}
+
+#[tokio::test]
+async fn resume_replays_recorded_code_observation_without_executing() {
+    // D3 twin: an AfterActions checkpoint carries its observation — resume
+    // rebuilds history from it (the backend's messages verbatim) instead of
+    // re-running the batch.
+    let executed = Arc::new(AtomicUsize::new(0));
+    let runtime = code_backend_runtime(executed.clone());
+    let sid = runtime.create_session().await;
+
+    let observation = Observation {
+        outcomes: vec![ActionOutcome {
+            action_id: "cell_1".to_string(),
+            name: "code_cell".to_string(),
+            ok: true,
+            denied: false,
+            summary: "stored result".to_string(),
+            details: None,
+        }],
+        events: vec![],
+        history_messages: vec![
+            ChatMessage::assistant("[cell cell_1]"),
+            ChatMessage::user("[observation]\nstored result"),
+        ],
+        batch_status: BatchStatus::Completed,
+    };
+    let checkpoint = CheckpointData::new(
+        sid.clone(),
+        "resume",
+        CheckpointStep::AfterActions {
+            actions: vec![Action::from_code_cell("cell_1", "task", "print(1)")],
+            observation: Some(observation),
+        },
+        1,
+        ActionFormat::CodeAct,
+        RunState::default(),
+    );
+
+    let result = runtime
+        .runner
+        .resume_from_checkpoint(checkpoint, |_| Ok(()))
+        .await;
+
+    assert!(
+        matches!(result, Ok(RunOutcome::Completed)),
+        "resume_from_checkpoint should complete: {:?}",
+        result.err()
+    );
+    assert_eq!(
+        executed.load(Ordering::SeqCst),
+        0,
+        "recorded observation must be replayed, not re-executed"
+    );
+
+    let session = runtime.session(&sid).await.expect("session exists");
+    assert!(
+        session.chat_messages().iter().any(
+            |m| matches!(m, ChatMessage::User { content, .. } if content.contains("stored result"))
+        ),
+        "the stored observation's history is rebuilt verbatim"
+    );
+}
+
+#[tokio::test]
+async fn resume_counters_trust_the_persisted_run_state_for_code_batches() {
+    // D12 (2) twin + D5+OV-11: the dangling code batch must NOT move the
+    // counts — the persisted value is the truth.
+    let executed = Arc::new(AtomicUsize::new(0));
+    let runtime = code_backend_runtime(executed.clone());
+    let sid = runtime.create_session().await;
+
+    let run_state = RunState {
+        turn_actions: 7,
+        total_actions: 11,
+        run_has_actions: true,
+        ..RunState::default()
+    };
+    let checkpoint = CheckpointData::new(
+        sid.clone(),
+        "resume",
+        CheckpointStep::BeforeActions {
+            actions: vec![
+                Action::from_code_cell("cell_1", "task", "print(1)"),
+                Action::from_code_cell("cell_2", "task", "print(2)"),
+            ],
+        },
+        7,
+        ActionFormat::CodeAct,
+        run_state,
+    );
 
     let events = Arc::new(Mutex::new(Vec::new()));
     let events_clone = events.clone();
@@ -2114,7 +2944,66 @@ async fn resume_from_checkpoint_executes_pending_tool_calls() {
             Ok(())
         })
         .await;
+    assert!(
+        matches!(result, Ok(RunOutcome::Completed)),
+        "resume_from_checkpoint should complete: {:?}",
+        result.err()
+    );
 
+    let events = events.lock().unwrap();
+    let first_llm = events
+        .iter()
+        .find_map(|e| match e {
+            RuntimeEvent::Checkpoint { checkpoint, .. }
+                if matches!(checkpoint.step, CheckpointStep::BeforeLlm { .. }) =>
+            {
+                Some(checkpoint)
+            }
+            _ => None,
+        })
+        .expect("the resumed loop reaches BeforeLlm");
+    let rs = first_llm
+        .run_state
+        .as_ref()
+        .expect("native checkpoints co-write RunState");
+    assert_eq!(
+        rs.turn_actions, 7,
+        "counts come from the persisted value, not the replayed batch"
+    );
+    assert_eq!(
+        rs.total_actions, 11,
+        "the session total is restored, not recounted from messages"
+    );
+    assert!(rs.run_has_actions);
+}
+
+#[tokio::test]
+async fn resume_rebuild_pairs_every_code_cell_with_its_fate() {
+    // 历史重建正确 twin: the replayed shape-A pair keeps the transcript sound
+    // — one assistant message carrying the batch, then one fate line per
+    // cell, in submission order.
+    let executed = Arc::new(AtomicUsize::new(0));
+    let runtime = code_backend_runtime(executed.clone());
+    let sid = runtime.create_session().await;
+
+    let checkpoint = CheckpointData::new(
+        sid.clone(),
+        "resume",
+        CheckpointStep::BeforeActions {
+            actions: vec![
+                Action::from_code_cell("cell_a", "task", "print(1)"),
+                Action::from_code_cell("cell_b", "task", "print(2)"),
+            ],
+        },
+        0,
+        ActionFormat::CodeAct,
+        RunState::default(),
+    );
+
+    let result = runtime
+        .runner
+        .resume_from_checkpoint(checkpoint, |_| Ok(()))
+        .await;
     assert!(
         matches!(result, Ok(RunOutcome::Completed)),
         "resume_from_checkpoint should complete: {:?}",
@@ -2122,11 +3011,135 @@ async fn resume_from_checkpoint_executes_pending_tool_calls() {
     );
 
     let session = runtime.session(&sid).await.expect("session exists");
+    let messages = session.chat_messages();
+    let assistant_pos = messages
+        .iter()
+        .position(
+            |m| matches!(m, ChatMessage::Assistant { content: Some(c), .. } if c.contains("[cell cell_a]") && c.contains("[cell cell_b]")),
+        )
+        .expect("one assistant message carries the whole batch");
+    let observation_pos = messages
+        .iter()
+        .position(
+            |m| matches!(m, ChatMessage::User { content, .. } if content.starts_with("[observation]")),
+        )
+        .expect("the observation pane follows");
+    assert!(
+        observation_pos > assistant_pos,
+        "shape-A order: assistant blocks first, observation second"
+    );
+    let pane = match &messages[observation_pos] {
+        ChatMessage::User { content, .. } => content.clone(),
+        _ => unreachable!(),
+    };
+    let fate_lines = pane.lines().filter(|l| *l != "[observation]").count();
+    assert_eq!(
+        fate_lines, 2,
+        "one fate line per cell, nothing invented: {pane:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_text_turn_with_cells_runs_through_the_mounted_backend() {
+    // Live smoke of the mount (T10c): a text turn carrying cells claims to
+    // the mounted backend's parse, executes through its flow, and lands the
+    // 账+数 checkpoint pair with the backend's observation — envelope turns
+    // would have taken the tool branch instead.
+    let executed = Arc::new(AtomicUsize::new(0));
+    let runtime = AgentBuilder::new(Arc::new(ScriptedProvider::new(vec![
+        vec![
+            StreamChunk::Text("code: print(1)".to_string()),
+            StreamChunk::Stop {
+                finish_reason: Some("stop".to_string()),
+            },
+        ],
+        vec![
+            StreamChunk::Text("done".to_string()),
+            StreamChunk::Stop {
+                finish_reason: Some("stop".to_string()),
+            },
+        ],
+    ])))
+    .system_prompt("test")
+    .action_backend(Box::new(FakeCodeBackend {
+        executed: executed.clone(),
+    }))
+    .build()
+    .expect("build runtime");
+
+    let sid = runtime.create_session().await;
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    let result = runtime
+        .run_turn(sid.clone(), "run the cell", move |event| {
+            events_clone.lock().unwrap().push(event);
+            Ok(())
+        })
+        .await;
+    assert!(
+        matches!(result, Ok(RunOutcome::Completed)),
+        "run should complete: {:?}",
+        result.err()
+    );
+    assert_eq!(
+        executed.load(Ordering::SeqCst),
+        1,
+        "the batch ran exactly once"
+    );
+
+    let mut before = None;
+    let mut after = None;
+    {
+        // Scoped so the std MutexGuard is dropped before the awaits below.
+        let events = events.lock().unwrap();
+        for e in events.iter() {
+            if let RuntimeEvent::Checkpoint { checkpoint, .. } = e {
+                match &checkpoint.step {
+                    CheckpointStep::BeforeActions { actions } => {
+                        assert_eq!(
+                            checkpoint.backend,
+                            ActionFormat::CodeAct,
+                            "the line is pinned to the backend that parsed the batch"
+                        );
+                        before = Some(actions.len());
+                    }
+                    CheckpointStep::AfterActions {
+                        actions,
+                        observation,
+                    } => {
+                        assert_eq!(checkpoint.backend, ActionFormat::CodeAct);
+                        after = Some((actions.len(), observation.clone()));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    let before_actions = before.expect("BeforeActions checkpoint emitted");
+    let (after_actions, observation) = after.expect("AfterActions checkpoint emitted");
+    assert_eq!(before_actions, 1, "the line records the batch (账)");
+    assert_eq!(after_actions, 1, "the line records the batch (账)");
+    let observation = observation.expect("the observation rides the line");
+    assert_eq!(observation.outcomes.len(), 1, "one fate per action");
+    assert!(
+        observation.batch_status == BatchStatus::Completed,
+        "the batch ran to fates: {:?}",
+        observation.batch_status
+    );
+
+    // The backend's protocol pair lands in history verbatim.
+    let session = runtime.session(&sid).await.expect("session exists");
     assert!(
         session.chat_messages().iter().any(
-            |m| matches!(m, ChatMessage::Tool { content, .. } if content.contains("echo: resume"))
+            |m| matches!(m, ChatMessage::Assistant { content: Some(c), .. } if c.contains("[cell]"))
         ),
-        "resumed tool call should have executed"
+        "the assistant half of the pair is pushed"
+    );
+    assert!(
+        session.chat_messages().iter().any(
+            |m| matches!(m, ChatMessage::User { content, .. } if content.contains("[observation]"))
+        ),
+        "the observation half of the pair is pushed"
     );
 }
 
@@ -2306,8 +3319,8 @@ fn terminal_seq(events: &[RuntimeEvent]) -> Vec<&'static str> {
             RuntimeEvent::Checkpoint { checkpoint, .. } => Some(match &checkpoint.step {
                 CheckpointStep::AfterUserInput => "AfterUserInput",
                 CheckpointStep::BeforeLlm { .. } => "BeforeLlm",
-                CheckpointStep::BeforeToolCalls { .. } => "BeforeToolCalls",
-                CheckpointStep::AfterToolCalls { .. } => "AfterToolCalls",
+                CheckpointStep::BeforeActions { .. } => "BeforeActions",
+                CheckpointStep::AfterActions { .. } => "AfterActions",
             }),
             RuntimeEvent::RunFinished { .. } => Some("RunFinished"),
             RuntimeEvent::RunCancelled { .. } => Some("RunCancelled"),
@@ -2566,8 +3579,8 @@ async fn run_turn_tool_call_then_text_event_order() {
         vec![
             "AfterUserInput",
             "BeforeLlm",
-            "BeforeToolCalls",
-            "AfterToolCalls",
+            "BeforeActions",
+            "AfterActions",
             "BeforeLlm",
             "RunFinished"
         ]
@@ -2718,8 +3731,8 @@ async fn max_turns_exceeded_event_order() {
         vec![
             "AfterUserInput",
             "BeforeLlm",
-            "BeforeToolCalls",
-            "AfterToolCalls",
+            "BeforeActions",
+            "AfterActions",
             "RunFinished"
         ]
     );
@@ -3189,7 +4202,7 @@ use crate::engine::react_loop_guard::{GuardCtx, GuardDecision, ReactLoopGuard};
 /// A guard that records every `on_turn` call for later inspection,
 /// and returns a configurable decision.
 struct RecordingGuard {
-    /// Recorded (run_has_tool_calls, model_response) from on_turn calls
+    /// Recorded (run_has_actions, model_response) from on_turn calls
     /// where is_text_only was true.
     calls: Mutex<Vec<(bool, String)>>,
     /// What to return from on_turn.
@@ -3212,16 +4225,16 @@ impl ReactLoopGuard for RecordingGuard {
             self.calls
                 .lock()
                 .unwrap()
-                .push((ctx.run_has_tool_calls, ctx.model_response.clone()));
+                .push((ctx.run_has_actions, ctx.model_response.clone()));
         }
         self.decision.clone()
     }
 }
 
 /// When the model calls a tool then returns text, the guard's `on_text_only`
-/// must be invoked with `run_has_tool_calls = true`.
+/// must be invoked with `run_has_actions = true`.
 #[tokio::test]
-async fn branch4_guard_called_with_run_has_tool_calls() {
+async fn branch4_guard_called_with_run_has_actions() {
     let guard = Arc::new(RecordingGuard::new(GuardDecision::Complete));
     let guard_clone = guard.clone();
 
@@ -3271,7 +4284,7 @@ async fn branch4_guard_called_with_run_has_tool_calls() {
     let (run_has_tools, response) = &calls[0];
     assert!(
         *run_has_tools,
-        "run_has_tool_calls must be true after tool use"
+        "run_has_actions must be true after tool use"
     );
     assert_eq!(response, "The answer is 42.");
 }
@@ -3281,7 +4294,7 @@ async fn branch4_guard_called_with_run_has_tool_calls() {
 #[tokio::test]
 async fn branch4_guard_continue_nudges_and_retries() {
     // Guard always returns Continue → nudge each time → loops until max turns.
-    // We verify: (1) guard called multiple times, (2) nudge injected, (3) run_has_tool_calls persists.
+    // We verify: (1) guard called multiple times, (2) nudge injected, (3) run_has_actions persists.
     let guard = Arc::new(RecordingGuard::new(GuardDecision::Continue {
         nudge: Some("please continue".to_string()),
     }));
@@ -3351,11 +4364,11 @@ async fn branch4_guard_continue_nudges_and_retries() {
     );
     assert!(has_nudge, "session should contain the nudge message");
 
-    // The second on_text_only call should still have run_has_tool_calls = true
+    // The second on_text_only call should still have run_has_actions = true
     // (it's never reset mid-run).
     assert!(
         all_have_tools,
-        "all on_text_only calls should have run_has_tool_calls = true"
+        "all on_text_only calls should have run_has_actions = true"
     );
 }
 

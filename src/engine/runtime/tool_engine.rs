@@ -120,8 +120,8 @@ impl ToolEngine {
             "execute tool start"
         );
 
-        // Emit ToolCallStarted via internal EventBus
-        self.event_bus.emit(RuntimeEvent::ToolCallStarted {
+        // Emit ActionStarted via internal EventBus
+        self.event_bus.emit(RuntimeEvent::ActionStarted {
             session_id: session_id.clone(),
             tool_name: name.to_string(),
             args_json: tool_args_json.to_string(),
@@ -219,13 +219,13 @@ impl ToolEngine {
                     Ok(output) => output,
                     Err(e) => {
                         tracing::error!(session_id = session_id.id, tool_name = name, error = %e, "Tool execution failed");
-                        // Emit ToolCallFinished with error summary before returning error
+                        // Emit ActionFinished with error summary before returning error
                         let error_summary = if ctx.language == Language::Zh {
                             format!("❌ 执行失败: {}", e)
                         } else {
                             format!("❌ Tool execution failed: {}", e)
                         };
-                        self.event_bus.emit(RuntimeEvent::ToolCallFinished {
+                        self.event_bus.emit(RuntimeEvent::ActionFinished {
                             session_id: session_id.clone(),
                             tool_name: name.to_string(),
                             summary: error_summary,
@@ -261,8 +261,8 @@ impl ToolEngine {
             }
         };
 
-        // Emit ToolCallFinished via internal EventBus
-        self.event_bus.emit(RuntimeEvent::ToolCallFinished {
+        // Emit ActionFinished via internal EventBus
+        self.event_bus.emit(RuntimeEvent::ActionFinished {
             session_id: session_id.clone(),
             tool_name: name.to_string(),
             summary: content_text(&tool_result),
@@ -401,7 +401,7 @@ impl ToolEngine {
                     format!("[Action Denied]: tool {} rejected by approval", tool_name);
                 // Not recorded to session history — a user denial is a UI-layer
                 // interaction; there is no need for the LLM to see it
-                self.event_bus.emit(RuntimeEvent::ToolCallFinished {
+                self.event_bus.emit(RuntimeEvent::ActionFinished {
                     session_id: session_id.clone(),
                     tool_name: tool_name.to_string(),
                     summary: denial_summary,
@@ -623,14 +623,14 @@ impl ToolEngine {
                             "Tool panicked during execution (parallel)"
                         );
                         // Mirror the ordinary error branch: emit
-                        // ToolCallFinished so UI panels can close the entry
+                        // ActionFinished so UI panels can close the entry
                         // instead of leaking a perpetual spinner.
                         let error_summary = if ctx.language == Language::Zh {
                             format!("❌ 执行失败: tool panicked: {panic_msg}")
                         } else {
                             format!("❌ Tool execution failed: tool panicked: {panic_msg}")
                         };
-                        self_event_bus.emit(RuntimeEvent::ToolCallFinished {
+                        self_event_bus.emit(RuntimeEvent::ActionFinished {
                             session_id: session_id.clone(),
                             tool_name: name.to_string(),
                             summary: error_summary,
@@ -655,7 +655,7 @@ impl ToolEngine {
         let outcomes = futures_util::future::join_all(futures).await;
 
         // Drain the ORIGINAL event_rx after all tools complete.
-        // This delivers ToolCallStarted/Finished events via on_event and
+        // This delivers ActionStarted/Finished events via on_event and
         // consumes them from the channel so drain_locked at the next turn
         // start won't re-deliver them. Checkpoint events that arrived
         // during orchestrate are also drained here (they only go through
@@ -707,8 +707,8 @@ impl ToolEngine {
             "execute tool start (parallel)"
         );
 
-        // Emit ToolCallStarted via internal EventBus
-        event_bus.emit(RuntimeEvent::ToolCallStarted {
+        // Emit ActionStarted via internal EventBus
+        event_bus.emit(RuntimeEvent::ActionStarted {
             session_id: session_id.clone(),
             tool_name: name.to_string(),
             args_json: tool_args_json.to_string(),
@@ -817,7 +817,7 @@ impl ToolEngine {
                         } else {
                             format!("❌ Tool execution failed: {}", e)
                         };
-                        event_bus.emit(RuntimeEvent::ToolCallFinished {
+                        event_bus.emit(RuntimeEvent::ActionFinished {
                             session_id: session_id.clone(),
                             tool_name: name.to_string(),
                             summary: error_summary,
@@ -848,8 +848,8 @@ impl ToolEngine {
             }
         };
 
-        // Emit ToolCallFinished via internal EventBus
-        event_bus.emit(RuntimeEvent::ToolCallFinished {
+        // Emit ActionFinished via internal EventBus
+        event_bus.emit(RuntimeEvent::ActionFinished {
             session_id: session_id.clone(),
             tool_name: name.to_string(),
             summary: content_text(&tool_result),
@@ -1221,7 +1221,7 @@ mod tests {
         assert_eq!(content_text(&result.output), "echo: hi");
 
         let started = events.iter().find_map(|e| match e {
-            RuntimeEvent::ToolCallStarted {
+            RuntimeEvent::ActionStarted {
                 tool_name,
                 args_json,
                 ..
@@ -1231,7 +1231,7 @@ mod tests {
         assert_eq!(started, Some(("echo", r#"{"text":"hi"}"#)));
 
         assert!(events.iter().any(
-            |e| matches!(e, RuntimeEvent::ToolCallFinished { summary, .. } if summary == "echo: hi")
+            |e| matches!(e, RuntimeEvent::ActionFinished { summary, .. } if summary == "echo: hi")
         ));
     }
 
@@ -1325,8 +1325,8 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, RuntimeEvent::ToolCallFinished { denied: true, .. })),
-            "should emit a denied ToolCallFinished"
+                .any(|e| matches!(e, RuntimeEvent::ActionFinished { denied: true, .. })),
+            "should emit a denied ActionFinished"
         );
     }
 
@@ -1580,10 +1580,10 @@ mod tests {
                 &mut event_rx,
                 Arc::new(Mutex::new(move |ev| -> AgentResult<()> {
                     let tag = match &ev {
-                        RuntimeEvent::ToolCallStarted { tool_name, .. } => {
+                        RuntimeEvent::ActionStarted { tool_name, .. } => {
                             format!("started:{tool_name}")
                         }
-                        RuntimeEvent::ToolCallFinished { tool_name, .. } => {
+                        RuntimeEvent::ActionFinished { tool_name, .. } => {
                             format!("finished:{tool_name}")
                         }
                         _ => return Ok(()),
@@ -1604,12 +1604,12 @@ mod tests {
         assert_eq!(
             started.len(),
             2,
-            "expected 2 ToolCallStarted, got {started:?}"
+            "expected 2 ActionStarted, got {started:?}"
         );
         assert_eq!(
             finished.len(),
             2,
-            "expected 2 ToolCallFinished, got {finished:?}"
+            "expected 2 ActionFinished, got {finished:?}"
         );
     }
 
@@ -1724,11 +1724,11 @@ mod tests {
                 "expected ToolExecution, got {err:?}"
             );
             assert!(
-                events.iter().any(
-                    |e| matches!(e, RuntimeEvent::ToolCallFinished { summary, .. }
-                        if summary.contains("failed") || summary.contains("失败"))
-                ),
-                "should emit error ToolCallFinished"
+                events
+                    .iter()
+                    .any(|e| matches!(e, RuntimeEvent::ActionFinished { summary, .. }
+                        if summary.contains("failed") || summary.contains("失败"))),
+                "should emit error ActionFinished"
             );
         }
     }
@@ -2039,7 +2039,7 @@ mod tests {
         ));
     }
 
-    /// Tool that does synchronous file I/O — mimics history.list_items.
+    /// Tool that does synchronous file I/O — mimics history_list_items.
     /// This exercises the real-world path where a blocking `fs::read_to_string`
     /// runs inside an async `call` on a multi-thread tokio runtime.
     struct SyncFileReadTool {
@@ -2071,7 +2071,7 @@ mod tests {
             serde_json::json!({})
         }
         async fn call(&self, _args: &Value, _ctx: &ToolContext) -> AgentResult<Vec<Content>> {
-            // Synchronous file I/O — same pattern as history.list_items
+            // Synchronous file I/O — same pattern as history_list_items
             let mut output = String::new();
             for i in 0..5 {
                 let path = self.dir.path().join(format!("file_{i}.jsonl"));

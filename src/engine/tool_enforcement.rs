@@ -40,10 +40,10 @@ impl Middleware for ToolEnforcementMiddleware {
         if ctx.available_tools.len() < self.config.min_tools_threshold {
             return Ok(());
         }
-        if self.config.first_turn_only && ctx.total_tool_calls > 0 {
+        if self.config.first_turn_only && ctx.total_actions > 0 {
             return Ok(());
         }
-        if ctx.is_tool_call {
+        if ctx.has_action_intent() {
             return Ok(());
         }
         if ctx.full_text.is_empty() {
@@ -73,19 +73,19 @@ impl Middleware for ToolEnforcementMiddleware {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::executor::ParseOutcome;
     use crate::types::{FinishReason, SessionId};
 
     fn ctx(available_tools: Vec<String>) -> PostLlmCtx {
         PostLlmCtx {
             session_id: SessionId::new(1),
             full_text: "I will do it.".to_string(),
-            is_tool_call: false,
-            tool_calls: vec![],
+            parse: ParseOutcome::Empty,
             available_tools,
             turn_count: 1,
-            total_tool_calls: 0,
+            total_actions: 0,
             nudge_count: 0,
-            turn_tool_calls: 0,
+            turn_actions: 0,
             skip_push: false,
             follow_up_message: None,
             finish_reason: FinishReason::Stop,
@@ -130,7 +130,9 @@ mod tests {
     async fn skips_when_is_tool_call() {
         let mw = ToolEnforcementMiddleware::new(ToolEnforcementConfig::default());
         let mut c = ctx(vec!["read".to_string()]);
-        c.is_tool_call = true;
+        // Action intent (even with no materialized calls) is tool work —
+        // never text-nudge the model over it.
+        c.parse = ParseOutcome::Incomplete;
         mw.on_post_llm(&mut c).await.unwrap();
 
         assert!(!c.skip_push);
@@ -169,7 +171,7 @@ mod tests {
     async fn first_turn_only_skips_after_tool_calls() {
         let mw = ToolEnforcementMiddleware::new(ToolEnforcementConfig::default());
         let mut c = ctx(vec!["read".to_string()]);
-        c.total_tool_calls = 1;
+        c.total_actions = 1;
         mw.on_post_llm(&mut c).await.unwrap();
 
         assert!(!c.skip_push);

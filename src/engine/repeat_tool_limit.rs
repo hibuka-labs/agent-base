@@ -53,8 +53,9 @@ impl Default for RepeatToolLimitConfig {
 ///
 /// **Counting is cumulative per run, not consecutive**: the incident's polls
 /// were interleaved with `read_file` etc., so a consecutive-counter would
-/// reset forever and never fire. The fingerprint is tool name + canonical
-/// (key-sorted) arguments — a model legitimately reading 51 *different*
+/// reset forever and never fire. The counting key is `Action.identity` — the
+/// parse-time backend-supplied fingerprint (tool name + canonical key-sorted
+/// arguments for tool calls) — a model legitimately reading 51 *different*
 /// files never accumulates a fingerprint.
 ///
 /// Two-stage response, mirroring existing middleware precedents:
@@ -82,15 +83,11 @@ impl RepeatToolLimitMiddleware {
         }
     }
 
-    /// Fingerprint of one tool call: name + canonical (key-sorted) args.
-    fn fingerprint(name: &str, args: &str) -> String {
-        let canonical = serde_json::from_str::<serde_json::Value>(args)
-            .map(|v| v.to_string())
-            .unwrap_or_else(|_| args.to_string());
-        format!("{name}::{canonical}")
-    }
-
-    /// Bump the run counter for a fingerprint; returns the new count.
+    /// Bump the run counter for an action identity; returns the new count.
+    ///
+    /// D5: count by the parse-time `Action.identity` (the backend's canonical
+    /// fingerprint at parse), never by a recomputation — one fingerprint
+    /// source across the limit middlewares and the checkpoint payloads.
     fn bump(&self, session_id: &SessionId, fingerprint: &str) -> usize {
         let mut counts = self.counts.lock().unwrap();
         let session_counts = counts.entry(session_id.clone()).or_default();
@@ -109,18 +106,17 @@ impl Middleware for RepeatToolLimitMiddleware {
     }
 
     async fn on_post_llm(&self, ctx: &mut PostLlmCtx) -> AgentResult<()> {
-        if !ctx.is_tool_call || ctx.tool_calls.is_empty() {
+        if ctx.actions().is_empty() {
             return Ok(());
         }
 
         let mut max_count = 0usize;
         let mut offending_tool = String::new();
-        for (_id, name, args) in &ctx.tool_calls {
-            let fingerprint = Self::fingerprint(name, args);
-            let count = self.bump(&ctx.session_id, &fingerprint);
+        for action in ctx.actions() {
+            let count = self.bump(&ctx.session_id, &action.identity);
             if count > max_count {
                 max_count = count;
-                offending_tool = name.clone();
+                offending_tool = action.name.clone();
             }
         }
 
@@ -129,11 +125,10 @@ impl Middleware for RepeatToolLimitMiddleware {
                 session_id = ctx.session_id.id,
                 tool = %offending_tool,
                 count = max_count,
-                pending_calls = ctx.tool_calls.len(),
+                pending_calls = ctx.actions().len(),
                 "RepeatToolLimit: blocking tool calls — identical-call limit reached"
             );
-            ctx.tool_calls.clear();
-            ctx.is_tool_call = false;
+            ctx.demote_to_text();
             ctx.follow_up_message = Some(self.config.block_message.clone());
         } else if self.config.nudge_after > 0 && max_count == self.config.nudge_after {
             // Fire exactly once per fingerprint: the count equals the
@@ -154,27 +149,39 @@ impl Middleware for RepeatToolLimitMiddleware {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::FinishReason;
+    use crate::engine::executor::ParseOutcome;
+    use crate::types::{Action, ActionFormat, FinishReason};
 
     fn mw() -> RepeatToolLimitMiddleware {
         RepeatToolLimitMiddleware::new(RepeatToolLimitConfig::default())
     }
 
     fn ctx(session: u64, calls: Vec<(&str, &str)>) -> PostLlmCtx {
+        let actions = calls
+            .into_iter()
+            .enumerate()
+            .map(|(i, (name, args))| Action {
+                id: format!("call_{i}"),
+                name: name.to_string(),
+                args: serde_json::Value::String(args.to_string()),
+                identity: Action::tool_call_identity(name, args),
+                format: ActionFormat::ToolCall,
+            })
+            .collect::<Vec<Action>>();
+        let parse = if actions.is_empty() {
+            ParseOutcome::Empty
+        } else {
+            ParseOutcome::Actions(actions)
+        };
         PostLlmCtx {
             session_id: SessionId::new(session),
             full_text: String::new(),
-            is_tool_call: !calls.is_empty(),
-            tool_calls: calls
-                .into_iter()
-                .enumerate()
-                .map(|(i, (name, args))| (format!("call_{i}"), name.to_string(), args.to_string()))
-                .collect(),
+            parse,
             available_tools: vec![],
             turn_count: 1,
-            total_tool_calls: 0,
+            total_actions: 0,
             nudge_count: 0,
-            turn_tool_calls: 0,
+            turn_actions: 0,
             skip_push: false,
             follow_up_message: None,
             finish_reason: FinishReason::ToolUse,
@@ -208,7 +215,7 @@ mod tests {
         mw.on_post_llm(&mut c).await.unwrap();
         assert!(c.follow_up_message.is_some(), "5th identical call nudges");
         assert!(
-            !c.tool_calls.is_empty() && c.is_tool_call,
+            !c.actions().is_empty() && c.has_action_intent(),
             "nudge is soft — calls still execute"
         );
     }
@@ -238,8 +245,8 @@ mod tests {
             vec![("list_agents", "{}"), ("read_file", r#"{"path":"x"}"#)],
         );
         mw.on_post_llm(&mut c).await.unwrap();
-        assert!(c.tool_calls.is_empty(), "pending calls discarded");
-        assert!(!c.is_tool_call, "response demoted to text-only");
+        assert!(c.actions().is_empty(), "pending calls discarded");
+        assert!(!c.has_action_intent(), "response demoted to text-only");
         assert!(c.follow_up_message.is_some(), "block carries a follow-up");
     }
 
@@ -263,7 +270,7 @@ mod tests {
             );
             mw.on_post_llm(&mut probe).await.unwrap();
             assert!(
-                probe.follow_up_message.is_none() && probe.is_tool_call,
+                probe.follow_up_message.is_none() && probe.has_action_intent(),
                 "legitimate distinct calls must never be limited"
             );
         }
@@ -279,6 +286,83 @@ mod tests {
         let mut c = ctx(1, vec![("wait_agent", r#"{"timeout":5,"name":"a"}"#)]);
         mw.on_post_llm(&mut c).await.unwrap();
         assert!(c.follow_up_message.is_some(), "canonical args must unify");
+    }
+
+    #[tokio::test]
+    async fn counting_key_is_the_parse_time_identity() {
+        // D5: the counting key is `Action.identity` as supplied at parse, not
+        // a recomputation over name+args. Whatever the backend folded into one
+        // identity is one call — and name+args alone never accumulate.
+        fn action_with(id: &str, name: &str, args: &str, identity: &str) -> Action {
+            Action {
+                id: id.to_string(),
+                name: name.to_string(),
+                args: serde_json::Value::String(args.to_string()),
+                identity: identity.to_string(),
+                format: ActionFormat::ToolCall,
+            }
+        }
+        fn post(actions: Vec<Action>) -> PostLlmCtx {
+            let parse = if actions.is_empty() {
+                ParseOutcome::Empty
+            } else {
+                ParseOutcome::Actions(actions)
+            };
+            PostLlmCtx {
+                session_id: SessionId::new(1),
+                full_text: String::new(),
+                parse,
+                available_tools: vec![],
+                turn_count: 1,
+                total_actions: 0,
+                nudge_count: 0,
+                turn_actions: 0,
+                skip_push: false,
+                follow_up_message: None,
+                finish_reason: FinishReason::ToolUse,
+            }
+        }
+
+        // Same identity, spelled with different names/args → one count key.
+        let mw1 = mw();
+        for i in 0..4 {
+            let mut c = post(vec![action_with(&format!("c{i}"), "a", "{}", "shared")]);
+            mw1.on_post_llm(&mut c).await.unwrap();
+            assert!(c.follow_up_message.is_none(), "below threshold");
+        }
+        let mut c = post(vec![action_with(
+            "c4",
+            "totally_different",
+            r#"{"x":1}"#,
+            "shared",
+        )]);
+        mw1.on_post_llm(&mut c).await.unwrap();
+        assert!(
+            c.follow_up_message.is_some(),
+            "same identity counts together even across different names"
+        );
+
+        // Distinct identity on identical name+args → separate keys.
+        let mw2 = mw();
+        for i in 0..4 {
+            let mut c = post(vec![action_with(
+                &format!("d{i}"),
+                "b",
+                "{}",
+                &format!("distinct-{i}"),
+            )]);
+            mw2.on_post_llm(&mut c).await.unwrap();
+            assert!(
+                c.follow_up_message.is_none(),
+                "distinct identities do not stack"
+            );
+        }
+        let mut c = post(vec![action_with("d4", "b", "{}", "distinct-again")]);
+        mw2.on_post_llm(&mut c).await.unwrap();
+        assert!(
+            c.follow_up_message.is_none(),
+            "identity is the key — name+args alone do not accumulate"
+        );
     }
 
     #[tokio::test]

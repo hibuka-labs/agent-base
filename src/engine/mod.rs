@@ -2,6 +2,7 @@ mod approval;
 pub mod auto_continue;
 mod builder;
 mod context;
+pub mod executor;
 pub mod max_turns_nudge;
 mod middleware;
 mod pipeline;
@@ -21,6 +22,11 @@ pub use context::{
     CompactionKind, CompactionOutcome, ContextCompaction, ContextWindowManager,
     estimate_messages_tokens, first_system_prompt,
 };
+pub use executor::{
+    ActionBackend, ActionExecutor, DEFAULT_INTERACT_TIMEOUT, ExecCtx, ExecError,
+    INTERRUPTED_SUMMARY, InteractionChannel, InteractionError, ParseError, ParseOutcome,
+    SessionError, SessionHandle,
+};
 pub use middleware::{Middleware, PostLlmCtx, PreLlmCtx, UserMessageCtx};
 pub use pipeline::{DefaultPipeline, ToolExecutionPipeline};
 pub use react_loop_guard::{GuardCtx, GuardDecision, NoopGuard, ReactLoopGuard};
@@ -32,6 +38,9 @@ pub use recovery::{
     ConsecutiveFailureRecovery, RetryOnError, StopOnError, ToolErrorAction, ToolErrorRecovery,
 };
 pub use runtime::AgentRuntime;
+// The seam's input type — exported so out-of-kernel ActionExecutor
+// implementations can name it (M3 T10).
+pub use runtime::LlmTurnResult;
 pub use runtime::QueueMode;
 pub use runtime::SessionManager;
 pub use safety::TurnToolLimitMiddleware;

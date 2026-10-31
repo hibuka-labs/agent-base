@@ -67,6 +67,19 @@ pub use tool::{
 pub use types::{RuntimeEvent, UserEvent};
 
 // ---------------------------------------------------------------------------
+// ActionExecutor seam (M3) — kernel vocabulary for action backends
+// ---------------------------------------------------------------------------
+pub use engine::{
+    ActionBackend, ActionExecutor, DEFAULT_INTERACT_TIMEOUT, ExecCtx, ExecError,
+    INTERRUPTED_SUMMARY, InteractionChannel, InteractionError, LlmTurnResult, ParseError,
+    ParseOutcome, SessionError, SessionHandle,
+};
+pub use types::{
+    Action, ActionFormat, ActionOutcome, AskAnswer, AskOption, BatchStatus, Observation,
+    ObservationEvent,
+};
+
+// ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
 pub use types::{AgentError, AgentResult, ErrorKind};
@@ -77,6 +90,6 @@ pub use types::{AgentError, AgentResult, ErrorKind};
 pub use types::{
     AgentConfig, ChatMessage, CheckpointData, CheckpointStep, FinishReason, ImageAttachment,
     ImageDetail, Language, Message, MessageRole, PlanItem, PlanStepStatus, ResponseFormat,
-    RetryConfig, RunOutcome, SafetyConfig, SessionConfig, ToolCallMessage, ToolResultData,
-    TurnContext, UpdatePlanArgs,
+    RetryConfig, RunOutcome, RunState, SafetyConfig, SessionConfig, SessionIdGenerator,
+    ToolCallMessage, ToolResultData, TurnContext, UpdatePlanArgs, shared_session_ids,
 };

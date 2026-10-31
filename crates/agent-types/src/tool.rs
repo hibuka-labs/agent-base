@@ -4,14 +4,17 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::session::SessionId;
+use llm_trait::message::ImageAttachment;
 
 /// Structured content returned by a tool, aligned with the MCP `content`
 /// array shape (no envelope, no orchestration/failure/truncation semantics).
 ///
-/// Only `Text` is consumed by the first LLM adapter; `Image` is shape-reserved
-/// and the adapter reports "not supported" rather than silently dropping it.
-/// `Detail` carries machine-readable metadata (e.g. edit line numbers) that
-/// the UI can consume but the LLM never sees.
+/// `Text` is the textual face and `Image` the pictorial one: a tool that
+/// hands the model something to *look at* returns an `Image`, and
+/// [`content_images`] turns those into the attachments that ride the tool
+/// result to the provider (`content_text` keeps only the words). `Detail`
+/// carries machine-readable metadata (e.g. edit line numbers) that the UI
+/// can consume but the LLM never sees.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Content {
@@ -26,6 +29,20 @@ pub enum Content {
     /// Machine-readable metadata for UI consumption (not sent to the LLM).
     Detail {
         data: serde_json::Value,
+    },
+    /// A stored observation artifact referenced by id (M3c,
+    /// action-executor-design §6): the body is fetched on demand via
+    /// `obs.fetch`; the model face is the summary+reference line carried in
+    /// `Text` — so this typed channel marks the artifact for UI/logs without
+    /// duplicating the line.
+    Artifact {
+        /// Stable store id (`art_<seq>`).
+        capture_id: String,
+        /// What the body is (`"stdout"` / `"stderr"` / `"observation"` / the
+        /// emitter's own label).
+        kind: String,
+        /// The truncation-heuristic glimpse of the body.
+        summary: String,
     },
 }
 
@@ -44,6 +61,18 @@ impl Content {
     pub fn detail(data: serde_json::Value) -> Self {
         Content::Detail { data }
     }
+
+    pub fn artifact(
+        capture_id: impl Into<String>,
+        kind: impl Into<String>,
+        summary: impl Into<String>,
+    ) -> Self {
+        Content::Artifact {
+            capture_id: capture_id.into(),
+            kind: kind.into(),
+            summary: summary.into(),
+        }
+    }
 }
 
 impl From<Content> for Vec<Content> {
@@ -53,16 +82,35 @@ impl From<Content> for Vec<Content> {
 }
 
 /// Join the textual portion of tool output into a single string for display
-/// and session history. Non-text variants (e.g. `Image`, `Detail`) are skipped.
+/// and session history. Non-text variants (e.g. `Image`, `Detail`) are skipped;
+/// `Artifact` is skipped too — its model face is the summary+reference line
+/// already carried in `Text` (the typed channel marks the artifact for UI).
 pub fn content_text(contents: &[Content]) -> String {
     contents
         .iter()
         .filter_map(|c| match c {
             Content::Text { text } => Some(text.as_str()),
-            Content::Image { .. } | Content::Detail { .. } => None,
+            Content::Image { .. } | Content::Detail { .. } | Content::Artifact { .. } => None,
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Extract the pictures a tool's output hands the model to look at, in the
+/// order they were produced — the image face of a tool result, exactly as
+/// [`content_text`] is its textual face. Empty when the output carried none.
+pub fn content_images(contents: &[Content]) -> Vec<ImageAttachment> {
+    contents
+        .iter()
+        .filter_map(|c| match c {
+            Content::Image { data, mime_type } => Some(ImageAttachment::Base64 {
+                data: data.clone(),
+                media_type: Some(mime_type.clone()),
+                detail: None,
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Extract structured detail metadata from tool output. When multiple `Detail`

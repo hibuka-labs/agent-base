@@ -1,16 +1,29 @@
+//! Tool-call backend for the M3 `ActionExecutor` seam: the `ToolCallExecutor`
+//! owns everything the tool protocol needs — envelope parse, truncation rescue,
+//! batch execution, and history rendering. The kernel sees only
+//! [`ParseOutcome`] / [`Observation`] / [`ExecError`].
+//!
+//! The `(id, name, args)` triple is internal to this backend; the kernel
+//! currency is [`Action`]. `run_actions` keeps the react loop's turn-level
+//! flow (breaker strikes, turn-end metrics) — full flow-face unification on
+//! the trait is T10 debt (see the `ActionExecutor` impl below).
+
 use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
+use serde_json::Value;
 use tokio::sync::broadcast;
 
-use serde_json::Value;
-
+use crate::engine::executor::{ActionExecutor, ExecCtx, ExecError, ParseError, ParseOutcome};
 use crate::engine::recovery::ToolErrorAction;
+use crate::engine::runtime::LlmTurnResult;
 use crate::engine::runtime::plan_runner::RuntimeCore;
 use crate::engine::runtime::tool_engine::ExecutionContext;
-use crate::tool::content_text;
+use crate::tool::{content_images, content_text};
 use crate::types::{
-    AgentError, AgentResult, CheckpointData, CheckpointStep, FinishReason, MessageRole, RunOutcome,
-    RuntimeEvent, SessionId,
+    Action, ActionFormat, ActionOutcome, AgentError, AgentResult, BatchStatus, ChatMessage,
+    CheckpointData, CheckpointStep, FinishReason, MessageRole, Observation, RunOutcome,
+    RuntimeEvent, SessionId, ToolResultData,
 };
 
 use super::entry::drain_locked;
@@ -18,18 +31,60 @@ use super::turn_end::TurnEndCtx;
 use super::turn_guard::TurnMetrics;
 use super::turn_loop::TurnFlow;
 
-impl RuntimeCore {
+/// A finished batch: the observation (per-action fates + rendered history) and,
+/// for the flow path, the first per-call failure to feed recovery.
+pub(super) struct ToolBatchReport {
+    pub observation: Observation,
+    /// First per-call failure (an outcome, not an error — D9); `None` when
+    /// every call had a success fate.
+    pub first_failure: Option<AgentError>,
+}
+
+/// The tool-call action backend (M3 seam).
+pub(super) struct ToolCallExecutor<'c> {
+    core: &'c RuntimeCore,
+    session_id: SessionId,
+}
+
+/// Internal triple currency: `Action` → backend triple.
+pub(super) fn actions_to_triples(actions: &[Action]) -> Vec<(String, String, String)> {
+    actions
+        .iter()
+        .map(|a| (a.id.clone(), a.name.clone(), a.raw_args().into_owned()))
+        .collect()
+}
+
+/// Internal triple currency: backend triple → `Action` (identity recomputed
+/// from the current — possibly salvaged — argument text).
+pub(super) fn triples_to_actions(tool_calls: &[(String, String, String)]) -> Vec<Action> {
+    tool_calls
+        .iter()
+        .map(|(id, name, args)| Action::from_tool_call(id.clone(), name.clone(), args.clone()))
+        .collect()
+}
+
+impl<'c> ToolCallExecutor<'c> {
+    pub(super) fn new(core: &'c RuntimeCore, session_id: SessionId) -> Self {
+        Self { core, session_id }
+    }
+
+    /// Turn output → four-state verdict (D4+OV-7). Envelope flattening +
+    /// classification only — no schema-dependent salvage here (that runs on
+    /// the execute side, where schema lookup is async).
+    pub(super) fn classify(&self, turn: &LlmTurnResult) -> ParseOutcome {
+        classify_turn(turn)
+    }
+
     /// Execute tool calls for one LLM turn: truncation guard, execution,
     /// checkpoint emission, and turn-end metrics.
     #[allow(clippy::too_many_arguments)]
-    pub(super) async fn run_tool_turn<F>(
+    pub(super) async fn run_actions<F>(
         &self,
-        session_id: &SessionId,
         user_input: &str,
         turn_count: u32,
         turn_start: std::time::Instant,
         model: &str,
-        mut tool_calls: Vec<(String, String, String)>,
+        actions: Vec<Action>,
         finish_reason: &FinishReason,
         reasoning_text: String,
         full_text: String,
@@ -40,6 +95,8 @@ impl RuntimeCore {
     where
         F: FnMut(RuntimeEvent) -> AgentResult<()> + Send + 'static,
     {
+        let session_id = &self.session_id;
+        let mut tool_calls = actions_to_triples(&actions);
         // Truncation guard — a well-formed provider stream always yields
         // complete JSON for each tool call's arguments. When that breaks, the
         // call must NOT be executed: re-issue it instead. Three ways it breaks:
@@ -94,7 +151,7 @@ impl RuntimeCore {
             let empty_object = serde_json::from_str::<Value>(args)
                 .map(|v| v.as_object().is_some_and(|o| o.is_empty()))
                 .unwrap_or(false);
-            if empty_object && self.tool_engine.tool_requires_params(name).await {
+            if empty_object && self.core.tool_engine.tool_requires_params(name).await {
                 invalid_indices.push(i);
                 continue;
             }
@@ -130,7 +187,7 @@ impl RuntimeCore {
                     let Some(candidate) = leaked.iter().find(|c| c.name == name) else {
                         continue;
                     };
-                    let schema = self.tool_engine.tool_schema(&name).await;
+                    let schema = self.core.tool_engine.tool_schema(&name).await;
                     let Some(args_json) =
                         super::text_toolcall::build_arguments(candidate, schema.as_ref())
                     else {
@@ -194,6 +251,7 @@ impl RuntimeCore {
                 0 // valid calls will reset the counter
             } else {
                 let current = self
+                    .core
                     .with_session_mut(session_id, |s| s.run_state.truncation_strikes)
                     .await?;
                 current + 1
@@ -221,18 +279,19 @@ impl RuntimeCore {
                     "truncation hard limit reached, stopping run"
                 );
                 // Record the final strike and close dangling tool calls.
-                self.with_session_mut(session_id, |session| {
-                    session.push_assistant_tool_calls(
-                        &tool_calls,
-                        Some(reasoning_text),
-                        Some(full_text),
-                    );
-                    for &i in &invalid_indices {
-                        session.push_tool_result(&tool_calls[i].0, &error_msg);
-                    }
-                    session.run_state.record_truncation();
-                })
-                .await?;
+                self.core
+                    .with_session_mut(session_id, |session| {
+                        session.push_assistant_tool_calls(
+                            &tool_calls,
+                            Some(reasoning_text),
+                            Some(full_text),
+                        );
+                        for &i in &invalid_indices {
+                            session.push_tool_result(&tool_calls[i].0, &error_msg);
+                        }
+                        session.run_state.record_truncation();
+                    })
+                    .await?;
                 return Ok(TurnFlow::Done(RunOutcome::Failed { error: error_msg }));
             }
 
@@ -262,18 +321,19 @@ impl RuntimeCore {
                     failed_tools.join(", "),
                     failed_tools.join(", "),
                 );
-                self.with_session_mut(session_id, |session| {
-                    session.push_assistant_tool_calls(
-                        &tool_calls,
-                        Some(reasoning_text),
-                        Some(full_text),
-                    );
-                    for &i in &invalid_indices {
-                        session.push_tool_result(&tool_calls[i].0, &redirect_msg);
-                    }
-                    session.run_state.record_truncation();
-                })
-                .await?;
+                self.core
+                    .with_session_mut(session_id, |session| {
+                        session.push_assistant_tool_calls(
+                            &tool_calls,
+                            Some(reasoning_text),
+                            Some(full_text),
+                        );
+                        for &i in &invalid_indices {
+                            session.push_tool_result(&tool_calls[i].0, &redirect_msg);
+                        }
+                        session.run_state.record_truncation();
+                    })
+                    .await?;
                 return Ok(TurnFlow::Continue);
             }
 
@@ -314,39 +374,46 @@ impl RuntimeCore {
                     .to_string()
             };
 
-            // Push the assistant message WITH all tool_calls (protocol requirement),
-            // and tool_results with guidance for the invalid ones.
-            self.with_session_mut(session_id, |session| {
-                session.push_assistant_tool_calls(
-                    &tool_calls,
-                    Some(reasoning_text),
-                    Some(full_text),
-                );
-                for &i in &invalid_indices {
-                    session.push_tool_result(&tool_calls[i].0, &guidance);
-                }
-                // Record the strike if all calls were invalid.
-                if !has_valid {
-                    session.run_state.record_truncation();
-                }
-            })
-            .await?;
-
             if has_valid {
-                // Execute only the valid tool_calls through the normal path.
-                let valid_calls: Vec<(String, String, String)> = tool_calls
+                // Build pre-resolved results for invalid calls (guidance text).
+                // `handle_tool_calls` pushes ONE assistant message with ALL
+                // tool_calls, then these results, then executes the valid ones —
+                // every tool_call_id gets exactly one result in order.
+                let pre_resolved: Vec<(String, String)> = invalid_indices
                     .iter()
-                    .enumerate()
-                    .filter(|(i, _)| !invalid_indices.contains(i))
-                    .map(|(_, tc)| tc.clone())
+                    .map(|&i| (tool_calls[i].0.clone(), guidance.clone()))
                     .collect();
-                self.handle_tool_calls(session_id, &valid_calls, event_rx, on_event, "", "")
-                    .await?;
-                // Valid calls executed — reset truncation counter.
-                self.with_session_mut(session_id, |session| {
-                    session.run_state.truncation_strikes = 0;
-                })
+                self.handle_tool_calls(
+                    session_id,
+                    &tool_calls,
+                    &pre_resolved,
+                    event_rx,
+                    on_event,
+                    &reasoning_text,
+                    &full_text,
+                )
                 .await?;
+                // Valid calls executed — reset truncation counter.
+                self.core
+                    .with_session_mut(session_id, |session| {
+                        session.run_state.truncation_strikes = 0;
+                    })
+                    .await?;
+            } else {
+                // All calls invalid — push assistant + guidance results directly.
+                self.core
+                    .with_session_mut(session_id, |session| {
+                        session.push_assistant_tool_calls(
+                            &tool_calls,
+                            Some(reasoning_text),
+                            Some(full_text),
+                        );
+                        for &i in &invalid_indices {
+                            session.push_tool_result(&tool_calls[i].0, &guidance);
+                        }
+                        session.run_state.record_truncation();
+                    })
+                    .await?;
             }
             return Ok(TurnFlow::Continue);
         }
@@ -357,16 +424,24 @@ impl RuntimeCore {
             tool_count = tool_calls.len(),
             "handling tool calls"
         );
-        self.event_bus.emit(RuntimeEvent::Checkpoint {
+        // 账+数 in one write (D5+OV-11): the step and the counting state that
+        // goes with it land on the journal together.
+        let run_state = self
+            .core
+            .with_session_mut(session_id, |session| session.run_state.clone())
+            .await?;
+        self.core.event_bus.emit(RuntimeEvent::Checkpoint {
             session_id: session_id.clone(),
-            checkpoint: CheckpointData {
-                session_id: session_id.clone(),
-                user_input: user_input.to_string(),
-                step: CheckpointStep::BeforeToolCalls {
-                    tool_calls: tool_calls.clone(),
+            checkpoint: Box::new(CheckpointData::new(
+                session_id.clone(),
+                user_input.to_string(),
+                CheckpointStep::BeforeActions {
+                    actions: triples_to_actions(&tool_calls),
                 },
                 turn_count,
-            },
+                ActionFormat::ToolCall,
+                run_state,
+            )),
             agent_id: None,
             trace_id: None,
         });
@@ -375,76 +450,35 @@ impl RuntimeCore {
         let tool_call_count = tool_calls.len() as u32;
         let tool_names: Vec<String> = tool_calls.iter().map(|(_, name, _)| name.clone()).collect();
 
-        match self
+        let batch_result = self
             .handle_tool_calls(
                 session_id,
                 &tool_calls,
+                &[],
                 event_rx,
                 on_event.clone(),
                 &reasoning_text,
                 &full_text,
             )
-            .await
-        {
-            Ok(()) => {
-                let tool_duration_ms = tool_start.elapsed().as_millis() as u64;
-                self.fire_turn_end(TurnEndCtx {
-                    ttft_ms: metrics.ttft_ms,
-                    llm_duration_ms: metrics.llm_duration_ms,
-                    tool_duration_ms,
-                    usage: metrics.usage,
-                    text_length: metrics.text_len,
-                    has_thinking: metrics.has_thinking,
-                    thinking_bytes: metrics.thinking_bytes,
-                    tool_call_count,
-                    tools_used: &tool_names,
-                    tool_success: tool_call_count,
-                    llm_calls: 1,
-                    ..TurnEndCtx::new(
-                        session_id,
-                        turn_count,
-                        turn_start,
-                        model,
-                        user_input,
-                        RunOutcome::Completed,
-                    )
-                })
-                .await;
-                tracing::info!(
-                    session_id = session_id.id,
-                    turn = turn_count,
-                    "tool calls done, continuing loop"
-                );
-                let n = tool_calls.len();
-                self.with_session_mut(session_id, |session| {
-                    session.total_tool_calls += n;
-                    session.run_state.record_tool_calls(n);
-                })
-                .await?;
-                self.event_bus.emit(RuntimeEvent::Checkpoint {
-                    session_id: session_id.clone(),
-                    checkpoint: CheckpointData {
-                        session_id: session_id.clone(),
-                        user_input: user_input.to_string(),
-                        step: CheckpointStep::AfterToolCalls {
-                            tool_calls,
-                            results: Vec::new(),
-                        },
-                        turn_count,
-                    },
-                    agent_id: None,
-                    trace_id: None,
-                });
-                Ok(TurnFlow::Continue)
-            }
-            Err(e) => {
-                let tool_duration_ms = tool_start.elapsed().as_millis() as u64;
-                let error_msg = e.to_string();
-                if let Some(outcome) = self
-                    .handle_tool_error(session_id, &tool_calls, e, event_rx, on_event)
-                    .await?
-                {
-                    self.fire_turn_end(TurnEndCtx {
+            .await;
+
+        // Per-call failures are outcomes (D9); the flow path still runs the
+        // legacy recovery on the first one. Orchestrate-level errors (approval
+        // denial, cancellation) arrive the same way they always did.
+        let (observation, first_failure) = match batch_result {
+            Ok(batch) => (Some(batch.observation), batch.first_failure),
+            Err(e) => (None, Some(e)),
+        };
+
+        if let Some(e) = first_failure {
+            let tool_duration_ms = tool_start.elapsed().as_millis() as u64;
+            let error_msg = e.to_string();
+            if let Some(outcome) = self
+                .handle_tool_error(session_id, &tool_calls, e, event_rx, on_event)
+                .await?
+            {
+                self.core
+                    .fire_turn_end(TurnEndCtx {
                         ttft_ms: metrics.ttft_ms,
                         llm_duration_ms: metrics.llm_duration_ms,
                         tool_duration_ms,
@@ -469,10 +503,11 @@ impl RuntimeCore {
                         )
                     })
                     .await;
-                    return Ok(TurnFlow::Done(outcome));
-                }
-                // Retry: record metrics for the failed attempt
-                self.fire_turn_end(TurnEndCtx {
+                return Ok(TurnFlow::Done(outcome));
+            }
+            // Retry: record metrics for the failed attempt
+            self.core
+                .fire_turn_end(TurnEndCtx {
                     ttft_ms: metrics.ttft_ms,
                     llm_duration_ms: metrics.llm_duration_ms,
                     tool_duration_ms,
@@ -497,9 +532,67 @@ impl RuntimeCore {
                     )
                 })
                 .await;
-                Ok(TurnFlow::Continue)
-            }
+            return Ok(TurnFlow::Continue);
         }
+
+        let tool_duration_ms = tool_start.elapsed().as_millis() as u64;
+        self.core
+            .fire_turn_end(TurnEndCtx {
+                ttft_ms: metrics.ttft_ms,
+                llm_duration_ms: metrics.llm_duration_ms,
+                tool_duration_ms,
+                usage: metrics.usage,
+                text_length: metrics.text_len,
+                has_thinking: metrics.has_thinking,
+                thinking_bytes: metrics.thinking_bytes,
+                tool_call_count,
+                tools_used: &tool_names,
+                tool_success: tool_call_count,
+                llm_calls: 1,
+                ..TurnEndCtx::new(
+                    session_id,
+                    turn_count,
+                    turn_start,
+                    model,
+                    user_input,
+                    RunOutcome::Completed,
+                )
+            })
+            .await;
+        tracing::info!(
+            session_id = session_id.id,
+            turn = turn_count,
+            "tool calls done, continuing loop"
+        );
+        let n = tool_calls.len();
+        // One counting entry point (D5): record_actions bumps both the turn
+        // and the session total. The AfterActions line co-writes the post-bump
+        // state in the same closure, so the 账 on the line can never disagree
+        // with the 数 (crash-window consistency, OV-11).
+        let run_state = self
+            .core
+            .with_session_mut(session_id, |session| {
+                session.run_state.record_actions(n);
+                session.run_state.clone()
+            })
+            .await?;
+        self.core.event_bus.emit(RuntimeEvent::Checkpoint {
+            session_id: session_id.clone(),
+            checkpoint: Box::new(CheckpointData::new(
+                session_id.clone(),
+                user_input.to_string(),
+                CheckpointStep::AfterActions {
+                    actions: triples_to_actions(&tool_calls),
+                    observation,
+                },
+                turn_count,
+                ActionFormat::ToolCall,
+                run_state,
+            )),
+            agent_id: None,
+            trace_id: None,
+        });
+        Ok(TurnFlow::Continue)
     }
 
     pub(super) async fn handle_tool_error<F>(
@@ -513,14 +606,20 @@ impl RuntimeCore {
     where
         F: FnMut(RuntimeEvent) -> AgentResult<()> + Send,
     {
-        let config = self.config_snapshot_async().await;
+        let config = self.core.config_snapshot_async().await;
 
         if e.is_cancelled() {
             // Don't emit RunFinished when cancelled — RunCancelled will be emitted by run_turn
             // But still drain pending events and persist session
             drain_locked(event_rx, &on_event)?;
-            let session = self.session_manager.session_or_err(session_id).await?;
-            if let Err(e) = self.session_manager.session_store().save(&session).await {
+            let session = self.core.session_manager.session_or_err(session_id).await?;
+            if let Err(e) = self
+                .core
+                .session_manager
+                .session_store()
+                .save(&session)
+                .await
+            {
                 tracing::warn!(session_id = session_id.id, error = %e, "Failed to persist session");
                 if config.execution.fail_on_persist_error {
                     return Err(AgentError::internal(format!(
@@ -547,25 +646,33 @@ impl RuntimeCore {
             } else {
                 format!("❌ User rejected: {}", e)
             };
-            self.with_session_mut(session_id, |session| {
-                session.close_dangling_tool_calls(&error_summary);
-                session.remove_ephemeral_messages();
-            })
-            .await?;
-            self.event_bus.emit(RuntimeEvent::RunFinished {
+            self.core
+                .with_session_mut(session_id, |session| {
+                    session.close_dangling_tool_calls(&error_summary);
+                    session.remove_ephemeral_messages();
+                })
+                .await?;
+            self.core.event_bus.emit(RuntimeEvent::RunFinished {
                 session_id: session_id.clone(),
                 agent_id: None,
                 trace_id: None,
             });
             drain_locked(event_rx, &on_event)?;
-            let session = self.session_manager.session_or_err(session_id).await?;
-            if let Err(e) = self.session_manager.session_store().save(&session).await {
+            let session = self.core.session_manager.session_or_err(session_id).await?;
+            if let Err(e) = self
+                .core
+                .session_manager
+                .session_store()
+                .save(&session)
+                .await
+            {
                 tracing::warn!(session_id = session_id.id, error = %e, "Failed to persist session");
             }
             return Ok(Some(RunOutcome::Completed));
         }
 
         let action = self
+            .core
             .tool_engine
             .error_recovery()
             .on_error(session_id, &names, &e)?;
@@ -577,8 +684,8 @@ impl RuntimeCore {
                 } else {
                     format!("❌ Tool execution failed: {}", e)
                 };
-                // Emit ToolCallFinished so TUI shows the failure before RunFinished
-                self.event_bus.emit(RuntimeEvent::ToolCallFinished {
+                // Emit ActionFinished so TUI shows the failure before RunFinished
+                self.core.event_bus.emit(RuntimeEvent::ActionFinished {
                     session_id: session_id.clone(),
                     tool_name: names.join(", "),
                     summary: error_summary.clone(),
@@ -587,19 +694,26 @@ impl RuntimeCore {
                     denied: false,
                     details: None,
                 });
-                self.with_session_mut(session_id, |session| {
-                    session.close_dangling_tool_calls(&error_summary);
-                    session.remove_ephemeral_messages();
-                })
-                .await?;
-                self.event_bus.emit(RuntimeEvent::RunFinished {
+                self.core
+                    .with_session_mut(session_id, |session| {
+                        session.close_dangling_tool_calls(&error_summary);
+                        session.remove_ephemeral_messages();
+                    })
+                    .await?;
+                self.core.event_bus.emit(RuntimeEvent::RunFinished {
                     session_id: session_id.clone(),
                     agent_id: None,
                     trace_id: None,
                 });
                 drain_locked(event_rx, &on_event)?;
-                let session = self.session_manager.session_or_err(session_id).await?;
-                if let Err(e) = self.session_manager.session_store().save(&session).await {
+                let session = self.core.session_manager.session_or_err(session_id).await?;
+                if let Err(e) = self
+                    .core
+                    .session_manager
+                    .session_store()
+                    .save(&session)
+                    .await
+                {
                     tracing::warn!(session_id = session_id.id, error = %e, "Failed to persist session");
                     if config.execution.fail_on_persist_error {
                         return Err(AgentError::internal(format!(
@@ -642,8 +756,8 @@ impl RuntimeCore {
                     )
                 };
 
-                // Emit ToolCallFinished so TUI shows the recovery action
-                self.event_bus.emit(RuntimeEvent::ToolCallFinished {
+                // Emit ActionFinished so TUI shows the recovery action
+                self.core.event_bus.emit(RuntimeEvent::ActionFinished {
                     session_id: session_id.clone(),
                     tool_name: tool_name.clone(),
                     summary: summary.clone(),
@@ -653,11 +767,12 @@ impl RuntimeCore {
                     details: None,
                 });
 
-                self.with_session_mut(session_id, |session| {
-                    session.close_dangling_tool_calls(&summary);
-                    session.push_message(MessageRole::User, error_history);
-                })
-                .await?;
+                self.core
+                    .with_session_mut(session_id, |session| {
+                        session.close_dangling_tool_calls(&summary);
+                        session.push_message(MessageRole::User, error_history);
+                    })
+                    .await?;
                 Ok(None)
             }
             ToolErrorAction::Retry => {
@@ -677,56 +792,78 @@ impl RuntimeCore {
                 } else {
                     format!("❌ Tool execution failed: {}", error_text)
                 };
-                self.with_session_mut(session_id, |session| {
-                    session.close_dangling_tool_calls(&error_summary);
-                    session.push_message(MessageRole::User, retry_prompt);
-                })
-                .await?;
+                self.core
+                    .with_session_mut(session_id, |session| {
+                        session.close_dangling_tool_calls(&error_summary);
+                        session.push_message(MessageRole::User, retry_prompt);
+                    })
+                    .await?;
                 Ok(None)
             }
         }
     }
 
+    /// Execute a batch of tool calls. `pre_resolved` carries results for calls
+    /// that must NOT be executed (e.g. truncation-guard invalid calls) — they
+    /// are rendered as tool results right after the assistant message so every
+    /// tool_call_id in the assistant message gets exactly one result in order
+    /// (provider pairing requirement, MiniMax error 2013).
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn handle_tool_calls<F>(
         &self,
         session_id: &SessionId,
         tool_calls: &[(String, String, String)],
+        pre_resolved: &[(String, String)],
         event_rx: &mut broadcast::Receiver<RuntimeEvent>,
         on_event: Arc<Mutex<F>>,
         reasoning: &str,
         full_text: &str,
-    ) -> AgentResult<()>
+    ) -> AgentResult<ToolBatchReport>
     where
         F: FnMut(RuntimeEvent) -> AgentResult<()> + Send + 'static,
     {
-        let tool_names: Vec<&str> = tool_calls
+        // Only execute calls that don't already have a pre-resolved result.
+        let exec_calls: Vec<(String, String, String)> = tool_calls
+            .iter()
+            .filter(|(id, _, _)| !pre_resolved.iter().any(|(pid, _)| pid == id))
+            .cloned()
+            .collect();
+
+        let tool_names: Vec<&str> = exec_calls
             .iter()
             .map(|(_, name, _)| name.as_str())
             .collect();
         tracing::debug!(
             session_id = session_id.id,
             ?tool_names,
+            pre_resolved_count = pre_resolved.len(),
             "handle tool calls start"
         );
 
-        let config = self.config_snapshot_async().await;
+        let config = self.core.config_snapshot_async().await;
 
         let ctx = ExecutionContext {
-            session_manager: self.session_manager.clone(),
-            llm_client: Some(self.llm_engine.get_provider()),
+            session_manager: self.core.session_manager.clone(),
+            llm_client: Some(self.core.llm_engine.get_provider()),
             language: config.language.clone(),
             tool_timeout_ms: config.tool.tool_timeout_ms,
             max_output_chars: config.tool.max_tool_output_chars,
-            cancel_token: self.cancel_token(),
+            cancel_token: self.core.cancel_token(),
         };
 
-        // Orchestrate: approval check + execution for all tool calls.
+        // Orchestrate: approval check + execution for executable calls only.
         // Approval denial is handled inside process_approval (pushes fake tool state
         // and returns Err). We only push real tool calls on success.
-        let outcome = self
-            .tool_engine
-            .orchestrate(session_id, tool_calls, &ctx, event_rx, on_event.clone())
-            .await?;
+        let outcome = if exec_calls.is_empty() {
+            None
+        } else {
+            Some(
+                self.core
+                    .tool_engine
+                    .orchestrate(session_id, &exec_calls, &ctx, event_rx, on_event.clone())
+                    .await?,
+            )
+        };
 
         // Per-batch park tracking: whether this batch left a human step pending
         // (e.g. a design-canvas screen awaiting a pick). Assignment, not
@@ -734,15 +871,19 @@ impl RuntimeCore {
         // after the park, so the run is no longer simply waiting. Must land
         // before the failure early-return below so a mixed batch (parked call
         // plus a failed one) still records the park.
-        {
+        if let Some(ref outcome) = outcome {
             let awaiting = outcome.results.iter().any(|r| r.waiting_for_human);
-            self.with_session_mut(session_id, |session| {
-                session.run_state.awaiting_human = awaiting;
-            })
-            .await?;
+            self.core
+                .with_session_mut(session_id, |session| {
+                    session.run_state.awaiting_human = awaiting;
+                })
+                .await?;
         }
 
-        // Push assistant tool calls to session after all approvals pass
+        // Push assistant tool calls to session after all approvals pass — the
+        // backend renders the history protocol and carries the same messages in
+        // the observation for checkpoint replay (M3 seam).
+        let mut history_messages: Vec<ChatMessage> = Vec::new();
         {
             let tc: Vec<(String, String, String)> = tool_calls.to_vec();
             let ft = if full_text.is_empty() {
@@ -755,40 +896,245 @@ impl RuntimeCore {
             } else {
                 Some(reasoning.to_string())
             };
-            self.with_session_mut(session_id, |session| {
-                session.push_assistant_tool_calls(&tc, rt, ft);
+            let assistant = crate::engine::AgentSession::render_assistant_tool_calls(&tc, rt, ft);
+            self.core
+                .with_session_mut(session_id, |session| {
+                    session.push_chat_message(assistant.clone());
+                })
+                .await?;
+            history_messages.push(assistant);
+        }
+
+        // Push pre-resolved results (e.g. truncation-guard invalid calls) —
+        // these must land immediately after the assistant message so every
+        // tool_call_id gets exactly one result (provider pairing requirement).
+        for (id, text) in pre_resolved {
+            let msg = ChatMessage::tool(id, text);
+            self.core
+                .with_session_mut(session_id, |session| {
+                    session.push_chat_message(msg.clone());
+                })
+                .await?;
+            history_messages.push(msg);
+        }
+
+        // Process successful results: push to session. The pictures a tool
+        // handed back ride with the words (§4.2): they are output the model
+        // looks at, not metadata to summarise away.
+        if let Some(ref outcome) = outcome {
+            for result in &outcome.results {
+                let msg = ChatMessage::tool_with_images(
+                    &result.id,
+                    content_text(&result.output),
+                    content_images(&result.output),
+                );
+                self.core
+                    .with_session_mut(session_id, |session| {
+                        session.push_chat_message(msg.clone());
+                    })
+                    .await?;
+                history_messages.push(msg);
+            }
+
+            // Push each failure's own error text so the model sees exactly what broke
+            // (not just the first failure's message) and every tool call has a result.
+            for failure in &outcome.failures {
+                let msg = ChatMessage::tool(&failure.id, failure.error.to_string());
+                self.core
+                    .with_session_mut(session_id, |session| {
+                        session.push_chat_message(msg.clone());
+                    })
+                    .await?;
+                history_messages.push(msg);
+            }
+        }
+
+        // Per-action fates in submission order (ids pair with the batch).
+        let outcomes: Vec<ActionOutcome> = tool_calls
+            .iter()
+            .map(|(id, name, _)| {
+                // Pre-resolved calls: fate comes from the pre-filled result.
+                if let Some((_, text)) = pre_resolved.iter().find(|(pid, _)| pid == id) {
+                    return ActionOutcome {
+                        action_id: id.clone(),
+                        name: name.clone(),
+                        ok: true,
+                        denied: false,
+                        summary: text.clone(),
+                        details: None,
+                    };
+                }
+                if let Some(ref outcome) = outcome {
+                    if let Some(r) = outcome.results.iter().find(|r| r.id == *id) {
+                        return ActionOutcome {
+                            action_id: id.clone(),
+                            name: name.clone(),
+                            ok: true,
+                            denied: false,
+                            summary: content_text(&r.output),
+                            details: None,
+                        };
+                    }
+                    if let Some(f) = outcome.failures.iter().find(|f| f.id == *id) {
+                        return ActionOutcome {
+                            action_id: id.clone(),
+                            name: name.clone(),
+                            ok: false,
+                            denied: matches!(f.error, AgentError::ApprovalDenied { .. }),
+                            summary: f.error.to_string(),
+                            details: None,
+                        };
+                    }
+                }
+                // Defensive fallback.
+                ActionOutcome {
+                    action_id: id.clone(),
+                    name: name.clone(),
+                    ok: false,
+                    denied: false,
+                    summary: "no result recorded".to_string(),
+                    details: None,
+                }
             })
-            .await?;
-        }
+            .collect();
 
-        // Process successful results: push to session.
-        for result in &outcome.results {
-            self.with_session_mut(session_id, |session| {
-                session.push_tool_result(&result.id, content_text(&result.output));
-            })
-            .await?;
-        }
-
-        // Push each failure's own error text so the model sees exactly what broke
-        // (not just the first failure's message) and every tool call has a result.
-        for failure in &outcome.failures {
-            let summary = failure.error.to_string();
-            self.with_session_mut(session_id, |session| {
-                session.push_tool_result(&failure.id, summary);
-            })
-            .await?;
-        }
-
-        // Surface the first per-call failure back to the caller so the existing
-        // `handle_tool_error` path can run recovery and feed the model a retry prompt.
-        // Recovery only counts this first failing tool here — an undercount in the
-        // rare multi-failure batch, which errs on the lenient (never false-Stop) side.
-        if let Some(first) = outcome.failures.into_iter().next() {
-            return Err(first.error);
-        }
-
-        Ok(())
+        let first_failure = outcome.and_then(|o| o.failures.into_iter().next().map(|f| f.error));
+        Ok(ToolBatchReport {
+            observation: Observation {
+                outcomes,
+                events: vec![],
+                history_messages,
+                batch_status: BatchStatus::Completed,
+            },
+            first_failure,
+        })
     }
+
+    /// Model-visible fate for an action the crash window cut off (OV-4) —
+    /// the kernel's one vocabulary ([`crate::engine::executor::INTERRUPTED_SUMMARY`]),
+    /// shared with the mounted-backend replay path (T10c).
+    const INTERRUPTED_SUMMARY: &'static str = crate::engine::executor::INTERRUPTED_SUMMARY;
+
+    /// D3 observation replay (T6) — resume never executes actions (side
+    /// effects are one-shot). A completed batch replays its recorded
+    /// observation verbatim; otherwise the batch is dangling (crash window)
+    /// and every action gets a synthetic fate: the migration mark's legacy
+    /// `results` summary when the pre-M3 payload recorded one, else
+    /// [`Self::INTERRUPTED_SUMMARY`] (已中断/未执行).
+    ///
+    /// Contract: the restored session history ends before this batch's
+    /// messages — the replay pushes exactly the batch's protocol pair
+    /// (assistant tool-call message + one result per action) so provider
+    /// validation stays sound.
+    pub(super) async fn replay_batch(
+        &self,
+        session_id: &SessionId,
+        tool_calls: &[(String, String, String)],
+        recorded: Option<Observation>,
+        legacy_results: &[ToolResultData],
+    ) -> AgentResult<Observation> {
+        if let Some(observation) = recorded {
+            self.core
+                .with_session_mut(session_id, |session| {
+                    for msg in &observation.history_messages {
+                        session.push_chat_message(msg.clone());
+                    }
+                })
+                .await?;
+            return Ok(observation);
+        }
+
+        let mut history_messages: Vec<ChatMessage> = Vec::with_capacity(tool_calls.len() + 1);
+        let assistant =
+            crate::engine::AgentSession::render_assistant_tool_calls(tool_calls, None, None);
+        history_messages.push(assistant);
+
+        let mut outcomes = Vec::with_capacity(tool_calls.len());
+        for (id, name, _) in tool_calls {
+            let summary = legacy_results
+                .iter()
+                .find(|r| r.tool_call_id == *id)
+                .map(|r| r.summary.as_str());
+            let text = summary.unwrap_or(Self::INTERRUPTED_SUMMARY);
+            history_messages.push(ChatMessage::tool(id, text));
+            outcomes.push(ActionOutcome {
+                action_id: id.clone(),
+                name: name.clone(),
+                ok: summary.is_some(),
+                denied: false,
+                summary: text.to_string(),
+                details: None,
+            });
+        }
+
+        self.core
+            .with_session_mut(session_id, |session| {
+                for msg in &history_messages {
+                    session.push_chat_message(msg.clone());
+                }
+            })
+            .await?;
+
+        Ok(Observation {
+            outcomes,
+            events: vec![],
+            history_messages,
+            // Reconstructed at resume, not observed (D3).
+            batch_status: BatchStatus::Interrupted,
+        })
+    }
+}
+
+/// Four-state classification of one turn (D4+OV-7). State-free: pure over the
+/// provider envelope.
+fn classify_turn(turn: &LlmTurnResult) -> ParseOutcome {
+    let actions = triples_to_actions(&flatten_envelope(turn));
+    if turn.is_tool_call {
+        if actions.is_empty() {
+            // Tool intent signalled but nothing materialized.
+            ParseOutcome::Incomplete
+        } else {
+            ParseOutcome::Actions(actions)
+        }
+    } else if !turn.full_text.is_empty() {
+        let finish = FinishReason::from_raw(turn.finish_reason.as_deref());
+        // Intent without a call: truncated finish or a ToolUse mislabel —
+        // the old finish-anomaly branch.
+        if finish.is_truncated() || matches!(finish, FinishReason::ToolUse) {
+            ParseOutcome::Malformed
+        } else {
+            ParseOutcome::Empty
+        }
+    } else {
+        ParseOutcome::Empty
+    }
+}
+
+/// Flatten the provider envelope's tool calls into backend triples.
+fn flatten_envelope(turn: &LlmTurnResult) -> Vec<(String, String, String)> {
+    turn.tool_calls
+        .iter()
+        .map(|tc| {
+            let id = tc
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let name = tc
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .to_string();
+            let args = tc
+                .get("function")
+                .and_then(|f| f.get("arguments"))
+                .and_then(|a| a.as_str())
+                .unwrap_or("")
+                .to_string();
+            (id, name, args)
+        })
+        .collect()
 }
 
 /// Names of the tools that actually failed in a batch of tool calls.
@@ -821,6 +1167,63 @@ fn is_truncation_wrapper(args: &Value) -> bool {
         .is_some_and(|s| s == "tool_call_arguments_truncated");
     let preview = obj.contains_key("original_args_preview");
     marker || (preview && obj.contains_key("message"))
+}
+
+fn noop_event(_event: RuntimeEvent) -> AgentResult<()> {
+    Ok(())
+}
+
+/// The seam face (M3). `parse` is the live four-state classifier; `execute` is
+/// the observation-shaped batch core. Flow-face debt: the react loop still
+/// drives turns through `run_actions` (truncation rescue, breaker strikes, and
+/// run-level flow signals are turn plumbing `ExecCtx` does not yet carry —
+/// T8 wired the interaction channel and its guards, T10 switches the loop to
+/// this trait).
+#[async_trait]
+impl<'c> ActionExecutor for ToolCallExecutor<'c> {
+    fn parse(&self, turn: &LlmTurnResult) -> Result<ParseOutcome, ParseError> {
+        Ok(self.classify(turn))
+    }
+
+    async fn execute(
+        &mut self,
+        actions: Vec<Action>,
+        ctx: &ExecCtx,
+    ) -> Result<Observation, ExecError> {
+        if actions.is_empty() {
+            return Err(ExecError::NothingRan {
+                reason: "empty batch".into(),
+            });
+        }
+        // Per-action fates are outcomes (D9); ExecError is reserved for "not a
+        // single action got off the ground" (D15). Interactions from inside
+        // the batch ride `ctx` (T8: consent/ask_user suspend there, on the
+        // run's cancel token); the batch's own cancel wiring and live event
+        // streaming need run plumbing (T10) — events ride a sinkless channel
+        // here.
+        let _ = ctx;
+        let triples = actions_to_triples(&actions);
+        let (_event_tx, mut event_rx) = broadcast::channel(8);
+        let on_event: Arc<Mutex<fn(RuntimeEvent) -> AgentResult<()>>> =
+            Arc::new(Mutex::new(noop_event));
+        match self
+            .handle_tool_calls(
+                &self.session_id,
+                &triples,
+                &[],
+                &mut event_rx,
+                on_event,
+                "",
+                "",
+            )
+            .await
+        {
+            Ok(batch) => Ok(batch.observation),
+            Err(e) => Err(ExecError::NothingRan {
+                reason: e.to_string(),
+            }),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -886,4 +1289,53 @@ mod tests {
             vec!["a".to_string(), "b".to_string()]
         );
     }
+
+    /// Four-state verdict of the envelope classifier (D4+OV-7 mapping).
+    #[test]
+    fn classify_maps_envelope_states() {
+        let mut turn = LlmTurnResult {
+            full_text: String::new(),
+            reasoning_text: String::new(),
+            is_tool_call: true,
+            tool_calls: vec![serde_json::json!({
+                "id": "call_1", "name": "echo", "arguments": "{\"x\":1}"
+            })],
+            usage: None,
+            finish_reason: Some("tool_calls".into()),
+            ttft_ms: 1,
+            llm_duration_ms: 2,
+            reasoning_only: false,
+            thinking_signature: None,
+        };
+
+        // Calls materialized → Actions.
+        let out = classify_turn(&turn);
+        assert!(matches!(out, ParseOutcome::Actions(ref a) if a.len() == 1 && a[0].id == "call_1"));
+
+        // Tool intent, nothing parsed → Incomplete.
+        turn.tool_calls = vec![];
+        assert_eq!(classify_turn(&turn), ParseOutcome::Incomplete);
+
+        // Truncated text without call flag → Malformed.
+        turn.is_tool_call = false;
+        turn.full_text = "partial...".into();
+        turn.finish_reason = Some("length".into());
+        assert_eq!(classify_turn(&turn), ParseOutcome::Malformed);
+
+        // ToolUse mislabel with text → Malformed.
+        turn.finish_reason = Some("tool_use".into());
+        assert_eq!(classify_turn(&turn), ParseOutcome::Malformed);
+
+        // Clean text → Empty (the loop's text path).
+        turn.finish_reason = Some("stop".into());
+        assert_eq!(classify_turn(&turn), ParseOutcome::Empty);
+
+        // Empty text wins over the finish reason → Empty (old empty branch).
+        turn.full_text = String::new();
+        turn.finish_reason = Some("length".into());
+        assert_eq!(classify_turn(&turn), ParseOutcome::Empty);
+    }
 }
+
+#[cfg(test)]
+mod parse_fixtures;

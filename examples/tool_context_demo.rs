@@ -450,7 +450,7 @@ async fn main() -> AgentResult<()> {
                         }
                         print!("{}", text);
                     }
-                    RuntimeEvent::ToolCallStarted {
+                    RuntimeEvent::ActionStarted {
                         tool_name,
                         args_json,
                         ..
@@ -462,7 +462,7 @@ async fn main() -> AgentResult<()> {
                         }
                         println!("[Tool Call] {} ({})", tool_name, args_json);
                     }
-                    RuntimeEvent::ToolCallFinished {
+                    RuntimeEvent::ActionFinished {
                         tool_name, summary, ..
                     } => {
                         println!("[Tool Result] {}: {}", tool_name, summary);

@@ -1,15 +1,19 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::llm::ReasoningConfig;
 use crate::tool::{Tool, ToolPolicy, ToolRegistry};
 use crate::types::{
-    AgentConfig, AtomicU64SessionIdGenerator, ConvertToLlmFn, ResponseFormat, RetryConfig,
-    SessionIdGenerator,
+    AgentConfig, ConvertToLlmFn, ResponseFormat, RetryConfig, SessionIdGenerator,
+    shared_session_ids,
 };
 
 use super::AgentRuntime;
 use super::approval::ApprovalHandler;
 use super::context::{ContextCompaction, ContextWindowManager};
+use super::executor::{
+    ActionBackend, DEFAULT_INTERACT_TIMEOUT, FailClosedInteract, InteractionChannel,
+};
 use super::middleware::{Middleware, MiddlewareRef};
 use super::react_loop_guard::ReactLoopGuard;
 use super::recovery::{StopOnError, ToolErrorRecovery};
@@ -30,6 +34,11 @@ pub struct AgentBuilder {
     convert_to_llm: Option<ConvertToLlmFn>,
     guard: Option<Arc<dyn ReactLoopGuard>>,
     context_compactor: Option<Arc<dyn ContextCompaction>>,
+    action_backend: Option<Box<dyn ActionBackend>>,
+    interact: Option<Arc<dyn InteractionChannel>>,
+    /// Outer `None` = unset (the default watchdog); inner `None` = explicitly
+    /// unbounded human time.
+    interact_timeout: Option<Option<Duration>>,
 }
 
 impl AgentBuilder {
@@ -50,6 +59,9 @@ impl AgentBuilder {
             convert_to_llm: None,
             guard: None,
             context_compactor: None,
+            action_backend: None,
+            interact: None,
+            interact_timeout: None,
         }
     }
 
@@ -94,6 +106,33 @@ impl AgentBuilder {
     /// and compact the session if it exceeds the configured threshold.
     pub fn context_compactor(mut self, compactor: Arc<dyn ContextCompaction>) -> Self {
         self.context_compactor = Some(compactor);
+        self
+    }
+
+    /// Mount this runtime's action backend (T10c): text turns route to it,
+    /// tool-envelope turns keep the built-in tool-call backend. One backend
+    /// per runtime — build one runtime per session when the backend holds a
+    /// resident engine (the product's assembly-time choice, sdk-assembly
+    /// §3.4).
+    pub fn action_backend(mut self, backend: Box<dyn ActionBackend>) -> Self {
+        self.action_backend = Some(backend);
+        self
+    }
+
+    /// The product's interaction surface for the action backend's `ExecCtx`
+    /// (OV-6): consent and ask_user suspend through it. Without one, every
+    /// interaction fails closed (`FailClosedInteract`) — a cell reaching for
+    /// the human refuses, it never hangs or silently allows.
+    pub fn interaction(mut self, channel: Arc<dyn InteractionChannel>) -> Self {
+        self.interact = Some(channel);
+        self
+    }
+
+    /// Per-interaction deadline for the action backend's suspensions (`None`
+    /// = unbounded human time, the run's cancel token is the only guard —
+    /// phimint's TUI shape). Unset = [`DEFAULT_INTERACT_TIMEOUT`].
+    pub fn interaction_timeout(mut self, interact_timeout: Option<Duration>) -> Self {
+        self.interact_timeout = Some(interact_timeout);
         self
     }
 
@@ -272,9 +311,10 @@ impl AgentBuilder {
             .session_store
             .unwrap_or_else(|| Arc::new(InMemorySessionStore::new()));
         let error_recovery = self.error_recovery.unwrap_or_else(|| Arc::new(StopOnError));
-        let session_id_generator = self
-            .session_id_generator
-            .unwrap_or_else(|| Arc::new(AtomicU64SessionIdGenerator::default()));
+        // Default numbering is process-global: a host and its sub-agents are
+        // several engines in one process, and per-engine counters handed every
+        // one of them a "session 1".
+        let session_id_generator = self.session_id_generator.unwrap_or_else(shared_session_ids);
 
         let session_manager = super::runtime::SessionManager::new(
             session_id_generator,
@@ -292,6 +332,15 @@ impl AgentBuilder {
             event_bus.clone(),
         );
 
+        // Interaction defaults: fail-closed when the product mounts no
+        // channel; the standard watchdog when it sets no deadline.
+        let interact = self
+            .interact
+            .unwrap_or_else(|| Arc::new(FailClosedInteract));
+        let interact_timeout = self
+            .interact_timeout
+            .unwrap_or(Some(DEFAULT_INTERACT_TIMEOUT));
+
         let runner = Arc::new(super::runtime::RuntimeCore::new(
             self.config,
             llm_engine,
@@ -303,6 +352,9 @@ impl AgentBuilder {
             self.convert_to_llm,
             self.guard,
             self.context_compactor,
+            self.action_backend,
+            interact,
+            interact_timeout,
         ));
 
         Ok(AgentRuntime { runner })

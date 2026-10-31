@@ -1,6 +1,6 @@
 mod entry;
 mod text_toolcall;
-mod tools;
+mod tool_executor;
 mod turn_dispatch;
 mod turn_end;
 mod turn_guard;

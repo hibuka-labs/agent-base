@@ -24,7 +24,7 @@ mod tool_engine;
 
 pub(super) const DEFAULT_MAX_TURNS: u32 = 160;
 
-pub use llm_engine::LlmEngine;
+pub use llm_engine::{LlmEngine, LlmTurnResult};
 pub use message_queue::QueueMode;
 pub use notify::NoticeHandle;
 pub(crate) use plan_runner::RuntimeCore;
@@ -67,6 +67,24 @@ impl AgentRuntime {
         self.runner
             .session_manager
             .with_session_mut(session_id, f)
+            .await
+    }
+
+    /// Resume a run from a persisted checkpoint line (T5): the checkpoint's
+    /// backend pin decides which flow rebuilds history — the tool-call replay,
+    /// the mounted action backend's own protocol, or a refusal naming the
+    /// mismatch. This is the product-facing entry (crash-window recovery,
+    /// OV-11).
+    pub async fn resume_from_checkpoint<F>(
+        &self,
+        checkpoint: CheckpointData,
+        on_event: F,
+    ) -> AgentResult<RunOutcome>
+    where
+        F: FnMut(RuntimeEvent) -> AgentResult<()> + Send + 'static,
+    {
+        self.runner
+            .resume_from_checkpoint(checkpoint, on_event)
             .await
     }
 
@@ -185,7 +203,7 @@ impl AgentRuntime {
     ) -> AgentResult<()> {
         self.emit_event(RuntimeEvent::Checkpoint {
             session_id: session_id.clone(),
-            checkpoint,
+            checkpoint: Box::new(checkpoint),
             agent_id: None,
             trace_id: None,
         });
@@ -381,6 +399,21 @@ impl AgentRuntime {
         self.runner.message_queue.steer(message);
     }
 
+    /// Snapshot the pending steering messages in FIFO order. A host UI's
+    /// source of truth for "what is still queued": display, take-back gating,
+    /// and turn-end flush all read the queue through here instead of keeping
+    /// a mirror that can drift from the real drains.
+    pub fn steering_snapshot(&self) -> Vec<String> {
+        self.runner.message_queue.snapshot_steering()
+    }
+
+    /// Drain **every** pending steering message and return them in FIFO
+    /// order. Used for take-back (back into the input box) and turn-end flush
+    /// (auto-send what never reached a tool boundary).
+    pub fn take_steering(&self) -> Vec<String> {
+        self.runner.message_queue.take_steering()
+    }
+
     /// Push a follow-up message — will be processed after the inner turn loop
     /// stops naturally (no tool calls or max turns).
     pub fn follow_up(&self, message: String) {
@@ -466,7 +499,12 @@ mod tests {
     async fn create_session_and_lookup() {
         let rt = runtime();
         let id = rt.create_session().await;
-        assert_eq!(id.id, 1);
+        // Default numbering is process-global (a host and its sub-agents are
+        // several engines in one process; per-engine counters handed all of
+        // them a "1"), so the number itself is not the invariant — a runtime's
+        // own sessions are distinct and findable.
+        let other = rt.create_session().await;
+        assert_ne!(id.id, other.id);
         assert!(rt.session(&id).await.is_some());
         assert!(rt.session_or_err(&id).await.is_ok());
     }

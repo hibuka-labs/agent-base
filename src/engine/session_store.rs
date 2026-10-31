@@ -361,14 +361,14 @@ mod sqlite_tests {
         session.push_message(crate::types::MessageRole::User, "question");
         session.push_message(crate::types::MessageRole::Assistant, "answer");
         session.allow_action("read_file");
-        session.total_tool_calls = 3;
+        session.run_state.total_actions = 3;
 
         store.save(&session).await.unwrap();
         let loaded = store.load(&SessionId::new(7)).await.unwrap().unwrap();
 
         assert_eq!(loaded.chat_messages().len(), 3);
         assert!(loaded.is_action_allowed("read_file"));
-        assert_eq!(loaded.total_tool_calls, 3);
+        assert_eq!(loaded.run_state.total_actions, 3);
     }
 }
 
@@ -388,7 +388,7 @@ mod tests {
         let store = InMemorySessionStore::new();
         let mut session = make_session(1);
         session.allow_action("read_file");
-        session.total_tool_calls = 2;
+        session.run_state.total_actions = 2;
         store.save(&session).await.unwrap();
 
         let loaded = store.load(&SessionId::new(1)).await.unwrap();
@@ -397,7 +397,7 @@ mod tests {
         assert_eq!(loaded.id(), Some(SessionId::new(1)));
         assert_eq!(loaded.chat_messages().len(), 2);
         assert!(loaded.is_action_allowed("read_file"));
-        assert_eq!(loaded.total_tool_calls, 2);
+        assert_eq!(loaded.run_state.total_actions, 2);
     }
 
     #[tokio::test]

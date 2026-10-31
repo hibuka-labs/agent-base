@@ -81,6 +81,29 @@ impl MessageQueue {
         }
     }
 
+    /// Snapshot the pending steering messages in FIFO order — a host UI's
+    /// source of truth for "what is still queued" (display + take-back),
+    /// independent of the drain mode.
+    pub fn snapshot_steering(&self) -> Vec<String> {
+        self.steering
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Drain **every** pending steering message and return them in FIFO order.
+    /// Take-back and turn-end flush must grab the whole queue regardless of
+    /// `QueueMode` (a one-at-a-time drain would strand the rest).
+    pub fn take_steering(&self) -> Vec<String> {
+        self.steering
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .collect()
+    }
+
     /// Drain follow-up messages according to the current `QueueMode`.
     pub fn drain_follow_up(&self) -> Vec<String> {
         let mode = *self.mode.lock().unwrap_or_else(|e| e.into_inner());
@@ -174,6 +197,31 @@ mod tests {
         assert!(mq.has_steering());
         mq.drain_steering();
         assert!(!mq.has_steering());
+    }
+
+    #[test]
+    fn snapshot_steering_is_fifo_and_non_destructive() {
+        let mq = MessageQueue::new();
+        mq.steer("msg1".into());
+        mq.steer("msg2".into());
+
+        assert_eq!(mq.snapshot_steering(), vec!["msg1", "msg2"]);
+        // A snapshot leaves the queue untouched.
+        assert_eq!(mq.snapshot_steering(), vec!["msg1", "msg2"]);
+        assert_eq!(mq.drain_steering(), vec!["msg1", "msg2"]);
+    }
+
+    #[test]
+    fn take_steering_drains_everything_even_in_one_at_a_time_mode() {
+        let mq = MessageQueue::with_mode(QueueMode::OneAtATime);
+        mq.steer("msg1".into());
+        mq.steer("msg2".into());
+        mq.steer("msg3".into());
+
+        // Take-back / turn-end flush must not strand the tail behind a
+        // one-at-a-time drain.
+        assert_eq!(mq.take_steering(), vec!["msg1", "msg2", "msg3"]);
+        assert!(mq.snapshot_steering().is_empty());
     }
 
     // ── follow-up queue ──

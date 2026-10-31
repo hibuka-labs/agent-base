@@ -79,17 +79,17 @@ impl Middleware for TurnFactMiddleware {
     }
 
     async fn on_post_llm(&self, ctx: &mut PostLlmCtx) -> AgentResult<()> {
-        if ctx.tool_calls.is_empty() {
+        if ctx.actions().is_empty() {
             return Ok(());
         }
 
         let mut facts = Vec::new();
-        for (_id, name, _args) in &ctx.tool_calls {
+        for action in ctx.actions() {
             // Record which tools were called — the actual results are in the
             // session history, but a compact reminder helps the LLM stay grounded.
             let fact = match self.language {
-                Language::Zh => format!("- 调用了工具: {name}"),
-                Language::En => format!("- Called tool: {name}"),
+                Language::Zh => format!("- 调用了工具: {}", action.name),
+                Language::En => format!("- Called tool: {}", action.name),
             };
             facts.push(fact);
         }
@@ -104,7 +104,38 @@ impl Middleware for TurnFactMiddleware {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{FinishReason, SessionId};
+    use crate::engine::executor::ParseOutcome;
+    use crate::types::{Action, ActionFormat, FinishReason, SessionId};
+
+    fn tool_actions(calls: &[(&str, &str)]) -> Vec<Action> {
+        calls
+            .iter()
+            .enumerate()
+            .map(|(i, (name, args))| Action {
+                id: format!("id{}", i + 1),
+                name: (*name).into(),
+                args: serde_json::Value::String((*args).into()),
+                identity: format!("{name}::{args}"),
+                format: ActionFormat::ToolCall,
+            })
+            .collect()
+    }
+
+    fn make_post_ctx(actions: Vec<Action>) -> PostLlmCtx {
+        PostLlmCtx {
+            session_id: SessionId::new(1),
+            full_text: String::new(),
+            parse: ParseOutcome::Actions(actions),
+            available_tools: vec![],
+            turn_count: 1,
+            total_actions: 0,
+            nudge_count: 0,
+            turn_actions: 0,
+            skip_push: false,
+            follow_up_message: None,
+            finish_reason: FinishReason::Stop,
+        }
+    }
 
     #[tokio::test]
     async fn test_no_facts_no_prefix() {
@@ -122,23 +153,10 @@ mod tests {
         let mw = TurnFactMiddleware::new();
 
         // Simulate a tool call turn
-        let mut post_ctx = PostLlmCtx {
-            session_id: SessionId::new(1),
-            full_text: String::new(),
-            is_tool_call: true,
-            tool_calls: vec![
-                ("id1".into(), "execute_ssh_command".into(), "{}".into()),
-                ("id2".into(), "start_interactive_task".into(), "{}".into()),
-            ],
-            available_tools: vec![],
-            turn_count: 1,
-            total_tool_calls: 0,
-            nudge_count: 0,
-            turn_tool_calls: 0,
-            skip_push: false,
-            follow_up_message: None,
-            finish_reason: FinishReason::Stop,
-        };
+        let mut post_ctx = make_post_ctx(tool_actions(&[
+            ("execute_ssh_command", "{}"),
+            ("start_interactive_task", "{}"),
+        ]));
         mw.on_post_llm(&mut post_ctx).await.unwrap();
 
         // Next user message should have facts prepended
@@ -159,20 +177,7 @@ mod tests {
         let mw = TurnFactMiddleware::new();
 
         // First turn with tool calls
-        let mut post_ctx = PostLlmCtx {
-            session_id: SessionId::new(1),
-            full_text: String::new(),
-            is_tool_call: true,
-            tool_calls: vec![("id1".into(), "docker".into(), "{}".into())],
-            available_tools: vec![],
-            turn_count: 1,
-            total_tool_calls: 0,
-            nudge_count: 0,
-            turn_tool_calls: 0,
-            skip_push: false,
-            follow_up_message: None,
-            finish_reason: FinishReason::Stop,
-        };
+        let mut post_ctx = make_post_ctx(tool_actions(&[("docker", "{}")]));
         mw.on_post_llm(&mut post_ctx).await.unwrap();
 
         // First user message gets facts
@@ -196,20 +201,7 @@ mod tests {
     async fn test_english_language_prefix() {
         let mw = TurnFactMiddleware::with_language(Language::En);
 
-        let mut post_ctx = PostLlmCtx {
-            session_id: SessionId::new(1),
-            full_text: String::new(),
-            is_tool_call: true,
-            tool_calls: vec![("id1".into(), "docker".into(), "{}".into())],
-            available_tools: vec![],
-            turn_count: 1,
-            total_tool_calls: 0,
-            nudge_count: 0,
-            turn_tool_calls: 0,
-            skip_push: false,
-            follow_up_message: None,
-            finish_reason: FinishReason::Stop,
-        };
+        let mut post_ctx = make_post_ctx(tool_actions(&[("docker", "{}")]));
         mw.on_post_llm(&mut post_ctx).await.unwrap();
 
         let mut ctx = UserMessageCtx {

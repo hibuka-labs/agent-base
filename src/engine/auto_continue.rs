@@ -13,7 +13,7 @@ use super::middleware::{Middleware, PostLlmCtx};
 ///
 /// # When it triggers
 /// - `finish_reason` is `Truncated` **and**
-/// - `tool_calls` is empty (tool-call truncation is already handled by the
+/// - `actions` is empty (tool-call truncation is already handled by the
 ///   react-loop's built-in truncation guard, which injects error results
 ///   instead of executing incomplete tool calls).
 ///
@@ -55,7 +55,7 @@ impl Default for AutoContinueMiddleware {
 #[async_trait]
 impl Middleware for AutoContinueMiddleware {
     async fn on_post_llm(&self, ctx: &mut PostLlmCtx) -> AgentResult<()> {
-        if ctx.finish_reason.is_truncated() && ctx.tool_calls.is_empty() {
+        if ctx.finish_reason.is_truncated() && ctx.actions().is_empty() {
             tracing::info!(
                 session_id = ctx.session_id.id,
                 turn = ctx.turn_count,
@@ -70,19 +70,34 @@ impl Middleware for AutoContinueMiddleware {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{FinishReason, SessionId};
+    use crate::engine::executor::ParseOutcome;
+    use crate::types::{Action, ActionFormat, FinishReason, SessionId};
 
     fn ctx(finish_reason: FinishReason, tool_calls: Vec<(String, String, String)>) -> PostLlmCtx {
+        let actions = tool_calls
+            .into_iter()
+            .map(|(id, name, args)| Action {
+                id,
+                name,
+                args: serde_json::Value::String(args),
+                identity: String::new(),
+                format: ActionFormat::ToolCall,
+            })
+            .collect::<Vec<Action>>();
+        let parse = if actions.is_empty() {
+            ParseOutcome::Empty
+        } else {
+            ParseOutcome::Actions(actions)
+        };
         PostLlmCtx {
             session_id: SessionId::new(1),
             full_text: "partial answer...".to_string(),
-            is_tool_call: !tool_calls.is_empty(),
-            tool_calls,
+            parse,
             available_tools: vec![],
             turn_count: 1,
-            total_tool_calls: 0,
+            total_actions: 0,
             nudge_count: 0,
-            turn_tool_calls: 0,
+            turn_actions: 0,
             skip_push: false,
             follow_up_message: None,
             finish_reason,

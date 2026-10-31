@@ -46,7 +46,8 @@ pub struct GuardCtx {
     // RunState information
     pub reasoning_only_strikes: usize,
     pub empty_response_strikes: usize,
-    pub run_has_tool_calls: bool,
+    #[serde(alias = "run_has_tool_calls")]
+    pub run_has_actions: bool,
     /// The most recent assistant tool calls were ALL rejected before
     /// execution (truncated/invalid arguments) and the model was told to
     /// re-issue them (`RunState.truncation_strikes > 0`). While this is

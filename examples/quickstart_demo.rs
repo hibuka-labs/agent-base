@@ -255,7 +255,7 @@ impl CliEventPrinter {
                     .flush()
                     .map_err(|e| AgentError::internal(format!("flush failed: {e}")))?;
             }
-            RuntimeEvent::ToolCallStarted {
+            RuntimeEvent::ActionStarted {
                 tool_name,
                 args_json,
                 ..
@@ -263,7 +263,7 @@ impl CliEventPrinter {
                 self.finish();
                 println!("[Tool Call] {} ({})", tool_name, args_json);
             }
-            RuntimeEvent::ToolCallFinished {
+            RuntimeEvent::ActionFinished {
                 tool_name, summary, ..
             } => {
                 self.finish();

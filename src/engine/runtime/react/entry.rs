@@ -2,11 +2,13 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::broadcast;
 
+use crate::engine::executor::INTERRUPTED_SUMMARY;
 use crate::engine::middleware::UserMessageCtx;
 use crate::engine::runtime::is_self_echo_user_event;
 use crate::engine::runtime::plan_runner::RuntimeCore;
 use crate::types::{
-    AgentResult, CheckpointData, CheckpointStep, MessageRole, RunOutcome, RuntimeEvent, SessionId,
+    ActionFormat, ActionOutcome, AgentError, AgentResult, CheckpointData, CheckpointStep,
+    MessageRole, RunOutcome, RuntimeEvent, SessionId,
 };
 
 /// Drain events from a `broadcast::Receiver` and invoke a `Mutex<FnMut>` callback
@@ -240,7 +242,7 @@ impl RuntimeCore {
             }
         };
 
-        // Reset nudge_count, turn_tool_calls, and run_tool_calls for the new turn
+        // Reset the run-level counting state for the new turn
         if let Err(e) = self
             .with_session_mut(&session_id, |session| {
                 session.run_state.reset_for_new_run();
@@ -255,32 +257,40 @@ impl RuntimeCore {
             return Err(e);
         }
 
-        if let Err(e) = self
+        // The push closure also snapshots the counting state: the checkpoint
+        // line co-writes 账 (step) + 数 (RunState) in one write (D5+OV-11).
+        let run_state = match self
             .with_session_mut(&session_id, |session| {
                 if ephemeral_input {
                     session.push_message_ephemeral(MessageRole::User, &user_input_owned);
                 } else {
                     session.push_message(MessageRole::User, &user_input_owned);
                 }
+                session.run_state.clone()
             })
             .await
         {
-            let _ = on_event.lock().unwrap()(RuntimeEvent::RunFinished {
-                session_id: session_id.clone(),
-                agent_id: None,
-                trace_id: None,
-            });
-            return Err(e);
-        }
+            Ok(run_state) => run_state,
+            Err(e) => {
+                let _ = on_event.lock().unwrap()(RuntimeEvent::RunFinished {
+                    session_id: session_id.clone(),
+                    agent_id: None,
+                    trace_id: None,
+                });
+                return Err(e);
+            }
+        };
 
         self.event_bus.emit(RuntimeEvent::Checkpoint {
             session_id: session_id.clone(),
-            checkpoint: CheckpointData {
-                session_id: session_id.clone(),
-                user_input: user_input_owned.clone(),
-                step: CheckpointStep::AfterUserInput,
-                turn_count: 0,
-            },
+            checkpoint: Box::new(CheckpointData::new(
+                session_id.clone(),
+                user_input_owned.clone(),
+                CheckpointStep::AfterUserInput,
+                0,
+                ActionFormat::ToolCall,
+                run_state,
+            )),
             agent_id: None,
             trace_id: None,
         });
@@ -394,7 +404,6 @@ impl RuntimeCore {
         Ok((events, outcome))
     }
 
-    #[allow(dead_code)]
     pub async fn resume_from_checkpoint<F>(
         &self,
         checkpoint: CheckpointData,
@@ -403,6 +412,16 @@ impl RuntimeCore {
     where
         F: FnMut(RuntimeEvent) -> AgentResult<()> + Send + 'static,
     {
+        // T5 persistence contract: backend affinity is pinned on the
+        // checkpoint; cross-backend resumes are refused with the mismatch
+        // spelled out. A runtime resumes every action format it is assembled
+        // with (T10c) — one session may interleave tool-call turns with a
+        // mounted backend's turns — and refuses a pin naming a backend it
+        // does not carry.
+        checkpoint
+            .verify_for_resume_any(&self.resume_formats().await)
+            .map_err(AgentError::Checkpoint)?;
+
         // Reset cancel token for this resume
         self.reset_cancel();
         // Notice pump (Batch E): drop leftovers from before this run so they
@@ -415,35 +434,86 @@ impl RuntimeCore {
 
         tracing::info!(session_id = session_id.id, turn_count, step = ?checkpoint.step, "resuming from checkpoint");
 
+        // D5+OV-11: counting restores trust the persisted value — the
+        // RunState co-written in this very checkpoint — never a recount from
+        // messages (the assistant lens counts call attempts, not executed
+        // actions, and lies for replayed/synthesized history). Pre-T7
+        // checkpoints carry no state (不猜不回填): those sessions keep whatever
+        // counting state they loaded with and fall back to the old-format paths.
+        if let Some(run_state) = checkpoint.run_state.clone() {
+            self.with_session_mut(&session_id, |session| {
+                session.run_state = run_state;
+            })
+            .await?;
+        }
+
         let mut event_rx = self.event_bus.subscribe();
         let on_event = Arc::new(Mutex::new(on_event));
 
-        if let CheckpointStep::BeforeToolCalls { tool_calls } = checkpoint.step {
-            match self
-                .handle_tool_calls(
-                    &session_id,
-                    &tool_calls,
-                    &mut event_rx,
-                    on_event.clone(),
-                    "",
-                    "",
-                )
-                .await
-            {
-                Ok(()) => {}
-                Err(e) => {
-                    if let Some(outcome) = self
-                        .handle_tool_error(
-                            &session_id,
-                            &tool_calls,
-                            e,
-                            &mut event_rx,
-                            on_event.clone(),
-                        )
-                        .await?
-                    {
-                        return Ok(outcome);
-                    }
+        // D3 observation replay (T6): a resumed batch is never re-executed —
+        // side effects stay one-shot. Completed batches replay their stored
+        // observation verbatim; a dangling batch (crash window) gets synthetic
+        // fates (已中断/未执行) so the model sees plainly that nothing ran.
+        let batch = match &checkpoint.step {
+            CheckpointStep::BeforeActions { actions } => Some((actions, None)),
+            CheckpointStep::AfterActions {
+                actions,
+                observation,
+            } => Some((actions, observation.as_ref())),
+            CheckpointStep::AfterUserInput | CheckpointStep::BeforeLlm { .. } => None,
+        };
+        if let Some((actions, recorded)) = batch {
+            if checkpoint.backend == ActionFormat::ToolCall {
+                let executor =
+                    super::tool_executor::ToolCallExecutor::new(self, session_id.clone());
+                let tool_calls = super::tool_executor::actions_to_triples(actions);
+                // T5 mark: pre-M3 `AfterToolCalls { results }` summaries are
+                // recorded evidence — replayed as-is, never rewritten.
+                let legacy = checkpoint
+                    .migrated_from
+                    .as_ref()
+                    .map(|m| m.legacy_results.as_slice())
+                    .unwrap_or(&[]);
+                executor
+                    .replay_batch(&session_id, &tool_calls, recorded.cloned(), legacy)
+                    .await?;
+            } else {
+                // Mounted-backend replay (T10c): a recorded observation
+                // replays verbatim (backend-neutral, D3); a dangling batch
+                // gets synthetic fates in the bound backend's own history
+                // shape (OV-4) carrying the kernel's fate vocabulary.
+                // Pre-M3 legacy summaries cannot exist under a non-tool pin.
+                let Some(backend) = &self.action_backend else {
+                    return Err(AgentError::Checkpoint(
+                        "resume refused: checkpoint is pinned to a mounted backend's protocol, but this runtime has none mounted".to_string(),
+                    ));
+                };
+                if let Some(observation) = recorded {
+                    self.with_session_mut(&session_id, |session| {
+                        for msg in &observation.history_messages {
+                            session.push_chat_message(msg.clone());
+                        }
+                    })
+                    .await?;
+                } else {
+                    let fates: Vec<ActionOutcome> = actions
+                        .iter()
+                        .map(|a| ActionOutcome {
+                            action_id: a.id.clone(),
+                            name: a.name.clone(),
+                            ok: false,
+                            denied: false,
+                            summary: INTERRUPTED_SUMMARY.to_string(),
+                            details: None,
+                        })
+                        .collect();
+                    let history_messages = backend.lock().await.render_fates(actions, &fates);
+                    self.with_session_mut(&session_id, |session| {
+                        for msg in &history_messages {
+                            session.push_chat_message(msg.clone());
+                        }
+                    })
+                    .await?;
                 }
             }
         }

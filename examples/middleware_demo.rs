@@ -89,12 +89,12 @@ impl AntiHallucinationMiddleware {
 impl Middleware for AntiHallucinationMiddleware {
     async fn on_post_llm(&self, ctx: &mut PostLlmCtx) -> AgentResult<()> {
         // Only triggers when "tools are available but no tool has been executed yet"
-        if ctx.available_tools.is_empty() || ctx.total_tool_calls > 0 {
+        if ctx.available_tools.is_empty() || ctx.total_actions > 0 {
             return Ok(());
         }
 
         // If the LLM has already called a tool, nothing to do
-        if ctx.is_tool_call {
+        if ctx.has_action_intent() {
             return Ok(());
         }
 
@@ -175,7 +175,7 @@ impl EventPrinter {
                 use std::io::{self, Write};
                 io::stdout().flush().unwrap();
             }
-            RuntimeEvent::ToolCallStarted {
+            RuntimeEvent::ActionStarted {
                 tool_name,
                 args_json,
                 ..
@@ -183,7 +183,7 @@ impl EventPrinter {
                 println!();
                 println!("[Tool call] {} (args: {})", tool_name, args_json);
             }
-            RuntimeEvent::ToolCallFinished {
+            RuntimeEvent::ActionFinished {
                 tool_name, summary, ..
             } => {
                 println!("[Tool finished] {} -> {}", tool_name, summary);

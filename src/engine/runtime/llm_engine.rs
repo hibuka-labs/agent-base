@@ -17,6 +17,48 @@ use crate::types::{AgentResult, ChatMessage, RuntimeEvent, SessionId};
 /// network within a minute instead of hanging forever.
 const TTFB_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How many picture-bearing results a request may carry. Pictures live in
+/// the transcript for audit and resume, but every request resends each one's
+/// base64; two desktop screenshots were enough to trip the gateway's body
+/// limit (HTTP 413, session 20261030_862ddf5c). Only the newest pictures go
+/// out — older ones keep their text and gain an honest note.
+const MAX_WIRE_IMAGES: usize = 2;
+
+/// Trim pictures the model no longer needs to look at, newest kept first.
+///
+/// A message keeps all of its pictures or none: a half-visible result would
+/// be worse than an honest omission. Once a message fails to fit, nothing
+/// older gets to jump the queue.
+fn bound_wire_images(messages: &mut [ChatMessage]) {
+    let mut budget = MAX_WIRE_IMAGES;
+    for message in messages.iter_mut().rev() {
+        let (images, content) = match message {
+            ChatMessage::Tool {
+                images, content, ..
+            } => (images, content),
+            ChatMessage::User {
+                images, content, ..
+            } => (images, content),
+            _ => continue,
+        };
+        if images.is_empty() {
+            continue;
+        }
+        if images.len() <= budget {
+            budget -= images.len();
+            continue;
+        }
+        let dropped = images.len();
+        images.clear();
+        budget = 0;
+        content.push_str(&format!(
+            "\n[note: {dropped} image(s) from this older result are not attached to this \
+             request — only the newest {MAX_WIRE_IMAGES} picture(s) travel; call the tool \
+             again if you need to look]"
+        ));
+    }
+}
+
 /// Build a `ChatRequest` from individual parameters.
 fn build_chat_request(
     messages: &[ChatMessage],
@@ -26,7 +68,9 @@ fn build_chat_request(
     thinking_disabled: bool,
     model_override: Option<&str>,
 ) -> llm_trait::ChatRequest {
-    let mut request = llm_trait::ChatRequest::new(messages.to_vec());
+    let mut messages = messages.to_vec();
+    bound_wire_images(&mut messages);
+    let mut request = llm_trait::ChatRequest::new(messages);
     if !tool_definitions.is_empty() {
         request = request.with_tools(tool_definitions.to_vec());
     }
@@ -389,7 +433,7 @@ impl LlmEngine {
                                 let grew_bucket =
                                     args_len / DRAFT_ARGS_BUCKET > before_args_len / DRAFT_ARGS_BUCKET;
                                 if fresh_slot || named_now || grew_bucket {
-                                    self.event_bus.emit(RuntimeEvent::ToolCallDraft {
+                                    self.event_bus.emit(RuntimeEvent::ActionDraft {
                                         session_id: session_id.clone(),
                                         index: idx,
                                         name: entry.1.clone(),
@@ -895,7 +939,7 @@ mod tests {
         let drafts: Vec<(usize, String, usize, usize)> = events
             .iter()
             .filter_map(|e| match e {
-                RuntimeEvent::ToolCallDraft {
+                RuntimeEvent::ActionDraft {
                     index,
                     name,
                     args_len,
@@ -1425,5 +1469,119 @@ mod tests {
         engine.emit_text_delta(&SessionId::new(1), "hello".into());
         let ev = rx.try_recv().expect("event should be emitted");
         assert!(matches!(ev, RuntimeEvent::TextDelta { text, .. } if text == "hello"));
+    }
+
+    fn one_picture() -> llm_trait::ImageAttachment {
+        llm_trait::ImageAttachment::Base64 {
+            data: "aGVsbG8=".to_string(),
+            media_type: Some("image/png".to_string()),
+            detail: None,
+        }
+    }
+
+    #[test]
+    fn only_the_newest_pictures_reach_the_wire() {
+        let mut messages = vec![
+            ChatMessage::user("look at the board"),
+            ChatMessage::tool_with_images("t1", "shot 1", vec![one_picture()]),
+            ChatMessage::tool_with_images("t2", "shot 2", vec![one_picture()]),
+            ChatMessage::tool_with_images("t3", "shot 3", vec![one_picture()]),
+        ];
+        bound_wire_images(&mut messages);
+
+        let ChatMessage::Tool {
+            images: oldest,
+            content: oldest_text,
+            ..
+        } = &messages[1]
+        else {
+            panic!("expected a tool result");
+        };
+        assert!(oldest.is_empty(), "the oldest picture is off the wire");
+        assert!(
+            oldest_text.contains("not attached to this request"),
+            "the omission is spoken, never silent: {oldest_text}"
+        );
+        assert!(
+            oldest_text.starts_with("shot 1"),
+            "the text face survives intact: {oldest_text}"
+        );
+        for i in [2, 3] {
+            let ChatMessage::Tool { images, .. } = &messages[i] else {
+                panic!("expected a tool result");
+            };
+            assert_eq!(images.len(), 1, "the newest two keep their pictures");
+        }
+    }
+
+    #[test]
+    fn a_word_only_history_is_untouched() {
+        let mut messages = vec![
+            ChatMessage::user("hi"),
+            ChatMessage::tool("t1", "done"),
+            ChatMessage::assistant("ok"),
+        ];
+        let before = format!("{messages:?}");
+        bound_wire_images(&mut messages);
+        assert_eq!(format!("{messages:?}"), before);
+    }
+
+    #[test]
+    fn a_picture_batch_keeps_all_or_none() {
+        let mut messages = vec![
+            ChatMessage::tool_with_images("t1", "older", vec![one_picture()]),
+            ChatMessage::tool_with_images(
+                "t2",
+                "a fresh batch of three",
+                vec![one_picture(), one_picture(), one_picture()],
+            ),
+        ];
+        bound_wire_images(&mut messages);
+
+        let ChatMessage::Tool {
+            images, content, ..
+        } = &messages[1]
+        else {
+            panic!("expected a tool result");
+        };
+        assert!(
+            images.is_empty(),
+            "three pictures do not fit a budget of two"
+        );
+        assert!(
+            content.contains("3 image(s)"),
+            "the count is named: {content}"
+        );
+        let ChatMessage::Tool { images, .. } = &messages[0] else {
+            panic!("expected a tool result");
+        };
+        assert!(
+            images.is_empty(),
+            "once the newest does not fit, older pictures never jump the queue"
+        );
+    }
+
+    #[test]
+    fn the_request_leaves_the_throat_already_bounded() {
+        let messages = vec![
+            ChatMessage::tool_with_images("t1", "shot 1", vec![one_picture()]),
+            ChatMessage::tool_with_images("t2", "shot 2", vec![one_picture()]),
+            ChatMessage::tool_with_images("t3", "shot 3", vec![one_picture()]),
+        ];
+        let request = build_chat_request(&messages, &[], None, None, false, None);
+        assert_eq!(
+            request.messages.len(),
+            messages.len(),
+            "nothing is discarded, only trimmed"
+        );
+        let carried: usize = request
+            .messages
+            .iter()
+            .map(|m| match m {
+                ChatMessage::Tool { images, .. } | ChatMessage::User { images, .. } => images.len(),
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(carried, MAX_WIRE_IMAGES, "the throat applies the bound");
     }
 }

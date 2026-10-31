@@ -3,11 +3,12 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
 use crate::engine::context::ContextWindowManager;
+use crate::engine::executor::ParseOutcome;
 use crate::engine::middleware::{PostLlmCtx, PreLlmCtx};
 use crate::engine::runtime::plan_runner::RuntimeCore;
 use crate::types::{
-    AgentResult, CheckpointData, CheckpointStep, FinishReason, MessageRole, RunOutcome,
-    RuntimeEvent, SessionId, UserEvent, default_convert_to_llm,
+    ActionFormat, AgentResult, CheckpointData, CheckpointStep, FinishReason, MessageRole,
+    RunOutcome, RuntimeEvent, SessionId, UserEvent, default_convert_to_llm,
 };
 
 use super::entry::drain_locked;
@@ -22,8 +23,9 @@ pub(super) enum TurnFlow {
 
 pub(super) struct PostLlmMwResult {
     pub full_text: String,
-    pub is_tool_call: bool,
-    pub tool_calls: Vec<(String, String, String)>,
+    /// The action backend's verdict for this turn (M3 seam) — middleware may
+    /// reshape it (demotion clears it to [`ParseOutcome::Empty`]).
+    pub parse: ParseOutcome,
     pub skip_push: bool,
     pub follow_up_message: Option<String>,
 }
@@ -90,27 +92,26 @@ impl RuntimeCore {
         &self,
         session_id: &SessionId,
         full_text: String,
-        is_tool_call: bool,
-        tool_calls: Vec<(String, String, String)>,
+        parse: ParseOutcome,
         available_tools: &[String],
         turn_count: u32,
         finish_reason: FinishReason,
     ) -> AgentResult<PostLlmMwResult> {
         let session = self.session_manager.session_or_err(session_id).await?;
-        let total_tool_calls = session.total_tool_calls;
+        // Counting state (D5: 口径=动作) — all of it lives in RunState.
+        let total_actions = session.run_state.total_actions;
         let nudge_count = session.run_state.nudge_count;
-        let turn_tool_calls = session.run_state.turn_tool_calls;
+        let turn_actions = session.run_state.turn_actions;
         drop(session);
         let mut ctx = PostLlmCtx {
             session_id: session_id.clone(),
             full_text,
-            is_tool_call,
-            tool_calls,
+            parse,
             available_tools: available_tools.to_vec(),
             turn_count,
-            total_tool_calls,
+            total_actions,
             nudge_count,
-            turn_tool_calls,
+            turn_actions,
             skip_push: false,
             follow_up_message: None,
             finish_reason,
@@ -127,8 +128,7 @@ impl RuntimeCore {
         }
         Ok(PostLlmMwResult {
             full_text: ctx.full_text,
-            is_tool_call: ctx.is_tool_call,
-            tool_calls: ctx.tool_calls,
+            parse: ctx.parse,
             skip_push: ctx.skip_push,
             follow_up_message: ctx.follow_up_message,
         })
@@ -301,17 +301,23 @@ impl RuntimeCore {
                 }
             }
 
+            // 账+数 in one write (D5+OV-11).
+            let run_state = self
+                .with_session_mut(session_id, |session| session.run_state.clone())
+                .await?;
             self.event_bus.emit(RuntimeEvent::Checkpoint {
                 session_id: session_id.clone(),
-                checkpoint: CheckpointData {
-                    session_id: session_id.clone(),
-                    user_input: user_input_owned.to_string(),
-                    step: CheckpointStep::BeforeLlm {
+                checkpoint: Box::new(CheckpointData::new(
+                    session_id.clone(),
+                    user_input_owned.to_string(),
+                    CheckpointStep::BeforeLlm {
                         messages: messages.clone(),
                         tools: tools_for_turn.clone(),
                     },
                     turn_count,
-                },
+                    ActionFormat::ToolCall,
+                    run_state,
+                )),
                 agent_id: None,
                 trace_id: None,
             });

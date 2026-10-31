@@ -20,7 +20,8 @@ pub use policy::{DenyAllToolPolicy, ToolDecision, ToolPolicy};
 
 // Re-export pure types from agent-types
 pub use agent_types::{
-    ActivationContext, Content, ToolExposure, ToolMetadata, content_details, content_text,
+    ActivationContext, Content, ToolExposure, ToolMetadata, content_details, content_images,
+    content_text,
 };
 
 /// Per-call execution-clock control, shared between the tool and the
@@ -516,6 +517,7 @@ impl ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use llm_trait::ImageAttachment;
 
     #[test]
     fn exec_clock_pause_accounting() {
@@ -723,6 +725,35 @@ mod tests {
             Content::text("c"),
         ]);
         assert_eq!(text, "a\nc");
+    }
+
+    /// The two faces of a tool result partition it: `content_text` keeps the
+    /// words, `content_images` the pictures — in the order the tool produced
+    /// them, so a screenshot the model must compare against the one before
+    /// it arrives in the same order it was taken.
+    #[test]
+    fn content_images_takes_the_pictures_content_text_drops() {
+        let out = [
+            Content::text("words"),
+            Content::image("Zmlyc3Q=", "image/png"),
+            Content::text("more words"),
+            Content::image("c2Vjb25k", "image/png"),
+            Content::detail(serde_json::json!({"line": 3})),
+        ];
+        let images = content_images(&out);
+        assert_eq!(images.len(), 2);
+        for (img, want) in images.iter().zip(["Zmlyc3Q=", "c2Vjb25k"]) {
+            match img {
+                ImageAttachment::Base64 {
+                    data, media_type, ..
+                } => {
+                    assert_eq!(data, want);
+                    assert_eq!(media_type.as_deref(), Some("image/png"));
+                }
+                other => panic!("expected a base64 attachment, got {other:?}"),
+            }
+        }
+        assert!(content_images(&[Content::text("no pictures")]).is_empty());
     }
 
     #[test]

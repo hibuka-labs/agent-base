@@ -6,144 +6,28 @@ use crate::types::{ChatMessage, ImageAttachment, Message, MessageRole, ToolCallM
 
 use crate::types::SessionId;
 
-/// Run-level state tracking for the react loop.
-///
-/// Manages counters and flags that track the current run's progress.
-/// All fields are reset at the start of each run (when a new user message arrives).
-///
-/// # Backward compatibility
-///
-/// Before this struct existed, `nudge_count` and `turn_tool_calls` were flat
-/// fields on `AgentSession`.  The [`RawAgentSession`] deserialization shim
-/// migrates them automatically.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct RunState {
-    /// Number of tool calls already executed in the current turn.
-    /// Reset to 0 at the start of each turn (when a new user message arrives).
-    /// Used by `TurnToolLimitMiddleware` to enforce per-turn tool call limits.
-    pub turn_tool_calls: usize,
-    /// Whether any tools were called in the current run.
-    /// Reset to false at the start of each run. Used by the completion judge
-    /// to determine if tools were used before a text-only response.
-    pub run_has_tool_calls: bool,
-    /// Number of consecutive LLM turns that produced only reasoning_content
-    /// (no text, no tool call). Reset to 0 when a normal response or tool call
-    /// is produced. Used by the react loop to fail instead of looping forever
-    /// on a reasoning-model runaway.
-    pub reasoning_only_strikes: usize,
-    /// Number of consecutive LLM turns that produced a completely empty response
-    /// (no text, no reasoning, no tool call). Reset to 0 when a normal response
-    /// or tool call is produced. Used by the react loop to retry a bounded
-    /// number of times, then fail instead of looping forever.
-    pub empty_response_strikes: usize,
-    /// Number of tool-enforcement nudges issued in the current turn.
-    /// Reset to 0 at the start of each turn (when a new user message arrives).
-    /// Used by `ToolEnforcementMiddleware` to cap nudge attempts per turn.
-    pub nudge_count: usize,
-    /// Thinking is disabled for the rest of the current run.
-    /// Set to true when reasoning_only_strikes reaches the maximum (3).
-    /// Reset to false at the start of each new run (when a new user message arrives).
-    /// This allows the model to continue without thinking after too many
-    /// reasoning-only responses.
-    #[serde(default)]
-    pub thinking_disabled_for_rest_of_run: bool,
-
-    // ─── New fields for thinking guard ─────────────────────────────
-    /// Original thinking configuration (for restoration)
-    ///
-    /// Records whether thinking was originally enabled when the session started.
-    /// Used to restore thinking to its original state after DisableThinking → RestoreThinking cycle.
-    #[serde(default)]
-    pub original_thinking_enabled: bool,
-
-    /// Number of consecutive LLM turns where the truncation guard fired
-    /// (all tool_calls had invalid/truncated arguments). Reset to 0 when
-    /// at least one valid tool call executes successfully. Used to break
-    /// the re-issue death spiral: after N consecutive truncations, stop
-    /// retrying and fail with an actionable message.
-    #[serde(default)]
-    pub truncation_strikes: usize,
-
-    /// The latest tool batch parked on a human step (a design-canvas screen
-    /// awaiting a pick) and no tool ran after it. Overwritten per batch by
-    /// `handle_tool_calls`. When true at the end of a run, the run is
-    /// *waiting for the user* — the guard must complete instead of nudging
-    /// "continue working" over their pending answer.
-    #[serde(default)]
-    pub awaiting_human: bool,
-}
-
-impl RunState {
-    /// Reset all run-level state for a new run (when a new user message arrives).
-    pub fn reset_for_new_run(&mut self) {
-        self.turn_tool_calls = 0;
-        self.run_has_tool_calls = false;
-        self.reasoning_only_strikes = 0;
-        self.empty_response_strikes = 0;
-        self.nudge_count = 0;
-        self.thinking_disabled_for_rest_of_run = false;
-        self.truncation_strikes = 0;
-        self.awaiting_human = false;
-        // Note: original_thinking_enabled is NOT reset here
-        // It should be set once when the session starts
-    }
-
-    /// Record tool calls (branch 3: tool calls).
-    /// Resets reasoning_only_strikes, empty_response_strikes, and truncation_strikes.
-    pub fn record_tool_calls(&mut self, n: usize) {
-        self.turn_tool_calls += n;
-        self.run_has_tool_calls = true;
-        self.reasoning_only_strikes = 0;
-        self.empty_response_strikes = 0;
-        self.truncation_strikes = 0;
-    }
-
-    /// Record reasoning-only response (branch 1).
-    /// Resets empty_response_strikes.
-    /// Returns the new strike count.
-    /// If strikes reach 3, disables thinking for the rest of the run.
-    pub fn record_reasoning_only(&mut self) -> usize {
-        self.empty_response_strikes = 0;
-        self.reasoning_only_strikes += 1;
-        if self.reasoning_only_strikes >= 3 {
-            tracing::info!(
-                strikes = self.reasoning_only_strikes,
-                "reasoning_only_strikes reached 3, disabling thinking for rest of run"
-            );
-            self.thinking_disabled_for_rest_of_run = true;
-        }
-        self.reasoning_only_strikes
-    }
-
-    /// Record empty response (branch 2).
-    /// Resets reasoning_only_strikes.
-    /// Returns the new strike count.
-    pub fn record_empty_response(&mut self) -> usize {
-        self.reasoning_only_strikes = 0;
-        self.empty_response_strikes += 1;
-        self.empty_response_strikes
-    }
-
-    /// Record a truncation guard firing (all tool_calls had invalid arguments).
-    /// Returns the new strike count. Caller should check against threshold.
-    pub fn record_truncation(&mut self) -> usize {
-        self.truncation_strikes += 1;
-        self.truncation_strikes
-    }
-}
+// RunState moved to agent-types (D5+OV-11): the counting state rides in
+// `CheckpointData`, so it must live where the checkpoint payload lives.
+// Re-exported here so existing `engine::session::RunState` imports keep working.
+pub use crate::types::RunState;
 
 /// Deserialization shim for backward compatibility.
 ///
 /// Before `RunState` was introduced, `nudge_count`, `turn_tool_calls`,
 /// `reasoning_only_strikes`, and `empty_response_strikes` were flat fields
-/// on `AgentSession`.  This struct accepts **both** the old flat format and
+/// on `AgentSession` — and the session-lifetime total lived at the top level
+/// as `total_tool_calls`. This struct accepts **both** the old flat format and
 /// the new nested `run_state` format, migrating legacy data on the fly.
 #[derive(Deserialize)]
 struct RawAgentSession {
     id: Option<SessionId>,
     chat_messages: Vec<ChatMessage>,
     always_allowed_actions: HashSet<String>,
-    total_tool_calls: usize,
+    /// Pre-T7 session total (D5 moved it into `RunState::total_actions`).
+    /// Optional so new-format payloads omit it; when present it migrates into
+    /// the counting state — the one counting home.
+    #[serde(default)]
+    total_tool_calls: Option<usize>,
 
     // ── new format (preferred) ──
     run_state: Option<RunState>,
@@ -157,18 +41,23 @@ struct RawAgentSession {
 
 impl From<RawAgentSession> for AgentSession {
     fn from(raw: RawAgentSession) -> Self {
-        let run_state = raw.run_state.unwrap_or_else(|| RunState {
+        let mut run_state = raw.run_state.unwrap_or_else(|| RunState {
             nudge_count: raw.nudge_count.unwrap_or(0),
-            turn_tool_calls: raw.turn_tool_calls.unwrap_or(0),
+            turn_actions: raw.turn_tool_calls.unwrap_or(0),
             reasoning_only_strikes: raw.reasoning_only_strikes.unwrap_or(0),
             empty_response_strikes: raw.empty_response_strikes.unwrap_or(0),
             ..RunState::default()
         });
+        // Pre-T7 wire kept the session total at the top level; migrate it into
+        // the counting state (D5: one counting home). New-format payloads omit
+        // the top-level key and keep the total already inside `run_state`.
+        if let Some(total) = raw.total_tool_calls {
+            run_state.total_actions = total;
+        }
         Self {
             id: raw.id,
             chat_messages: raw.chat_messages,
             always_allowed_actions: raw.always_allowed_actions,
-            total_tool_calls: raw.total_tool_calls,
             run_state,
         }
     }
@@ -186,10 +75,9 @@ pub struct AgentSession {
     /// This is the single source of truth for the conversation state.
     chat_messages: Vec<ChatMessage>,
     always_allowed_actions: HashSet<String>,
-    /// Total number of tool calls made in this session (across all turns).
-    /// Used by middleware for decisions like "first_turn_only" enforcement.
-    pub total_tool_calls: usize,
-    /// Run-level state tracking for the react loop.
+    /// Run-level state tracking for the react loop. Holds ALL counting state
+    /// (D5): `run_state.total_actions` is the session-lifetime total middleware
+    /// decisions like "first_turn_only" read.
     pub run_state: RunState,
 }
 
@@ -199,7 +87,6 @@ impl AgentSession {
             id: Some(id),
             chat_messages: Vec::new(),
             always_allowed_actions: HashSet::new(),
-            total_tool_calls: 0,
             run_state: RunState::default(),
         }
     }
@@ -336,12 +223,16 @@ impl AgentSession {
         format!("{:?}", args.chars().take(max_chars).collect::<String>())
     }
 
-    pub fn push_assistant_tool_calls(
-        &mut self,
+    /// Render one assistant message carrying tool calls — the tool backend's
+    /// history protocol (invalid-JSON sanitization included). Split out of
+    /// [`Self::push_assistant_tool_calls`] so the backend can both push the
+    /// message and carry it in `Observation::history_messages` for checkpoint
+    /// replay (M3 seam).
+    pub fn render_assistant_tool_calls(
         tool_calls: &[(String, String, String)],
         reasoning: Option<String>,
         content: Option<String>,
-    ) {
+    ) -> ChatMessage {
         let calls: Vec<ToolCallMessage> = tool_calls
             .iter()
             .map(|(id, name, args)| {
@@ -373,12 +264,29 @@ impl AgentSession {
                 }
             })
             .collect();
-        self.chat_messages.push(ChatMessage::Assistant {
+        ChatMessage::Assistant {
             content,
             reasoning_content: reasoning,
             tool_calls: Some(calls),
             thinking_signature: None,
-        });
+        }
+    }
+
+    pub fn push_assistant_tool_calls(
+        &mut self,
+        tool_calls: &[(String, String, String)],
+        reasoning: Option<String>,
+        content: Option<String>,
+    ) {
+        self.push_chat_message(Self::render_assistant_tool_calls(
+            tool_calls, reasoning, content,
+        ));
+    }
+
+    /// Push one already-built message — the kernel's verbatim push for
+    /// backend-rendered history ([`crate::types::Observation::history_messages`]).
+    pub fn push_chat_message(&mut self, message: ChatMessage) {
+        self.chat_messages.push(message);
     }
 
     pub fn push_tool_result(&mut self, tool_call_id: &str, content: impl Into<String>) {
@@ -494,15 +402,29 @@ impl AgentSession {
         }
     }
 
-    /// Replace chat messages — only for persistence restore.
+    /// Replace chat messages — for persistence restore and window compaction.
     /// Validates message sequence before replacing.
     ///
-    /// For persistence restore use only. Callers must ensure the `messages` sequence is valid.
+    /// Counters are NOT touched (D5): the counting source is explicit. A
+    /// checkpoint restore trusts the persisted `RunState` (co-written with the
+    /// checkpoint/journal — OV-11); only a messages-only restore — the
+    /// old-format corpus — recounts via [`Self::recount_actions_from_messages`].
+    /// Recounting here would also deflate the total after compaction and lie
+    /// for restored histories that carry synthesized "已中断/未执行" results.
     pub fn set_chat_messages(&mut self, messages: Vec<ChatMessage>) -> Result<(), String> {
         validate_message_sequence(&messages)?;
-        // Recalculate total_tool_calls from the incoming messages so middleware
-        // decisions (e.g. first_turn_only enforcement) see the correct count.
-        self.total_tool_calls = messages
+        self.chat_messages = messages;
+        Ok(())
+    }
+
+    /// Old-format compatibility (D5: 消息重算只做旧格式兼容): rebuild the
+    /// session-lifetime action total from the history's assistant tool-call
+    /// lens. Call ONLY on restores that carry no persisted counting state —
+    /// the lens counts call attempts, not executed actions, so it is a
+    /// fallback, never the primary source.
+    pub fn recount_actions_from_messages(&mut self) {
+        self.run_state.total_actions = self
+            .chat_messages
             .iter()
             .filter_map(|m| match m {
                 ChatMessage::Assistant {
@@ -512,8 +434,6 @@ impl AgentSession {
                 _ => None,
             })
             .sum();
-        self.chat_messages = messages;
-        Ok(())
     }
 }
 
@@ -910,8 +830,8 @@ mod tests {
             .filter_map(|m| match m {
                 ChatMessage::Tool {
                     tool_call_id,
-                    name: _,
                     content,
+                    ..
                 } => Some((tool_call_id.clone(), content.clone())),
                 _ => None,
             })
@@ -925,7 +845,25 @@ mod tests {
     }
 
     #[test]
-    fn test_set_chat_messages_recalculates_total_tool_calls() {
+    fn set_chat_messages_leaves_counters_alone() {
+        // D5: the counting source is explicit — a messages replace must not
+        // recount. (Replaces `test_set_chat_messages_recalculates_total_tool_calls`,
+        // a named D13 exception: the demotion is the designed behavior change.)
+        let mut s = make_session();
+        s.run_state.record_actions(2);
+        let msgs = vec![
+            ChatMessage::user("do"),
+            ChatMessage::assistant_tool_call("c1", "t", "{}"),
+            ChatMessage::tool("c1", "result"),
+        ];
+        s.set_chat_messages(msgs).unwrap();
+        assert_eq!(s.run_state.total_actions, 2); // untouched, not 1
+        assert_eq!(s.run_state.turn_actions, 2);
+    }
+
+    #[test]
+    fn recount_actions_from_messages_counts_the_assistant_lens() {
+        // The old-format entry point keeps the previous rebuild behavior.
         let mut s = make_session();
         let msgs = vec![
             ChatMessage::user("do"),
@@ -933,7 +871,8 @@ mod tests {
             ChatMessage::tool("c1", "result"),
         ];
         s.set_chat_messages(msgs).unwrap();
-        assert_eq!(s.total_tool_calls, 1);
+        s.recount_actions_from_messages();
+        assert_eq!(s.run_state.total_actions, 1);
     }
 }
 
@@ -1045,212 +984,6 @@ mod validate_tests {
         assert!(s.set_chat_messages(msgs).is_err());
     }
 
-    // ── RunState tests ────────────────────────────────────────────────────
-
-    #[test]
-    fn run_state_default() {
-        let rs = RunState::default();
-        assert_eq!(rs.turn_tool_calls, 0);
-        assert!(!rs.run_has_tool_calls);
-        assert_eq!(rs.reasoning_only_strikes, 0);
-        assert_eq!(rs.empty_response_strikes, 0);
-        assert_eq!(rs.nudge_count, 0);
-    }
-
-    #[test]
-    fn run_state_reset_for_new_run() {
-        let mut rs = RunState {
-            turn_tool_calls: 5,
-            run_has_tool_calls: true,
-            reasoning_only_strikes: 2,
-            empty_response_strikes: 1,
-            nudge_count: 3,
-            thinking_disabled_for_rest_of_run: true,
-            original_thinking_enabled: true,
-            truncation_strikes: 4,
-            awaiting_human: true,
-        };
-
-        rs.reset_for_new_run();
-
-        assert_eq!(rs.turn_tool_calls, 0);
-        assert!(!rs.run_has_tool_calls);
-        assert_eq!(rs.reasoning_only_strikes, 0);
-        assert_eq!(rs.empty_response_strikes, 0);
-        assert_eq!(rs.nudge_count, 0);
-        assert_eq!(rs.truncation_strikes, 0);
-        assert!(!rs.thinking_disabled_for_rest_of_run);
-        assert!(!rs.awaiting_human);
-        // original_thinking_enabled is NOT reset
-        assert!(rs.original_thinking_enabled);
-    }
-
-    #[test]
-    fn run_state_record_tool_calls() {
-        let mut rs = RunState {
-            reasoning_only_strikes: 2,
-            empty_response_strikes: 1,
-            ..RunState::default()
-        };
-
-        rs.record_tool_calls(3);
-
-        assert_eq!(rs.turn_tool_calls, 3);
-        assert!(rs.run_has_tool_calls);
-        assert_eq!(rs.reasoning_only_strikes, 0); // reset
-        assert_eq!(rs.empty_response_strikes, 0); // reset
-    }
-
-    #[test]
-    fn run_state_record_tool_calls_accumulates() {
-        let mut rs = RunState::default();
-        rs.record_tool_calls(2);
-        rs.record_tool_calls(3);
-
-        assert_eq!(rs.turn_tool_calls, 5);
-        assert!(rs.run_has_tool_calls);
-    }
-
-    #[test]
-    fn run_state_record_reasoning_only() {
-        let mut rs = RunState {
-            empty_response_strikes: 2,
-            ..RunState::default()
-        };
-
-        let strikes = rs.record_reasoning_only();
-
-        assert_eq!(strikes, 1);
-        assert_eq!(rs.reasoning_only_strikes, 1);
-        assert_eq!(rs.empty_response_strikes, 0); // reset
-    }
-
-    #[test]
-    fn run_state_record_reasoning_only_consecutive() {
-        let mut rs = RunState::default();
-
-        assert_eq!(rs.record_reasoning_only(), 1);
-        assert_eq!(rs.record_reasoning_only(), 2);
-        assert_eq!(rs.record_reasoning_only(), 3);
-    }
-
-    #[test]
-    fn run_state_record_empty_response() {
-        let mut rs = RunState {
-            reasoning_only_strikes: 2,
-            ..RunState::default()
-        };
-
-        let strikes = rs.record_empty_response();
-
-        assert_eq!(strikes, 1);
-        assert_eq!(rs.empty_response_strikes, 1);
-        assert_eq!(rs.reasoning_only_strikes, 0); // reset
-    }
-
-    #[test]
-    fn run_state_record_empty_response_consecutive() {
-        let mut rs = RunState::default();
-
-        assert_eq!(rs.record_empty_response(), 1);
-        assert_eq!(rs.record_empty_response(), 2);
-        assert_eq!(rs.record_empty_response(), 3);
-    }
-
-    #[test]
-    fn run_state_branch_cross_reset() {
-        // Simulate: reasoning only → tool calls → reasoning only
-        let mut rs = RunState::default();
-
-        // Branch 1: reasoning only
-        rs.record_reasoning_only();
-        assert_eq!(rs.reasoning_only_strikes, 1);
-
-        // Branch 3: tool calls (should reset reasoning_only_strikes)
-        rs.record_tool_calls(2);
-        assert_eq!(rs.reasoning_only_strikes, 0);
-        assert_eq!(rs.turn_tool_calls, 2);
-
-        // Branch 1 again: reasoning only (should start from 1, not 2)
-        let strikes = rs.record_reasoning_only();
-        assert_eq!(strikes, 1);
-    }
-
-    #[test]
-    fn run_state_empty_to_reasoning_reset() {
-        // Simulate: empty → empty → reasoning only (should reset empty strikes)
-        let mut rs = RunState::default();
-
-        rs.record_empty_response();
-        rs.record_empty_response();
-        assert_eq!(rs.empty_response_strikes, 2);
-
-        // Branch 1: reasoning only (should reset empty_response_strikes)
-        rs.record_reasoning_only();
-        assert_eq!(rs.empty_response_strikes, 0);
-        assert_eq!(rs.reasoning_only_strikes, 1);
-    }
-
-    #[test]
-    fn run_state_thinking_disabled_default() {
-        let rs = RunState::default();
-        assert!(!rs.thinking_disabled_for_rest_of_run);
-    }
-
-    #[test]
-    fn run_state_thinking_disabled_after_3_strikes() {
-        let mut rs = RunState::default();
-
-        // After 1st reasoning-only: not disabled
-        rs.record_reasoning_only();
-        assert!(!rs.thinking_disabled_for_rest_of_run);
-        assert_eq!(rs.reasoning_only_strikes, 1);
-
-        // After 2nd reasoning-only: not disabled
-        rs.record_reasoning_only();
-        assert!(!rs.thinking_disabled_for_rest_of_run);
-        assert_eq!(rs.reasoning_only_strikes, 2);
-
-        // After 3rd reasoning-only: disabled!
-        rs.record_reasoning_only();
-        assert!(rs.thinking_disabled_for_rest_of_run);
-        assert_eq!(rs.reasoning_only_strikes, 3);
-    }
-
-    #[test]
-    fn run_state_thinking_disabled_resets_on_new_run() {
-        let mut rs = RunState::default();
-
-        // Simulate 3 reasoning-only responses
-        rs.record_reasoning_only();
-        rs.record_reasoning_only();
-        rs.record_reasoning_only();
-        assert!(rs.thinking_disabled_for_rest_of_run);
-        assert_eq!(rs.reasoning_only_strikes, 3);
-
-        // Reset for new run (new user message)
-        rs.reset_for_new_run();
-        assert!(!rs.thinking_disabled_for_rest_of_run);
-        assert_eq!(rs.reasoning_only_strikes, 0);
-    }
-
-    #[test]
-    fn run_state_thinking_disabled_stays_after_tool_calls() {
-        let mut rs = RunState::default();
-
-        // Simulate 3 reasoning-only responses
-        rs.record_reasoning_only();
-        rs.record_reasoning_only();
-        rs.record_reasoning_only();
-        assert!(rs.thinking_disabled_for_rest_of_run);
-
-        // Tool calls should NOT reset thinking_disabled_for_rest_of_run
-        // (it should stay disabled for the rest of the run)
-        rs.record_tool_calls(2);
-        assert!(rs.thinking_disabled_for_rest_of_run);
-        assert_eq!(rs.reasoning_only_strikes, 0); // strikes reset, but thinking stays disabled
-    }
-
     // ── Backward-compatible deserialization ────────────────────────────────
 
     #[test]
@@ -1268,10 +1001,10 @@ mod validate_tests {
         }"#;
         let session: AgentSession = serde_json::from_str(json).unwrap();
         assert_eq!(session.run_state.nudge_count, 3);
-        assert_eq!(session.run_state.turn_tool_calls, 2);
+        assert_eq!(session.run_state.turn_actions, 2);
         assert_eq!(session.run_state.reasoning_only_strikes, 1);
         assert_eq!(session.run_state.empty_response_strikes, 0);
-        assert!(!session.run_state.run_has_tool_calls); // default
+        assert!(!session.run_state.run_has_actions); // default
     }
 
     #[test]
@@ -1291,8 +1024,8 @@ mod validate_tests {
             }
         }"#;
         let session: AgentSession = serde_json::from_str(json).unwrap();
-        assert_eq!(session.run_state.turn_tool_calls, 4);
-        assert!(session.run_state.run_has_tool_calls);
+        assert_eq!(session.run_state.turn_actions, 4);
+        assert!(session.run_state.run_has_actions);
         assert_eq!(session.run_state.empty_response_strikes, 1);
         assert_eq!(session.run_state.nudge_count, 2);
     }
@@ -1316,7 +1049,7 @@ mod validate_tests {
             "turn_tool_calls": 99
         }"#;
         let session: AgentSession = serde_json::from_str(json).unwrap();
-        assert_eq!(session.run_state.turn_tool_calls, 10); // run_state wins
+        assert_eq!(session.run_state.turn_actions, 10); // run_state wins
         assert_eq!(session.run_state.nudge_count, 0); // run_state wins
     }
 
@@ -1332,7 +1065,7 @@ mod validate_tests {
         }"#;
         let session: AgentSession = serde_json::from_str(json).unwrap();
         assert_eq!(session.run_state.nudge_count, 1);
-        assert_eq!(session.run_state.turn_tool_calls, 0); // missing → 0
+        assert_eq!(session.run_state.turn_actions, 0); // missing → 0
         assert_eq!(session.run_state.reasoning_only_strikes, 0);
         assert_eq!(session.run_state.empty_response_strikes, 0);
     }
@@ -1341,16 +1074,45 @@ mod validate_tests {
     fn roundtrip_preserves_run_state() {
         let mut session = AgentSession::new(SessionId::new(1));
         session.run_state.nudge_count = 5;
-        session.run_state.turn_tool_calls = 3;
-        session.run_state.run_has_tool_calls = true;
+        session.run_state.turn_actions = 3;
+        session.run_state.run_has_actions = true;
         session.run_state.reasoning_only_strikes = 2;
 
         let json = serde_json::to_string(&session).unwrap();
         let restored: AgentSession = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.run_state.nudge_count, 5);
-        assert_eq!(restored.run_state.turn_tool_calls, 3);
-        assert!(restored.run_state.run_has_tool_calls);
+        assert_eq!(restored.run_state.turn_actions, 3);
+        assert!(restored.run_state.run_has_actions);
         assert_eq!(restored.run_state.reasoning_only_strikes, 2);
+    }
+
+    #[test]
+    fn deserialize_migrates_top_level_total_into_run_state() {
+        // Pre-T7 wire: the session total lived at the top level. It migrates
+        // into the one counting home (D5), and the old top-level field is gone
+        // from new writes.
+        let json = r#"{
+            "id": null,
+            "chat_messages": [],
+            "always_allowed_actions": [],
+            "total_tool_calls": 7,
+            "run_state": {
+                "turn_tool_calls": 4,
+                "run_has_tool_calls": true,
+                "reasoning_only_strikes": 0,
+                "empty_response_strikes": 0,
+                "nudge_count": 0
+            }
+        }"#;
+        let session: AgentSession = serde_json::from_str(json).unwrap();
+        assert_eq!(session.run_state.total_actions, 7);
+        assert_eq!(session.run_state.turn_actions, 4);
+
+        let rewritten = serde_json::to_string(&session).unwrap();
+        assert!(
+            !rewritten.contains("total_tool_calls"),
+            "new writes keep the total inside run_state: {rewritten}"
+        );
     }
 
     #[test]
@@ -1510,70 +1272,6 @@ mod proptest_tests {
     use proptest::prelude::*;
 
     proptest! {
-        // ── RunState property tests ─────────────────────────────────────────
-
-        #[test]
-        fn reset_for_new_run_zeros_all_fields(
-            turn_tool_calls in 0usize..1000,
-            run_has_tool_calls in proptest::bool::ANY,
-            reasoning_only_strikes in 0usize..100,
-            empty_response_strikes in 0usize..100,
-            nudge_count in 0usize..100,
-        ) {
-            let mut rs = RunState {
-                turn_tool_calls,
-                run_has_tool_calls,
-                reasoning_only_strikes,
-                empty_response_strikes,
-                nudge_count,
-                thinking_disabled_for_rest_of_run: true,
-                original_thinking_enabled: true,
-                truncation_strikes: 5,
-                awaiting_human: true,
-            };
-            rs.reset_for_new_run();
-            assert_eq!(rs.turn_tool_calls, 0);
-            assert!(!rs.run_has_tool_calls);
-            assert_eq!(rs.reasoning_only_strikes, 0);
-            assert_eq!(rs.empty_response_strikes, 0);
-            assert_eq!(rs.nudge_count, 0);
-            assert_eq!(rs.truncation_strikes, 0);
-            assert!(!rs.thinking_disabled_for_rest_of_run);
-            assert!(!rs.awaiting_human);
-            // original_thinking_enabled is NOT reset
-            assert!(rs.original_thinking_enabled);
-        }
-
-        #[test]
-        fn record_tool_calls_accumulates(n in 0usize..100) {
-            let mut rs = RunState::default();
-            rs.record_tool_calls(n);
-            assert_eq!(rs.turn_tool_calls, n);
-            assert!(rs.run_has_tool_calls);
-            assert_eq!(rs.reasoning_only_strikes, 0);
-            assert_eq!(rs.empty_response_strikes, 0);
-        }
-
-        #[test]
-        fn record_reasoning_only_increments(count in 1usize..50) {
-            let mut rs = RunState::default();
-            for i in 1..=count {
-                let strikes = rs.record_reasoning_only();
-                assert_eq!(strikes, i);
-                assert_eq!(rs.empty_response_strikes, 0);
-            }
-        }
-
-        #[test]
-        fn record_empty_response_increments(count in 1usize..50) {
-            let mut rs = RunState::default();
-            for i in 1..=count {
-                let strikes = rs.record_empty_response();
-                assert_eq!(strikes, i);
-                assert_eq!(rs.reasoning_only_strikes, 0);
-            }
-        }
-
         // ── push_assistant_tool_calls property tests ────────────────────────
 
         #[test]

@@ -199,7 +199,7 @@ impl EventPrinter {
                 println!();
                 io::stdout().flush().unwrap();
             }
-            RuntimeEvent::ToolCallStarted {
+            RuntimeEvent::ActionStarted {
                 tool_name,
                 args_json,
                 ..
@@ -207,7 +207,7 @@ impl EventPrinter {
                 println!();
                 println!("[Tool call] {} (with args: {})", tool_name, args_json);
             }
-            RuntimeEvent::ToolCallFinished {
+            RuntimeEvent::ActionFinished {
                 tool_name, summary, ..
             } => {
                 println!("[Tool finished] {} -> {}", tool_name, summary);

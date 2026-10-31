@@ -35,6 +35,7 @@ async fn test_summarize(
             tool_call_id: "call_001".to_string(),
             name: None,
             content: "Filesystem      Size  Used Avail Use% Mounted on\n/dev/vda3        40G  8.0G   30G  22% /\ntmpfs           1.8G     0  1.8G   0% /dev/shm\n/dev/vda2       197M  6.3M  191M   4% /boot/efi".to_string(),
+            images: Vec::new(),
         },
     ];
 

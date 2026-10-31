@@ -7,7 +7,7 @@ use crate::types::{AgentResult, SafetyConfig};
 ///
 /// Mounted on `on_post_llm` hook. When the turn's tool call count reaches
 /// `max_tool_calls_per_turn`, this middleware:
-/// 1. Clears `ctx.tool_calls` (discards pending tool calls)
+/// 1. Demotes the turn to text-only (discards pending actions)
 /// 2. Injects a `follow_up_message` forcing the LLM to summarize
 ///
 /// This is a **hard constraint** — unlike prompt rules, the model cannot bypass it.
@@ -31,22 +31,21 @@ impl TurnToolLimitMiddleware {
 impl Middleware for TurnToolLimitMiddleware {
     async fn on_post_llm(&self, ctx: &mut PostLlmCtx) -> AgentResult<()> {
         // Only intercept when the LLM is trying to call tools
-        if !ctx.is_tool_call || ctx.tool_calls.is_empty() {
+        if ctx.actions().is_empty() {
             return Ok(());
         }
 
         // Check if this turn has already hit the limit
-        if ctx.turn_tool_calls >= self.max_tool_calls_per_turn {
+        if ctx.turn_actions >= self.max_tool_calls_per_turn {
             tracing::warn!(
-                turn_tool_calls = ctx.turn_tool_calls,
+                turn_actions = ctx.turn_actions,
                 max = self.max_tool_calls_per_turn,
-                pending_calls = ctx.tool_calls.len(),
+                pending_calls = ctx.actions().len(),
                 "TurnToolLimit: blocking tool calls — limit reached"
             );
 
             // Discard all pending tool calls
-            ctx.tool_calls.clear();
-            ctx.is_tool_call = false;
+            ctx.demote_to_text();
 
             // Force LLM to summarize
             ctx.follow_up_message = Some(
@@ -62,28 +61,33 @@ impl Middleware for TurnToolLimitMiddleware {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{FinishReason, SessionId};
+    use crate::engine::executor::ParseOutcome;
+    use crate::types::{Action, ActionFormat, FinishReason, SessionId};
 
-    fn make_ctx(turn_tool_calls: usize, pending_calls: usize) -> PostLlmCtx {
-        let tool_calls = (0..pending_calls)
-            .map(|i| {
-                (
-                    format!("call_{}", i),
-                    "test_tool".to_string(),
-                    "{}".to_string(),
-                )
+    fn make_ctx(turn_actions: usize, pending_calls: usize) -> PostLlmCtx {
+        let actions = (0..pending_calls)
+            .map(|i| Action {
+                id: format!("call_{}", i),
+                name: "test_tool".to_string(),
+                args: serde_json::json!({}),
+                identity: "test_tool|{}".to_string(),
+                format: ActionFormat::ToolCall,
             })
-            .collect();
+            .collect::<Vec<Action>>();
+        let parse = if actions.is_empty() {
+            ParseOutcome::Empty
+        } else {
+            ParseOutcome::Actions(actions)
+        };
         PostLlmCtx {
             session_id: SessionId::new(1),
             full_text: String::new(),
-            is_tool_call: pending_calls > 0,
-            tool_calls,
+            parse,
             available_tools: vec!["test_tool".to_string()],
             turn_count: 1,
-            total_tool_calls: 0,
+            total_actions: 0,
             nudge_count: 0,
-            turn_tool_calls,
+            turn_actions,
             skip_push: false,
             follow_up_message: None,
             finish_reason: FinishReason::Stop,
@@ -95,7 +99,7 @@ mod tests {
         let mw = TurnToolLimitMiddleware::new(8);
         let mut ctx = make_ctx(3, 2);
         mw.on_post_llm(&mut ctx).await.unwrap();
-        assert_eq!(ctx.tool_calls.len(), 2);
+        assert_eq!(ctx.actions().len(), 2);
         assert!(ctx.follow_up_message.is_none());
     }
 
@@ -104,8 +108,8 @@ mod tests {
         let mw = TurnToolLimitMiddleware::new(8);
         let mut ctx = make_ctx(8, 3);
         mw.on_post_llm(&mut ctx).await.unwrap();
-        assert!(ctx.tool_calls.is_empty());
-        assert!(!ctx.is_tool_call);
+        assert!(ctx.actions().is_empty());
+        assert!(!ctx.has_action_intent());
         assert!(ctx.follow_up_message.is_some());
     }
 
@@ -114,7 +118,7 @@ mod tests {
         let mw = TurnToolLimitMiddleware::new(8);
         let mut ctx = make_ctx(12, 2);
         mw.on_post_llm(&mut ctx).await.unwrap();
-        assert!(ctx.tool_calls.is_empty());
+        assert!(ctx.actions().is_empty());
         assert!(ctx.follow_up_message.is_some());
     }
 
@@ -122,7 +126,7 @@ mod tests {
     async fn ignores_text_only_responses() {
         let mw = TurnToolLimitMiddleware::new(8);
         let mut ctx = make_ctx(10, 0); // no tool calls
-        ctx.is_tool_call = false;
+        ctx.demote_to_text();
         ctx.full_text = "just text".to_string();
         mw.on_post_llm(&mut ctx).await.unwrap();
         assert!(ctx.follow_up_message.is_none());
@@ -133,7 +137,7 @@ mod tests {
         let mw = TurnToolLimitMiddleware::new(3);
         let mut ctx = make_ctx(3, 1);
         mw.on_post_llm(&mut ctx).await.unwrap();
-        assert!(ctx.tool_calls.is_empty());
+        assert!(ctx.actions().is_empty());
         assert!(ctx.follow_up_message.is_some());
     }
 }

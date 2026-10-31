@@ -60,6 +60,11 @@ pub enum AgentError {
     #[error("Configuration error: {0}")]
     ConfigError(String),
 
+    /// Checkpoint persistence contract refused (T5): a payload this build
+    /// will not read, or a cross-backend resume. The message spells out why.
+    #[error("{0}")]
+    Checkpoint(String),
+
     #[error("Internal error: {0}")]
     Internal(String),
 }

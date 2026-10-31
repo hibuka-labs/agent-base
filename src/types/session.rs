@@ -1,3 +1,5 @@
+use std::sync::{Arc, OnceLock};
+
 pub use agent_types::SessionId;
 
 pub trait SessionIdGenerator: Send + Sync {
@@ -29,6 +31,20 @@ impl SessionIdGenerator for AtomicU64SessionIdGenerator {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         )
     }
+}
+
+/// Process-global numbering for engines that bring no generator of their own.
+///
+/// One process routinely runs several engines — a host and its sub-agents —
+/// and each engine that minted its own counter started over at 1, so all of
+/// them held a "session 1" and tool calls / metrics could not tell the engines
+/// apart. Engines built without a generator draw from this one counter, so
+/// ids are unique within the process.
+pub fn shared_session_ids() -> Arc<dyn SessionIdGenerator> {
+    static SHARED: OnceLock<Arc<AtomicU64SessionIdGenerator>> = OnceLock::new();
+    SHARED
+        .get_or_init(|| Arc::new(AtomicU64SessionIdGenerator::default()))
+        .clone()
 }
 
 pub struct UuidSessionIdGenerator;
@@ -67,5 +83,14 @@ mod tests {
         let sid = UuidSessionIdGenerator.generate();
         assert_eq!(sid.id, 0);
         assert!(sid.external_id.is_some());
+    }
+
+    #[test]
+    fn shared_numbering_distinguishes_engines_in_one_process() {
+        // Two engines, no generator of their own. Per-engine counters handed
+        // both a "1"; the shared counter must not collide.
+        let a = shared_session_ids();
+        let b = shared_session_ids();
+        assert_ne!(a.generate().id, b.generate().id);
     }
 }
