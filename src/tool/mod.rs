@@ -394,9 +394,13 @@ impl<T: TypedTool + Send + Sync + 'static> Tool for T {
 
     async fn call(&self, args: &Value, ctx: &ToolContext) -> AgentResult<Vec<Content>> {
         let typed_args: T::Args =
-            serde_json::from_value(args.clone()).map_err(|_| AgentError::ToolArgsInvalid {
+            serde_json::from_value(args.clone()).map_err(|e| AgentError::ToolArgsInvalid {
                 name: self.name().to_string(),
-                raw: args.to_string(),
+                // Carry the serde detail ("missing field `task` …") — the model
+                // can only fix what the message names. Same "{e} (args: …)"
+                // shape as the phase1 JSON-parse failure site (tool_engine.rs)
+                // and the contract asserted in recovery.rs.
+                raw: format!("{e} (args: {args})"),
             })?;
         let output = self.call_typed(typed_args, ctx).await?;
         Ok(vec![self.format_output(output)])
@@ -614,6 +618,52 @@ mod tests {
         // The derived schema exposes the struct's fields as object properties.
         assert!(j["properties"]["name"].is_object());
         assert!(j["properties"]["times"].is_object());
+    }
+
+    #[tokio::test]
+    async fn typed_tool_arg_error_names_the_missing_field() {
+        // Session 20261104_23c198dc: 4 spawn_agent calls omitted the required
+        // `task` field and the model-visible error echoed the raw args with no
+        // serde detail — the model had to guess what was wrong. The error must
+        // name the missing field and keep the args echo (recovery.rs contract).
+        #[derive(schemars::JsonSchema, serde::Deserialize)]
+        struct GreetArgs {
+            #[allow(dead_code)]
+            name: String,
+        }
+
+        struct Greet;
+
+        #[async_trait]
+        impl TypedTool for Greet {
+            type Args = GreetArgs;
+            type Output = String;
+
+            fn name(&self) -> &'static str {
+                "greet"
+            }
+            fn description(&self) -> &'static str {
+                "greet"
+            }
+            async fn call_typed(
+                &self,
+                _args: Self::Args,
+                _ctx: &ToolContext,
+            ) -> AgentResult<Self::Output> {
+                Ok(String::new())
+            }
+        }
+
+        let err = Greet
+            .call(&serde_json::json!({}), &ToolContext::for_test())
+            .await
+            .expect_err("missing required field must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("missing field `name`"),
+            "serde detail must reach the model: {msg}"
+        );
+        assert!(msg.contains("(args: {}"), "raw args echo kept: {msg}");
     }
 
     #[test]
