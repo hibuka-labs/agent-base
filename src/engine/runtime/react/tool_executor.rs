@@ -22,8 +22,8 @@ use crate::engine::runtime::tool_engine::ExecutionContext;
 use crate::tool::{content_images, content_text};
 use crate::types::{
     Action, ActionFormat, ActionOutcome, AgentError, AgentResult, BatchStatus, ChatMessage,
-    CheckpointData, CheckpointStep, FinishReason, MessageRole, Observation, RunOutcome,
-    RuntimeEvent, SessionId, ToolResultData,
+    CheckpointData, CheckpointStep, FinishReason, Observation, RunOutcome, RuntimeEvent, SessionId,
+    ToolResultData,
 };
 
 use super::entry::drain_locked;
@@ -770,7 +770,9 @@ impl<'c> ToolCallExecutor<'c> {
                 self.core
                     .with_session_mut(session_id, |session| {
                         session.close_dangling_tool_calls(&summary);
-                        session.push_message(MessageRole::User, error_history);
+                        // Machine-composed recovery guidance: synthetic, so
+                        // the rotation trail never mistakes it for the user.
+                        session.push_user_synthetic(error_history);
                     })
                     .await?;
                 Ok(None)
@@ -795,7 +797,8 @@ impl<'c> ToolCallExecutor<'c> {
                 self.core
                     .with_session_mut(session_id, |session| {
                         session.close_dangling_tool_calls(&error_summary);
-                        session.push_message(MessageRole::User, retry_prompt);
+                        // Same synthetic notice as the recovery path above.
+                        session.push_user_synthetic(retry_prompt);
                     })
                     .await?;
                 Ok(None)

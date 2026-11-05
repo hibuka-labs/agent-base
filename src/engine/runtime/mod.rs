@@ -253,6 +253,23 @@ impl AgentRuntime {
             .await
     }
 
+    /// Like `run_turn`, but the input is machine-composed (a notice, a wake):
+    /// the message keeps the synthetic flag, so the rotation trail never
+    /// mistakes it for the user's own words.
+    pub async fn run_turn_synthetic_input<F>(
+        &self,
+        session_id: SessionId,
+        user_input: &str,
+        on_event: F,
+    ) -> AgentResult<RunOutcome>
+    where
+        F: FnMut(RuntimeEvent) -> AgentResult<()> + Send + 'static,
+    {
+        self.runner
+            .run_turn_synthetic_input(session_id, user_input, on_event)
+            .await
+    }
+
     pub async fn run_turn_collect(
         &self,
         session_id: SessionId,

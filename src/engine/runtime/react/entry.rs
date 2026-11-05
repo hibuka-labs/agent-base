@@ -52,6 +52,18 @@ where
     Ok(())
 }
 
+/// Provenance of a turn's user input: how it is pushed into the transcript
+/// (and what the rotation trail may later carry into a fresh window).
+enum UserInputKind {
+    /// A real user submit — the task trail.
+    Real,
+    /// An ephemeral skill body: visible this turn only, stripped at turn end.
+    Ephemeral,
+    /// Machine-composed input on the user role (notices, wakes): the model
+    /// treats it like a user turn, but it is never the user's own words.
+    Synthetic,
+}
+
 impl RuntimeCore {
     pub async fn run<F>(&self, session_id: SessionId, on_event: F) -> AgentResult<RunOutcome>
     where
@@ -180,7 +192,7 @@ impl RuntimeCore {
     where
         F: FnMut(RuntimeEvent) -> AgentResult<()> + Send + 'static,
     {
-        self.run_turn_impl(session_id, user_input, false, on_event)
+        self.run_turn_impl(session_id, user_input, UserInputKind::Real, on_event)
             .await
     }
 
@@ -199,7 +211,25 @@ impl RuntimeCore {
     where
         F: FnMut(RuntimeEvent) -> AgentResult<()> + Send + 'static,
     {
-        self.run_turn_impl(session_id, user_input, true, on_event)
+        self.run_turn_impl(session_id, user_input, UserInputKind::Ephemeral, on_event)
+            .await
+    }
+
+    /// Like `run_turn`, but the input is **synthetic**: machine-composed
+    /// input on the user role (a background-task wake, a child-result batch).
+    /// The model treats it like a user turn — the transcript keeps it — but
+    /// the message carries the synthetic flag, so context rotation never
+    /// carries it into a fresh window as the user's task trail.
+    pub async fn run_turn_synthetic_input<F>(
+        &self,
+        session_id: SessionId,
+        user_input: &str,
+        on_event: F,
+    ) -> AgentResult<RunOutcome>
+    where
+        F: FnMut(RuntimeEvent) -> AgentResult<()> + Send + 'static,
+    {
+        self.run_turn_impl(session_id, user_input, UserInputKind::Synthetic, on_event)
             .await
     }
 
@@ -207,7 +237,7 @@ impl RuntimeCore {
         &self,
         session_id: SessionId,
         user_input: &str,
-        ephemeral_input: bool,
+        input_kind: UserInputKind,
         on_event: F,
     ) -> AgentResult<RunOutcome>
     where
@@ -261,10 +291,16 @@ impl RuntimeCore {
         // line co-writes 账 (step) + 数 (RunState) in one write (D5+OV-11).
         let run_state = match self
             .with_session_mut(&session_id, |session| {
-                if ephemeral_input {
-                    session.push_message_ephemeral(MessageRole::User, &user_input_owned);
-                } else {
-                    session.push_message(MessageRole::User, &user_input_owned);
+                match input_kind {
+                    UserInputKind::Real => {
+                        session.push_message(MessageRole::User, &user_input_owned);
+                    }
+                    UserInputKind::Ephemeral => {
+                        session.push_message_ephemeral(MessageRole::User, &user_input_owned);
+                    }
+                    UserInputKind::Synthetic => {
+                        session.push_user_synthetic(&user_input_owned);
+                    }
                 }
                 session.run_state.clone()
             })

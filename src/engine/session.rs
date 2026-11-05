@@ -159,6 +159,15 @@ impl AgentSession {
         self.chat_messages.push(chat_msg);
     }
 
+    /// Push machine-composed input on the user role (a tool-failure notice, a
+    /// background-task wake): the model treats it like a user turn, but the
+    /// synthetic flag keeps it out of the task trail context rotation carries
+    /// into a fresh window.
+    pub fn push_user_synthetic(&mut self, content: impl Into<String>) {
+        self.chat_messages
+            .push(ChatMessage::user_synthetic(content));
+    }
+
     /// Replace the system prompt — the first **non-ephemeral** System message
     /// (wherever it sits, matching how `context` locates it); inserted at
     /// index 0 if none exists. All other messages are untouched. Hosts that
@@ -690,6 +699,18 @@ mod tests {
             ChatMessage::User { images, .. } => assert_eq!(images.len(), 1),
             other => panic!("unexpected message: {other:?}"),
         }
+    }
+
+    /// Machine-composed notices land on the user role with the synthetic
+    /// flag: the rotation trail must never carry them as the user's words.
+    #[test]
+    fn test_push_user_synthetic_flags_the_message() {
+        let mut s = make_session();
+        s.push_user_synthetic("Tool calls failed: exec_command");
+        s.push_message(MessageRole::User, "actually do the thing");
+        let msgs = s.chat_messages();
+        assert!(msgs[0].is_synthetic());
+        assert!(!msgs[1].is_synthetic());
     }
 
     #[test]

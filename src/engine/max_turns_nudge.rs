@@ -74,11 +74,11 @@ impl Middleware for MaxTurnsNudgeMiddleware {
                 max_turns = ctx.max_turns,
                 "max turns nudge: injecting nudge message"
             );
-            ctx.messages.push(crate::types::ChatMessage::User {
-                content: self.config.message.clone(),
-                images: Vec::new(),
-                ephemeral: false,
-            });
+            // Machine-composed nudge: synthetic, so the rotation trail never
+            // mistakes it for the user's own words.
+            ctx.messages.push(crate::types::ChatMessage::user_synthetic(
+                self.config.message.clone(),
+            ));
         }
 
         Ok(())
