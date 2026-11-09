@@ -3,7 +3,7 @@ use async_trait::async_trait;
 // Re-export from agent-types (single source of truth).
 pub use agent_types::{GuardCtx, GuardDecision};
 
-use crate::engine::runtime::NoticeHandle;
+use crate::engine::runtime::{NoticeHandle, ProviderHandle};
 
 /// React Loop Guard trait — single unified entry point.
 ///
@@ -33,6 +33,16 @@ pub trait ReactLoopGuard: Send + Sync {
     /// store the handle; the default implementation ignores it, so existing
     /// implementers are unaffected.
     fn set_notice(&self, _handle: NoticeHandle) {}
+
+    /// Receive the engine's live provider handle. Called once by the runtime
+    /// when the guard is registered (next to [`Self::set_notice`]). A guard
+    /// that runs LLM calls of its own (e.g. a completion judge) MUST resolve
+    /// its client through this handle instead of holding the provider clone
+    /// it was built with: a `/model` swap replaces the engine's provider, and
+    /// a build-time clone keeps answering as the old model (session
+    /// 20261107_27dc727a). Default: ignore, so existing implementers are
+    /// unaffected.
+    fn set_provider_source(&self, _handle: ProviderHandle) {}
 }
 
 /// Default guard — fails on degenerate states, completes on normal flow.

@@ -147,6 +147,10 @@ impl RuntimeCore {
     where
         F: FnMut(RuntimeEvent) -> AgentResult<()> + Send + 'static,
     {
+        // One user turn of run-liveness for the engine: a provider staged
+        // via `set_provider_when_idle` lands when this guard drops (and none
+        // other is held), never between this turn's tool-continuation steps.
+        let _run_guard = self.llm_engine.begin_run();
         let config = self.config_snapshot_async().await;
         let max_turns = config
             .execution

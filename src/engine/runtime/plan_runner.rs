@@ -74,8 +74,14 @@ impl RuntimeCore {
         // Engine notice channel (Batch E): guards get the sender via
         // set_notice; drain_notices forwards pending notices at run end.
         let (notice_tx, notice_rx) = mpsc::unbounded_channel::<crate::types::Notice>();
+        // The engine's live provider handle (same wiring moment as the notice
+        // handle): a guard with LLM calls of its own (the completion judge)
+        // resolves its client through this, so a `/model` swap reaches it
+        // instead of leaving it judging on its build-time provider.
+        let provider_source = llm_engine.provider_handle();
         if let Some(guard) = &guard {
             guard.set_notice(crate::engine::runtime::NoticeHandle::new(notice_tx));
+            guard.set_provider_source(provider_source);
         }
         Self {
             config: Arc::new(RwLock::new(config)),

@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-11-09
+
+### Added
+- **Images fit the wire, or the request is refused with the numbers.**
+  `image_ops` is the single source of truth for "is these bytes a picture,
+  how big is it, does it fit": magic-byte sniffing (never a named MIME type),
+  header-only dimension reads, downscale-to-fit, and the budget — longest
+  edge 1568px, 3.5MB per image on the wire, 12MB per message. The engine
+  applies it before the request leaves, and an over-budget message is
+  refused whole (with the offending dimensions named) instead of being
+  silently truncated.
+- **The react-loop guard has one entry point.** `ReactLoopGuard::on_turn` is
+  the single seam a runtime calls; the guard may trust the scene hints it is
+  handed or re-detect for itself, and it can hold a notice handle and the
+  live provider handle.
+
+### Changed
+- **Breaking (dependency):** `llm-unified` requirement bumped from 0.1.5 to
+  0.2.0 (`ModelRegistry::lookup_known` — a lookup that admits when it does
+  not know a model).
+- The react loop, the tool engine and the session store moved into modules
+  (`engine/runtime/react/`, `engine/runtime/tool_engine/`, `engine/session/`).
+  Internal reorganization, no API change.
+
+### Fixed
+- **A typed tool argument error names the missing field** instead of
+  reporting a generic decode failure.
+- **Machine-composed input is pushed as a synthetic user turn**, so replayed
+  or injected context is distinguishable from what the human typed.
+
+### agent-types 0.6.0 (published alongside)
+
+- **`AskAnswer::Clarify`** — the user answered a picker with a question
+  instead of a choice. `text` carries their words verbatim, the picker is
+  gone, and the model answers the question before carrying on. JSON written
+  before the variant existed still parses byte-identically.
+
 ## [0.11.0] - 2026-10-24
 
 ### Added

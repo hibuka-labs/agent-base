@@ -24,7 +24,7 @@ mod tool_engine;
 
 pub(super) const DEFAULT_MAX_TURNS: u32 = 160;
 
-pub use llm_engine::{LlmEngine, LlmTurnResult};
+pub use llm_engine::{LlmEngine, LlmTurnResult, ProviderHandle};
 pub use message_queue::QueueMode;
 pub use notify::NoticeHandle;
 pub(crate) use plan_runner::RuntimeCore;
@@ -235,6 +235,23 @@ impl AgentRuntime {
         F: FnMut(RuntimeEvent) -> AgentResult<()> + Send + 'static,
     {
         self.runner.run_turn(session_id, user_input, on_event).await
+    }
+
+    /// Like `run_turn`, but the user message carries pictures (the paste
+    /// pipeline's face) — they ride the message through the vision channel.
+    pub async fn run_turn_with_images<F>(
+        &self,
+        session_id: SessionId,
+        user_input: &str,
+        images: Vec<crate::types::ImageAttachment>,
+        on_event: F,
+    ) -> AgentResult<RunOutcome>
+    where
+        F: FnMut(RuntimeEvent) -> AgentResult<()> + Send + 'static,
+    {
+        self.runner
+            .run_turn_with_images(session_id, user_input, images, on_event)
+            .await
     }
 
     /// Like `run_turn`, but the user input is pushed as an ephemeral message:

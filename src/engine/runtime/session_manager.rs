@@ -561,4 +561,48 @@ mod tests {
         let session = m.session(&id).await.unwrap();
         assert!(session.chat_messages().is_empty());
     }
+
+    /// protects: two pasted screenshots survive the max_message_tokens safety
+    /// valve at the production limit (120k) — the incident of session
+    /// 20261108_c525b6c7, where base64-length pricing estimated the same
+    /// message at 439k tokens, the valve popped it whole, and the turn went
+    /// out with an empty message list. fails_when: the estimate scales with
+    /// payload bytes and the message (text AND pictures) is silently eaten.
+    /// no_claim: what a provider bills for the pictures.
+    #[tokio::test]
+    async fn two_pasted_screenshots_survive_the_safety_valve() {
+        let cfg = SessionConfig {
+            max_message_tokens: Some(120_000),
+            ..Default::default()
+        };
+        let m = manager_with_config(cfg);
+        let id = m.create_session(None).await;
+        let shots: Vec<crate::types::ImageAttachment> = (0..2)
+            .map(|_| crate::types::ImageAttachment::Base64 {
+                data: crate::image_ops::to_base64(&crate::image_ops::test_fixtures::noisy_png(
+                    1278, 1152,
+                )),
+                media_type: Some("image/png".to_string()),
+                detail: None,
+            })
+            .collect();
+        m.with_session_mut(&id, |s| {
+            s.push_user_message_with_images("look at these screenshots", shots)
+        })
+        .await
+        .unwrap();
+
+        let session = m.session(&id).await.unwrap();
+        let messages = session.chat_messages();
+        assert_eq!(messages.len(), 1, "the user message must still be there");
+        match &messages[0] {
+            ChatMessage::User {
+                content, images, ..
+            } => {
+                assert_eq!(content, "look at these screenshots");
+                assert_eq!(images.len(), 2, "both pictures ride along");
+            }
+            other => panic!("expected a user message, got {other:?}"),
+        }
+    }
 }

@@ -24,6 +24,10 @@ pub enum AskAnswer {
     Picked { id: String, label: String },
     /// Declined to pick (Esc). A skip is an answer too; never re-ask.
     Skipped,
+    /// Neither pick nor skip: the user typed a question instead — `text` is
+    /// their words, verbatim. Answer it in the reply and carry on; the picker
+    /// is gone (the "Chat about this" pseudo-row is how a user gets here).
+    Clarify { text: String },
 }
 
 #[cfg(test)]
@@ -31,7 +35,7 @@ mod tests {
     use super::*;
 
     /// The ask vocabulary is wire data (a cell's host-call answer is JSON) —
-    /// it must round-trip without loss.
+    /// it must round-trip without loss, every variant included.
     #[test]
     fn ask_vocabulary_round_trips_through_json() {
         let option = AskOption {
@@ -49,10 +53,27 @@ mod tests {
                 label: "登录".into(),
             },
             AskAnswer::Skipped,
+            AskAnswer::Clarify {
+                text: "先说说两种方案的差别？".into(),
+            },
         ] {
             let json = serde_json::to_string(&answer).unwrap();
             let back: AskAnswer = serde_json::from_str(&json).unwrap();
             assert_eq!(back, answer);
         }
+
+        // Clarify is additive: JSON written before the variant existed still
+        // parses byte-identically (old Picked/Skipped shapes unchanged).
+        let old_skipped: AskAnswer = serde_json::from_str("\"Skipped\"").unwrap();
+        assert_eq!(old_skipped, AskAnswer::Skipped);
+        let old_picked: AskAnswer =
+            serde_json::from_str(r#"{"Picked":{"id":"login","label":"登录"}}"#).unwrap();
+        assert_eq!(
+            old_picked,
+            AskAnswer::Picked {
+                id: "login".into(),
+                label: "登录".into(),
+            }
+        );
     }
 }

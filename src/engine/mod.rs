@@ -31,7 +31,7 @@ pub use middleware::{Middleware, PostLlmCtx, PreLlmCtx, UserMessageCtx};
 pub use pipeline::{DefaultPipeline, ToolExecutionPipeline};
 pub use react_loop_guard::{GuardCtx, GuardDecision, NoopGuard, ReactLoopGuard};
 pub(crate) use runtime::EventBus;
-pub use runtime::NoticeHandle;
+pub use runtime::{NoticeHandle, ProviderHandle};
 
 pub use crate::types::{AgentResult, ApprovalDecision, ApprovalRequest, RiskLevel, SessionId};
 pub use recovery::{

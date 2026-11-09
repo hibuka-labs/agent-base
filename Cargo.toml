@@ -4,7 +4,7 @@ exclude = ["fuzz"]
 
 [package]
 name = "agent-base"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2024"
 description = "A lightweight Agent Runtime Kernel for building AI agents in Rust"
 license = "MIT"
@@ -14,15 +14,17 @@ keywords = ["agent", "ai", "llm", "runtime", "tool-calling"]
 categories = ["development-tools", "asynchronous"]
 
 [dependencies]
-agent-types = { version = "0.5.0", path = "crates/agent-types" }
+agent-types = { version = "0.6.0", path = "crates/agent-types" }
 anyhow = "1"
-llm-trait = { version = "0.1.4" }
-llm-unified = { version = "0.1.5" }
+llm-trait = { version = "0.1.5" }
+llm-unified = { version = "0.2.0" }
 async-openai = { version = "0.41", default-features = true }
 async-trait = "0.1"
+base64 = "0.23"
 eventsource-stream = "0.2"
 futures-core = "0.3"
 futures-util = "0.3"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 reqwest = { version = "0.13", features = ["json", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -55,5 +57,3 @@ wiremock = "0.6"
 [[bench]]
 name = "tool_registry"
 harness = false
-
-# LOCAL DEV ONLY — DO NOT COMMIT

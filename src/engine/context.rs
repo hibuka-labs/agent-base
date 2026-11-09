@@ -44,6 +44,24 @@ impl ContextWindowManager {
     /// OpenAI Vision API fixed token overhead per image
     const IMAGE_OVERHEAD_TOKENS: usize = 85;
 
+    /// Vision pricing: ~750 pixels per token at high detail — the magnitude
+    /// every provider's image bill lives in. The estimator prices the
+    /// picture as the WIRE sends it (shrunk to `MAX_WIRE_LONG_EDGE`), never
+    /// the session's stored original.
+    ///
+    /// The old estimator priced the base64 payload as text (`data.len() / 4`),
+    /// which billed one 1278x1152 screenshot at ~219k tokens instead of ~2k.
+    /// Two pasted screenshots then tripped the `max_message_tokens` safety
+    /// valve, the valve popped the whole user message, and the turn went out
+    /// with an empty message list (session 20261108_c525b6c7).
+    const IMAGE_PIXELS_PER_TOKEN: u64 = 750;
+
+    /// Price for an attachment whose header cannot be read (exotic format,
+    /// corrupt payload, not an image at all): the worst case the wire budget
+    /// lets through — a downscaled 1568x1568 picture is ~3.3k tokens — so an
+    /// unreadable payload is never underpriced into the request.
+    const IMAGE_UNREADABLE_TOKENS: usize = 3_500;
+
     pub fn new(max_tokens: usize) -> Self {
         Self {
             max_tokens,
@@ -74,33 +92,61 @@ impl ContextWindowManager {
         (cjk_count as f64 / 1.5 + latin_count as f64 / 4.0).ceil() as usize
     }
 
+    /// What one picture costs — fixed overhead plus either its wire-scale
+    /// pixel count (a base64 payload whose header reads), the URL text (a
+    /// reference the provider fetches), or the capped fallback.
+    fn image_tokens(image: &crate::types::ImageAttachment) -> usize {
+        use crate::types::ImageAttachment;
+        let body = match image {
+            ImageAttachment::Url { url, detail: _ } => Self::estimate_tokens(url),
+            ImageAttachment::Base64 {
+                data,
+                media_type,
+                detail: _,
+            } => {
+                let mut tokens = match crate::image_ops::base64_prefix_dims(data) {
+                    Some((w, h)) => Self::pixel_tokens(w, h),
+                    None => Self::IMAGE_UNREADABLE_TOKENS,
+                };
+                if let Some(mt) = media_type {
+                    tokens += Self::estimate_tokens(mt);
+                }
+                tokens
+            }
+        };
+        body + Self::IMAGE_OVERHEAD_TOKENS
+    }
+
+    /// Pixel price of a picture as it travels: the wire shrinks any long
+    /// edge above the cap, so price the scaled pixels — never more than a
+    /// full-cap picture.
+    fn pixel_tokens(w: u32, h: u32) -> usize {
+        let long = u64::from(w.max(h)).max(1);
+        let cap = u64::from(crate::image_ops::MAX_WIRE_LONG_EDGE);
+        let (w, h) = if long > cap {
+            (u64::from(w) * cap / long, u64::from(h) * cap / long)
+        } else {
+            (u64::from(w), u64::from(h))
+        };
+        let pixels = (w * h).max(1);
+        (pixels.div_ceil(Self::IMAGE_PIXELS_PER_TOKEN)) as usize
+    }
+
+    /// Estimate a user message's tokens from its parts — the turn-entry size
+    /// gate uses it before the message exists as a [`ChatMessage`].
+    pub(crate) fn user_message_tokens(
+        content: &str,
+        images: &[crate::types::ImageAttachment],
+    ) -> usize {
+        Self::estimate_tokens(content) + images.iter().map(Self::image_tokens).sum::<usize>()
+    }
+
     pub(crate) fn message_tokens(msg: &ChatMessage) -> usize {
         match msg {
             ChatMessage::System { content, .. } => Self::estimate_tokens(content),
             ChatMessage::User {
                 content, images, ..
-            } => {
-                let mut tokens = Self::estimate_tokens(content);
-                for img in images {
-                    match img {
-                        crate::types::ImageAttachment::Url { url, detail: _ } => {
-                            tokens += Self::estimate_tokens(url);
-                        }
-                        crate::types::ImageAttachment::Base64 {
-                            data,
-                            media_type,
-                            detail: _,
-                        } => {
-                            tokens += data.len() / 4;
-                            if let Some(mt) = media_type {
-                                tokens += Self::estimate_tokens(mt);
-                            }
-                        }
-                    }
-                    tokens += Self::IMAGE_OVERHEAD_TOKENS;
-                }
-                tokens
-            }
+            } => Self::user_message_tokens(content, images),
             ChatMessage::Assistant {
                 content,
                 reasoning_content,
@@ -123,8 +169,19 @@ impl ContextWindowManager {
             ChatMessage::Tool {
                 tool_call_id,
                 content,
+                images,
                 ..
-            } => Self::estimate_tokens(tool_call_id) + Self::estimate_tokens(content),
+            } => {
+                // A tool result's pictures count like any other — before this
+                // they rode the context budget for free while user pictures
+                // were overcharged.
+                let mut tokens =
+                    Self::estimate_tokens(tool_call_id) + Self::estimate_tokens(content);
+                for img in images {
+                    tokens += Self::image_tokens(img);
+                }
+                tokens
+            }
             ChatMessage::Custom { role, data } => {
                 Self::estimate_tokens(role) + Self::estimate_tokens(&data.to_string())
             }
@@ -359,6 +416,95 @@ mod tests {
             data: serde_json::json!({"x": 1}),
         };
         assert!(ContextWindowManager::message_tokens(&custom) > 0);
+    }
+
+    /// protects: a screenshot is priced by its wire-scale PIXELS (~750 px per
+    /// token) — never by the length of its base64 payload, which billed one
+    /// 1278x1152 screenshot at ~219k tokens and fed the max_message_tokens
+    /// safety valve its victims (session 20261108_c525b6c7: two pastes
+    /// estimated at 439k, the valve popped the user message, the turn 400ed
+    /// on an empty message list). fails_when: the estimate scales with
+    /// payload bytes. no_claim: any provider's exact bill.
+    #[test]
+    fn screenshot_images_price_by_pixels_not_base64_length() {
+        let png = crate::image_ops::test_fixtures::noisy_png(1278, 1152);
+        let b64 = crate::image_ops::to_base64(&png);
+        let msg = ChatMessage::user_with_images(
+            "what is in this screenshot?",
+            vec![ImageAttachment::Base64 {
+                data: b64.clone(),
+                media_type: Some("image/png".into()),
+                detail: None,
+            }],
+        );
+        let tokens = ContextWindowManager::message_tokens(&msg);
+        // The old formula's verdict on the very same payload:
+        let old_formula = b64.len() / 4;
+        assert!(
+            old_formula > 100_000,
+            "fixture must carry the incident's payload scale, got {old_formula}"
+        );
+        assert!(
+            tokens < 5_000,
+            "one screenshot must cost thousands of tokens, not {tokens} (payload was {old_formula} under the old formula)"
+        );
+        assert!(tokens > 1_500, "the pixel price is real, got {tokens}");
+    }
+
+    /// protects: a tool result's pictures enter the estimate like any other
+    /// (they used to ride the context budget for free). fails_when: tool
+    /// images are uncounted and trim starves. no_claim: that a tool's images
+    /// and a user's images cost the same at any given provider.
+    #[test]
+    fn tool_result_images_are_counted_too() {
+        let png =
+            crate::image_ops::to_base64(&crate::image_ops::test_fixtures::noisy_png(200, 200));
+        let text_only = ChatMessage::tool("tc1", "done");
+        let with_image = ChatMessage::Tool {
+            tool_call_id: "tc1".into(),
+            name: Some("read_image".into()),
+            content: "done".into(),
+            images: vec![ImageAttachment::Base64 {
+                data: png,
+                media_type: Some("image/png".into()),
+                detail: None,
+            }],
+        };
+        let text_tokens = ContextWindowManager::message_tokens(&text_only);
+        let image_tokens = ContextWindowManager::message_tokens(&with_image);
+        assert!(
+            image_tokens > text_tokens + 100,
+            "tool image must cost its pixels: {text_tokens} vs {image_tokens}"
+        );
+    }
+
+    /// protects: a payload whose header cannot be read (exotic format, junk)
+    /// gets the capped fallback — bounded and independent of payload length,
+    /// so garbage can never inflate the estimate into the safety valve's
+    /// range. fails_when: unreadable payloads are priced by byte length or
+    /// crash the estimator. no_claim: what such a payload would really cost.
+    #[test]
+    fn unreadable_image_payloads_get_the_capped_fallback() {
+        let small: Vec<u8> = b"not an image".to_vec();
+        let mut big = vec![b'x'; 512_000];
+        big.extend_from_slice(b"also not an image");
+        let estimate = |payload: Vec<u8>| {
+            ContextWindowManager::user_message_tokens(
+                "",
+                &[ImageAttachment::Base64 {
+                    data: crate::image_ops::to_base64(&payload),
+                    media_type: None,
+                    detail: None,
+                }],
+            )
+        };
+        let small_est = estimate(small);
+        let big_est = estimate(big);
+        assert_eq!(small_est, big_est, "fallback is size-independent");
+        assert!(
+            (1_000..5_000).contains(&small_est),
+            "fallback is capped: {small_est}"
+        );
     }
 
     #[test]

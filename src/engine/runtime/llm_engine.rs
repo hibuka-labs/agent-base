@@ -1,4 +1,5 @@
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -17,49 +18,14 @@ use crate::types::{AgentResult, ChatMessage, RuntimeEvent, SessionId};
 /// network within a minute instead of hanging forever.
 const TTFB_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// How many picture-bearing results a request may carry. Pictures live in
-/// the transcript for audit and resume, but every request resends each one's
-/// base64; two desktop screenshots were enough to trip the gateway's body
-/// limit (HTTP 413, session 20261030_862ddf5c). Only the newest pictures go
-/// out — older ones keep their text and gain an honest note.
-const MAX_WIRE_IMAGES: usize = 2;
-
-/// Trim pictures the model no longer needs to look at, newest kept first.
-///
-/// A message keeps all of its pictures or none: a half-visible result would
-/// be worse than an honest omission. Once a message fails to fit, nothing
-/// older gets to jump the queue.
-fn bound_wire_images(messages: &mut [ChatMessage]) {
-    let mut budget = MAX_WIRE_IMAGES;
-    for message in messages.iter_mut().rev() {
-        let (images, content) = match message {
-            ChatMessage::Tool {
-                images, content, ..
-            } => (images, content),
-            ChatMessage::User {
-                images, content, ..
-            } => (images, content),
-            _ => continue,
-        };
-        if images.is_empty() {
-            continue;
-        }
-        if images.len() <= budget {
-            budget -= images.len();
-            continue;
-        }
-        let dropped = images.len();
-        images.clear();
-        budget = 0;
-        content.push_str(&format!(
-            "\n[note: {dropped} image(s) from this older result are not attached to this \
-             request — only the newest {MAX_WIRE_IMAGES} picture(s) travel; call the tool \
-             again if you need to look]"
-        ));
-    }
-}
-
 /// Build a `ChatRequest` from individual parameters.
+///
+/// Every picture is shrunk to the wire size and judged by
+/// [`crate::image_ops::apply_image_budget`] on the way out: over either
+/// budget line the WHOLE request is refused with a size inventory — the one
+/// place a picture may leave the wire, and never silently. The pass runs on
+/// this wire copy only; the session's history keeps the originals (each turn
+/// re-shrinks its own copy).
 fn build_chat_request(
     messages: &[ChatMessage],
     tool_definitions: &[Value],
@@ -67,9 +33,10 @@ fn build_chat_request(
     response_format: Option<&crate::types::ResponseFormat>,
     thinking_disabled: bool,
     model_override: Option<&str>,
-) -> llm_trait::ChatRequest {
+) -> AgentResult<llm_trait::ChatRequest> {
     let mut messages = messages.to_vec();
-    bound_wire_images(&mut messages);
+    crate::image_ops::apply_image_budget(&mut messages)
+        .map_err(|e| crate::types::AgentError::llm(e.to_string()))?;
     let mut request = llm_trait::ChatRequest::new(messages);
     if !tool_definitions.is_empty() {
         request = request.with_tools(tool_definitions.to_vec());
@@ -92,7 +59,7 @@ fn build_chat_request(
         request = request.with_model(model);
     }
 
-    request
+    Ok(request)
 }
 
 /// Convert a `ChatStream` (new) to the old stream type consumed by `process_stream`.
@@ -103,22 +70,67 @@ fn chat_stream_to_old(
     Box::pin(inner.map(|item| item.map_err(Into::into)))
 }
 
+/// Run-liveness accounting for [`LlmEngine::begin_run`]: counts one run
+/// against the engine and lands staged provider swaps when the last run
+/// ends. Held for the duration of one `run` / `run_turn`.
+pub(crate) struct RunGuard<'a> {
+    engine: &'a LlmEngine,
+}
+
+impl Drop for RunGuard<'_> {
+    fn drop(&mut self) {
+        self.engine.active_runs.fetch_sub(1, AtomicOrdering::AcqRel);
+        self.engine.flush_pending_if_idle();
+    }
+}
+
+/// A live view of the engine's provider slot ([`LlmEngine::provider_handle`]).
+///
+/// Resolves the current provider at USE time, so a holder survives
+/// [`LlmEngine::set_provider`] / [`LlmEngine::set_provider_when_idle`] swaps
+/// (a `/model` switch). A provider cloned out of the engine at build time is
+/// a boot-time snapshot: the guard's completion judge kept judging on the old
+/// model after a swap and treated that model's own identity as the session's
+/// ground truth (session 20261107_27dc727a).
+#[derive(Clone)]
+pub struct ProviderHandle(Arc<RwLock<Arc<dyn llm_trait::LlmProvider>>>);
+
+impl ProviderHandle {
+    /// A standalone handle over `initial` — for holders that get their handle
+    /// directly instead of from an engine (and for tests).
+    pub fn new(initial: Arc<dyn llm_trait::LlmProvider>) -> Self {
+        Self(Arc::new(RwLock::new(initial)))
+    }
+
+    /// The provider currently in the slot.
+    pub fn current(&self) -> Arc<dyn llm_trait::LlmProvider> {
+        self.0.read().unwrap().clone()
+    }
+}
+
 pub struct LlmEngine {
-    provider: RwLock<Arc<dyn llm_trait::LlmProvider>>,
+    provider: Arc<RwLock<Arc<dyn llm_trait::LlmProvider>>>,
     event_bus: EventBus,
     /// Optional model override for all requests.
     ///
     /// When set, this overrides the model in ChatRequest.
     /// Used by sub-agents to specify their model tier (e.g., "lite").
     model_override: RwLock<Option<String>>,
+    /// Runs currently executing against this engine (see [`RunGuard`]).
+    active_runs: AtomicUsize,
+    /// A staged provider swap waiting for the engine to go idle
+    /// ([`Self::set_provider_when_idle`]).
+    pending_provider: RwLock<Option<Arc<dyn llm_trait::LlmProvider>>>,
 }
 
 impl LlmEngine {
     pub(crate) fn new(provider: Arc<dyn llm_trait::LlmProvider>, event_bus: EventBus) -> Self {
         Self {
-            provider: RwLock::new(provider),
+            provider: Arc::new(RwLock::new(provider)),
             event_bus,
             model_override: RwLock::new(None),
+            active_runs: AtomicUsize::new(0),
+            pending_provider: RwLock::new(None),
         }
     }
 
@@ -127,9 +139,59 @@ impl LlmEngine {
         self.provider.read().unwrap().clone()
     }
 
+    /// A handle that always resolves to this engine's CURRENT provider —
+    /// hand it to long-lived holders (e.g. the react-loop guard) instead of a
+    /// provider clone so model swaps reach them too. See [`ProviderHandle`].
+    pub fn provider_handle(&self) -> ProviderHandle {
+        ProviderHandle(Arc::clone(&self.provider))
+    }
+
     /// Replace the LLM provider at runtime (e.g., model switch).
+    ///
+    /// Immediate: the swap lands even while a run is streaming. Callers that
+    /// must not split one conversation across two models use
+    /// [`Self::set_provider_when_idle`] instead. Every [`ProviderHandle`]
+    /// handed out by [`Self::provider_handle`] follows the swap.
     pub fn set_provider(&self, provider: Arc<dyn llm_trait::LlmProvider>) {
         *self.provider.write().unwrap() = provider;
+    }
+
+    /// Stage a provider swap for the end of the run executing now.
+    ///
+    /// Hot-swapping mid-run would split one conversation across two models —
+    /// the tool-continuation steps would run on the new provider with the old
+    /// provider's history and identity. So the swap lands when the last active
+    /// run ends; when the engine is already idle it lands at once. Returns
+    /// `true` when the swap was deferred, `false` when it landed immediately.
+    /// A second staged swap replaces the first (the last pick wins).
+    pub fn set_provider_when_idle(&self, provider: Arc<dyn llm_trait::LlmProvider>) -> bool {
+        *self.pending_provider.write().unwrap() = Some(provider);
+        self.flush_pending_if_idle();
+        self.pending_provider.read().unwrap().is_some()
+    }
+
+    /// Whether a run is executing against this engine right now.
+    pub fn has_active_run(&self) -> bool {
+        self.active_runs.load(AtomicOrdering::Acquire) > 0
+    }
+
+    /// Count one run against the engine. The returned guard decrements on
+    /// drop and lands any staged swap once the count reaches zero.
+    pub(crate) fn begin_run(&self) -> RunGuard<'_> {
+        self.active_runs.fetch_add(1, AtomicOrdering::AcqRel);
+        RunGuard { engine: self }
+    }
+
+    /// Land the staged swap if no run is in flight. Called at every point
+    /// that can change the answer (a stage, a run's end) so no interleaving
+    /// of the two can strand a staged swap.
+    fn flush_pending_if_idle(&self) {
+        if self.has_active_run() {
+            return;
+        }
+        if let Some(provider) = self.pending_provider.write().unwrap().take() {
+            self.set_provider(provider);
+        }
     }
 
     /// Get the model override, if set.
@@ -217,7 +279,7 @@ impl LlmEngine {
             response_format,
             thinking_disabled,
             model_override.as_deref(),
-        );
+        )?;
         let result = self.stream_cancellable(cancel_token, request).await;
         match &result {
             Ok(_) => tracing::info!("LLM chat_stream: API response received"),
@@ -246,7 +308,7 @@ impl LlmEngine {
             response_format,
             thinking_disabled,
             model_override.as_deref(),
-        );
+        )?;
         let mut attempt = 1;
         let mut delay_ms = retry.initial_backoff_ms;
         loop {
@@ -629,959 +691,6 @@ impl StreamAggregator {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::types::{AgentError, RetryConfig};
-    use async_trait::async_trait;
-    use llm_trait::{Capabilities, ChatRequest, ChatStream, LlmError, LlmProvider, ProviderInfo};
-    use std::pin::Pin;
-
-    struct StubProvider(&'static str);
-
-    #[async_trait]
-    impl LlmProvider for StubProvider {
-        async fn stream(&self, _request: ChatRequest) -> Result<ChatStream, LlmError> {
-            Ok(ChatStream::new(Box::pin(futures_util::stream::empty())))
-        }
-
-        async fn chat(&self, _request: ChatRequest) -> Result<llm_trait::ChatResponse, LlmError> {
-            Err(LlmError::Llm("not implemented".into()))
-        }
-
-        fn capabilities(&self) -> Capabilities {
-            Capabilities::default()
-        }
-
-        fn info(&self) -> ProviderInfo {
-            ProviderInfo {
-                name: "stub".to_string(),
-                model: self.0.to_string(),
-                version: None,
-            }
-        }
-    }
-
-    fn engine(model: &'static str) -> LlmEngine {
-        LlmEngine::new(Arc::new(StubProvider(model)), EventBus::new(16))
-    }
-
-    #[test]
-    fn get_provider_and_set_provider_swap() {
-        let engine = engine("model-a");
-        assert_eq!(engine.get_provider().info().model, "model-a");
-        engine.set_provider(Arc::new(StubProvider("model-b")));
-        assert_eq!(engine.get_provider().info().model, "model-b");
-    }
-
-    #[test]
-    fn get_provider_returns_provider() {
-        let engine = engine("model-a");
-        let provider = engine.get_provider();
-        assert_eq!(provider.info().model, "model-a");
-    }
-
-    #[tokio::test]
-    async fn process_stream_aggregates_text_usage_and_stop() {
-        let bus = EventBus::new(16);
-        let engine = LlmEngine::new(Arc::new(StubProvider("x")), bus.clone());
-        let chunks = vec![
-            Ok(StreamChunk::Text("Hello".into())),
-            Ok(StreamChunk::Text(" world".into())),
-            Ok(StreamChunk::Usage(UsageInfo {
-                prompt_tokens: Some(5),
-                completion_tokens: Some(2),
-                total_tokens: Some(7),
-                reasoning_tokens: None,
-            })),
-            Ok(StreamChunk::Stop {
-                finish_reason: Some("stop".into()),
-            }),
-        ];
-        let stream = Box::pin(futures_util::stream::iter(chunks));
-        let mut rx = bus.subscribe();
-        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let events_clone = events.clone();
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let result = engine
-            .process_stream(
-                &SessionId::new(1),
-                stream,
-                tracing::Span::none(),
-                &mut rx,
-                std::sync::Arc::new(std::sync::Mutex::new(move |e| {
-                    events_clone.lock().unwrap().push(e);
-                    Ok(())
-                })),
-                &cancel,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(result.full_text, "Hello world");
-        assert!(!result.is_tool_call);
-        assert_eq!(result.finish_reason.as_deref(), Some("stop"));
-        let usage = result.usage.unwrap();
-        assert_eq!(usage.prompt_tokens, Some(5));
-        assert_eq!(usage.completion_tokens, Some(2));
-        assert_eq!(usage.total_tokens, Some(7));
-        assert!(result.llm_duration_ms >= result.ttft_ms);
-
-        let events = events.lock().unwrap();
-        let texts: Vec<String> = events
-            .iter()
-            .filter_map(|e| match e {
-                RuntimeEvent::TextDelta { text, .. } => Some(text.clone()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(texts, vec!["Hello".to_string(), " world".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn process_stream_merges_partial_usage_events() {
-        // Anthropic streams split usage across two events: message_start
-        // carries prompt_tokens only, message_delta carries prompt (optional)
-        // plus the final completion count. Replacing the struct wholesale
-        // made every Anthropic session record input_tokens = 0.
-        let bus = EventBus::new(16);
-        let engine = LlmEngine::new(Arc::new(StubProvider("x")), bus.clone());
-        let chunks = vec![
-            Ok(StreamChunk::Usage(UsageInfo {
-                prompt_tokens: Some(2),
-                completion_tokens: Some(0),
-                total_tokens: None,
-                reasoning_tokens: None,
-            })),
-            Ok(StreamChunk::Usage(UsageInfo {
-                prompt_tokens: Some(63),
-                completion_tokens: Some(26),
-                total_tokens: None,
-                reasoning_tokens: None,
-            })),
-            Ok(StreamChunk::Stop {
-                finish_reason: Some("end_turn".into()),
-            }),
-        ];
-        let stream = Box::pin(futures_util::stream::iter(chunks));
-        let mut rx = bus.subscribe();
-        let noop = std::sync::Arc::new(std::sync::Mutex::new(|_e: RuntimeEvent| Ok(())));
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let result = engine
-            .process_stream(
-                &SessionId::new(1),
-                stream,
-                tracing::Span::none(),
-                &mut rx,
-                noop,
-                &cancel,
-            )
-            .await
-            .unwrap();
-
-        let usage = result.usage.unwrap();
-        assert_eq!(usage.prompt_tokens, Some(63), "later Some wins");
-        assert_eq!(usage.completion_tokens, Some(26));
-    }
-
-    #[tokio::test]
-    async fn process_stream_keeps_usage_when_delta_omits_prompt() {
-        // Real Anthropic: message_delta has no input_tokens at all; the
-        // message_start value must survive the merge rather than be zeroed.
-        let bus = EventBus::new(16);
-        let engine = LlmEngine::new(Arc::new(StubProvider("x")), bus.clone());
-        let chunks = vec![
-            Ok(StreamChunk::Usage(UsageInfo {
-                prompt_tokens: Some(5),
-                completion_tokens: Some(1),
-                total_tokens: None,
-                reasoning_tokens: None,
-            })),
-            Ok(StreamChunk::Usage(UsageInfo {
-                prompt_tokens: None,
-                completion_tokens: Some(26),
-                total_tokens: None,
-                reasoning_tokens: None,
-            })),
-            Ok(StreamChunk::Stop {
-                finish_reason: Some("end_turn".into()),
-            }),
-        ];
-        let stream = Box::pin(futures_util::stream::iter(chunks));
-        let mut rx = bus.subscribe();
-        let noop = std::sync::Arc::new(std::sync::Mutex::new(|_e: RuntimeEvent| Ok(())));
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let result = engine
-            .process_stream(
-                &SessionId::new(1),
-                stream,
-                tracing::Span::none(),
-                &mut rx,
-                noop,
-                &cancel,
-            )
-            .await
-            .unwrap();
-
-        let usage = result.usage.unwrap();
-        assert_eq!(
-            usage.prompt_tokens,
-            Some(5),
-            "prompt survives a partial delta"
-        );
-        assert_eq!(usage.completion_tokens, Some(26));
-    }
-
-    #[tokio::test]
-    async fn process_stream_aggregates_tool_calls() {
-        let bus = EventBus::new(16);
-        let engine = LlmEngine::new(Arc::new(StubProvider("x")), bus.clone());
-        let chunks = vec![
-            Ok(StreamChunk::ToolCall(serde_json::json!({
-                "delta": { "tool_calls": [
-                    { "index": 0, "id": "call_1", "function": { "name": "shell", "arguments": "{\"cmd\":" } }
-                ] }
-            }))),
-            Ok(StreamChunk::ToolCall(serde_json::json!({
-                "delta": { "tool_calls": [
-                    { "index": 0, "function": { "arguments": "\"ls\"" } }
-                ] }
-            }))),
-        ];
-        let stream = Box::pin(futures_util::stream::iter(chunks));
-        let mut rx = bus.subscribe();
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let result = engine
-            .process_stream(
-                &SessionId::new(1),
-                stream,
-                tracing::Span::none(),
-                &mut rx,
-                std::sync::Arc::new(std::sync::Mutex::new(|_e| Ok(()))),
-                &cancel,
-            )
-            .await
-            .unwrap();
-
-        assert!(result.is_tool_call);
-        assert!(result.full_text.is_empty());
-        assert_eq!(result.tool_calls.len(), 1);
-        let tc = &result.tool_calls[0];
-        assert_eq!(tc["id"].as_str(), Some("call_1"));
-        assert_eq!(tc["type"].as_str(), Some("function"));
-        assert_eq!(tc["function"]["name"].as_str(), Some("shell"));
-        assert_eq!(
-            tc["function"]["arguments"].as_str(),
-            Some("{\"cmd\":\"ls\"")
-        );
-    }
-
-    #[tokio::test]
-    async fn process_stream_emits_throttled_tool_call_drafts() {
-        // Tool-call args arrive as fragments and are invisible to every
-        // consumer until the stream drains — multi-KB briefs (spawn_agent)
-        // were a tens-of-seconds black hole (session 20261006_9264ba3e).
-        // The draft is the liveness signal: throttled to slot creation,
-        // name arrival and each 512-char args bucket — never per fragment,
-        // and never carrying the args themselves.
-        let bus = EventBus::new(16);
-        let engine = LlmEngine::new(Arc::new(StubProvider("x")), bus.clone());
-        let args_400 = "x".repeat(400);
-        let args_200 = "y".repeat(200);
-        let args_50 = "z".repeat(50);
-        let chunks = vec![
-            // Fresh slot + name → one draft.
-            Ok(StreamChunk::ToolCall(serde_json::json!({
-                "delta": { "tool_calls": [
-                    { "index": 0, "id": "call_1", "function": { "name": "spawn_agent", "arguments": args_400 } }
-                ] }
-            }))),
-            // +200 chars → crosses the 512 bucket → one draft.
-            Ok(StreamChunk::ToolCall(serde_json::json!({
-                "delta": { "tool_calls": [
-                    { "index": 0, "function": { "arguments": args_200 } }
-                ] }
-            }))),
-            // +50 chars → inside the same bucket → silent.
-            Ok(StreamChunk::ToolCall(serde_json::json!({
-                "delta": { "tool_calls": [
-                    { "index": 0, "function": { "arguments": args_50 } }
-                ] }
-            }))),
-            // Second call: fresh slot + name → one draft, count 2.
-            Ok(StreamChunk::ToolCall(serde_json::json!({
-                "delta": { "tool_calls": [
-                    { "index": 1, "id": "call_2", "function": { "name": "shell", "arguments": "{}" } }
-                ] }
-            }))),
-        ];
-        let stream = Box::pin(futures_util::stream::iter(chunks));
-        let mut rx = bus.subscribe();
-        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let events_clone = events.clone();
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let result = engine
-            .process_stream(
-                &SessionId::new(1),
-                stream,
-                tracing::Span::none(),
-                &mut rx,
-                std::sync::Arc::new(std::sync::Mutex::new(move |e| {
-                    events_clone.lock().unwrap().push(e);
-                    Ok(())
-                })),
-                &cancel,
-            )
-            .await
-            .unwrap();
-        assert_eq!(result.tool_calls.len(), 2);
-
-        let events = events.lock().unwrap();
-        let drafts: Vec<(usize, String, usize, usize)> = events
-            .iter()
-            .filter_map(|e| match e {
-                RuntimeEvent::ActionDraft {
-                    index,
-                    name,
-                    args_len,
-                    count,
-                    ..
-                } => Some((*index, name.clone(), *args_len, *count)),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            drafts,
-            vec![
-                (0, "spawn_agent".to_string(), 400, 1),
-                (0, "spawn_agent".to_string(), 600, 1),
-                (1, "shell".to_string(), 2, 2),
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn process_stream_emits_text_after_tool_call_chunks() {
-        // Regression: the old gate `!aggregator.is_tool_call` suppressed every
-        // TextDelta/ThoughtDelta after the first tool_call chunk, but
-        // aggregator.full_text still accumulated them — the user saw nothing
-        // while the model context carried the text (user sees ≠ model sees,
-        // session 20260904_efad759c: 2935 chars of prose rendered nowhere).
-        let bus = EventBus::new(16);
-        let engine = LlmEngine::new(Arc::new(StubProvider("x")), bus.clone());
-        let chunks = vec![
-            Ok(StreamChunk::Text("before".into())),
-            Ok(StreamChunk::ToolCall(serde_json::json!({
-                "delta": { "tool_calls": [
-                    { "index": 0, "id": "call_1", "function": { "name": "shell", "arguments": "{}" } }
-                ] }
-            }))),
-            Ok(StreamChunk::Text("interleaved".into())),
-            Ok(StreamChunk::Thought("late thought".into())),
-        ];
-        let stream = Box::pin(futures_util::stream::iter(chunks));
-        let mut rx = bus.subscribe();
-        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let events_clone = events.clone();
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let result = engine
-            .process_stream(
-                &SessionId::new(1),
-                stream,
-                tracing::Span::none(),
-                &mut rx,
-                std::sync::Arc::new(std::sync::Mutex::new(move |e| {
-                    events_clone.lock().unwrap().push(e);
-                    Ok(())
-                })),
-                &cancel,
-            )
-            .await
-            .unwrap();
-
-        assert!(result.is_tool_call);
-        assert_eq!(result.full_text, "beforeinterleaved");
-
-        let events = events.lock().unwrap();
-        let texts: Vec<&str> = events
-            .iter()
-            .filter_map(|e| match e {
-                RuntimeEvent::TextDelta { text, .. } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(texts, vec!["before", "interleaved"]);
-        let thoughts: Vec<&str> = events
-            .iter()
-            .filter_map(|e| match e {
-                RuntimeEvent::ThoughtDelta { text, .. } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(thoughts, vec!["late thought"]);
-    }
-
-    #[tokio::test]
-    async fn process_stream_flags_reasoning_only_without_promoting() {
-        let bus = EventBus::new(16);
-        let engine = LlmEngine::new(Arc::new(StubProvider("x")), bus.clone());
-        let chunks = vec![Ok(StreamChunk::Thought("deep thought".into()))];
-        let stream = Box::pin(futures_util::stream::iter(chunks));
-        let mut rx = bus.subscribe();
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let result = engine
-            .process_stream(
-                &SessionId::new(1),
-                stream,
-                tracing::Span::none(),
-                &mut rx,
-                std::sync::Arc::new(std::sync::Mutex::new(|_e| Ok(()))),
-                &cancel,
-            )
-            .await
-            .unwrap();
-
-        // Reasoning must NOT be promoted into the answer text.
-        assert_eq!(result.full_text, "");
-        assert_eq!(result.reasoning_text, "deep thought");
-        assert!(!result.is_tool_call);
-        assert!(result.reasoning_only, "reasoning-only should be flagged");
-    }
-
-    #[tokio::test]
-    async fn process_stream_keeps_reasoning_on_tool_call_turns() {
-        // Issue #32 regression anchor at the stream-result boundary: a turn
-        // that carries both Thought chunks and a tool call must keep the
-        // reasoning text in the result. `thinking_bytes` is derived from this
-        // string (same UTF-8 byte source as the `reasoning_len` log field),
-        // so an empty reasoning_text here is what zeroed the metric on every
-        // tool-call turn (session 20260927_4180845c: 27x undercount).
-        let bus = EventBus::new(16);
-        let engine = LlmEngine::new(Arc::new(StubProvider("x")), bus.clone());
-        let chunks = vec![
-            Ok(StreamChunk::Thought("why this tool, now".into())),
-            Ok(StreamChunk::ToolCall(serde_json::json!({
-                "delta": { "tool_calls": [
-                    { "index": 0, "id": "call_1", "function": { "name": "shell", "arguments": "{}" } }
-                ] }
-            }))),
-            Ok(StreamChunk::Thought("...and what it should do".into())),
-            Ok(StreamChunk::Stop {
-                finish_reason: Some("tool_calls".to_string()),
-            }),
-        ];
-        let stream = Box::pin(futures_util::stream::iter(chunks));
-        let mut rx = bus.subscribe();
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let result = engine
-            .process_stream(
-                &SessionId::new(1),
-                stream,
-                tracing::Span::none(),
-                &mut rx,
-                std::sync::Arc::new(std::sync::Mutex::new(|_e| Ok(()))),
-                &cancel,
-            )
-            .await
-            .unwrap();
-
-        assert!(result.is_tool_call);
-        assert!(!result.reasoning_only);
-        assert_eq!(
-            result.reasoning_text,
-            "why this tool, now...and what it should do"
-        );
-        // UTF-8 bytes — the unit `thinking_bytes` reports downstream.
-        assert_eq!(
-            result.reasoning_text.len(),
-            "why this tool, now".len() + "...and what it should do".len()
-        );
-    }
-
-    #[tokio::test]
-    async fn process_stream_propagates_error() {
-        let bus = EventBus::new(16);
-        let engine = LlmEngine::new(Arc::new(StubProvider("x")), bus.clone());
-        let chunks = vec![
-            Ok(StreamChunk::Text("partial".into())),
-            Err(AgentError::internal("boom")),
-        ];
-        let stream = Box::pin(futures_util::stream::iter(chunks));
-        let mut rx = bus.subscribe();
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let err = engine
-            .process_stream(
-                &SessionId::new(1),
-                stream,
-                tracing::Span::none(),
-                &mut rx,
-                std::sync::Arc::new(std::sync::Mutex::new(|_e| Ok(()))),
-                &cancel,
-            )
-            .await
-            .err()
-            .expect("stream should error");
-        assert!(err.to_string().contains("boom"));
-    }
-
-    #[tokio::test]
-    async fn process_stream_cancelled() {
-        let bus = EventBus::new(16);
-        let engine = LlmEngine::new(Arc::new(StubProvider("x")), bus.clone());
-        let stream: Pin<Box<dyn Stream<Item = AgentResult<StreamChunk>> + Send>> =
-            Box::pin(futures_util::stream::pending());
-        let mut rx = bus.subscribe();
-        let cancel = tokio_util::sync::CancellationToken::new();
-        cancel.cancel();
-        let err = engine
-            .process_stream(
-                &SessionId::new(1),
-                stream,
-                tracing::Span::none(),
-                &mut rx,
-                std::sync::Arc::new(std::sync::Mutex::new(|_e| Ok(()))),
-                &cancel,
-            )
-            .await
-            .err()
-            .expect("stream should error");
-        assert!(matches!(err, AgentError::Cancelled));
-    }
-
-    // ── B5: chat_stream + retry + remaining process_stream branches ────────
-
-    /// A provider whose `stream()` always fails.
-    struct AlwaysFail;
-
-    #[async_trait]
-    impl LlmProvider for AlwaysFail {
-        async fn stream(&self, _request: ChatRequest) -> Result<ChatStream, LlmError> {
-            Err(LlmError::Llm("api down".into()))
-        }
-
-        async fn chat(&self, _request: ChatRequest) -> Result<llm_trait::ChatResponse, LlmError> {
-            Err(LlmError::Llm("api down".into()))
-        }
-
-        fn capabilities(&self) -> Capabilities {
-            Capabilities::default()
-        }
-
-        fn info(&self) -> ProviderInfo {
-            ProviderInfo {
-                name: "always-fail".to_string(),
-                model: "always-fail".to_string(),
-                version: None,
-            }
-        }
-    }
-
-    /// A provider that fails the first `n` `stream()` calls, then succeeds.
-    struct FailThenSucceed {
-        remaining: std::sync::Mutex<usize>,
-    }
-
-    impl FailThenSucceed {
-        fn new(failures: usize) -> Self {
-            Self {
-                remaining: std::sync::Mutex::new(failures),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl LlmProvider for FailThenSucceed {
-        async fn stream(&self, _request: ChatRequest) -> Result<ChatStream, LlmError> {
-            let mut remaining = self.remaining.lock().unwrap();
-            if *remaining > 0 {
-                *remaining -= 1;
-                Err(LlmError::Llm("transient".into()))
-            } else {
-                Ok(ChatStream::new(Box::pin(futures_util::stream::empty())))
-            }
-        }
-
-        async fn chat(&self, _request: ChatRequest) -> Result<llm_trait::ChatResponse, LlmError> {
-            Err(LlmError::Llm("not implemented".into()))
-        }
-
-        fn capabilities(&self) -> Capabilities {
-            Capabilities::default()
-        }
-
-        fn info(&self) -> ProviderInfo {
-            ProviderInfo {
-                name: "fail-then-succeed".to_string(),
-                model: "fail-then-succeed".to_string(),
-                version: None,
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn chat_stream_returns_stream_on_ok() {
-        let engine = LlmEngine::new(Arc::new(StubProvider("x")), EventBus::new(16));
-        let mut stream = engine
-            .chat_stream(
-                &[],
-                &[],
-                None,
-                None,
-                false,
-                &tokio_util::sync::CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        let next = futures_util::StreamExt::next(&mut stream).await;
-        assert!(next.is_none());
-    }
-
-    #[tokio::test]
-    async fn chat_stream_with_thinking_disabled() {
-        let engine = LlmEngine::new(Arc::new(StubProvider("x")), EventBus::new(16));
-        // Test with thinking_disabled=true — should still work, just without reasoning
-        let mut stream = engine
-            .chat_stream(
-                &[],
-                &[],
-                None,
-                None,
-                true,
-                &tokio_util::sync::CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        let next = futures_util::StreamExt::next(&mut stream).await;
-        assert!(next.is_none());
-    }
-
-    #[tokio::test]
-    async fn chat_stream_forwards_error() {
-        let engine = LlmEngine::new(Arc::new(AlwaysFail), EventBus::new(16));
-        let err = engine
-            .chat_stream(
-                &[],
-                &[],
-                None,
-                None,
-                false,
-                &tokio_util::sync::CancellationToken::new(),
-            )
-            .await
-            .err()
-            .expect("should fail");
-        assert!(err.to_string().contains("api down"));
-    }
-
-    #[tokio::test]
-    async fn run_llm_turn_retries_then_succeeds() {
-        let engine = LlmEngine::new(Arc::new(FailThenSucceed::new(2)), EventBus::new(16));
-        let cfg = RetryConfig {
-            max_retries: 3,
-            initial_backoff_ms: 1,
-            max_backoff_ms: 1000,
-            backoff_multiplier: 2.0,
-            jitter: false,
-        };
-        let _stream = engine
-            .run_llm_turn_with_retry(
-                &SessionId::new(1),
-                &[],
-                &[],
-                None,
-                None,
-                cfg,
-                false,
-                &tokio_util::sync::CancellationToken::new(),
-            )
-            .await
-            .expect("should succeed after retries");
-    }
-
-    #[tokio::test]
-    async fn run_llm_turn_retries_exhausted() {
-        let engine = LlmEngine::new(Arc::new(FailThenSucceed::new(100)), EventBus::new(16));
-        let cfg = RetryConfig {
-            max_retries: 2,
-            initial_backoff_ms: 1,
-            max_backoff_ms: 1,
-            backoff_multiplier: 2.0,
-            jitter: false,
-        };
-        let err = engine
-            .run_llm_turn_with_retry(
-                &SessionId::new(1),
-                &[],
-                &[],
-                None,
-                None,
-                cfg,
-                false,
-                &tokio_util::sync::CancellationToken::new(),
-            )
-            .await
-            .err()
-            .expect("should be exhausted");
-        assert!(err.to_string().contains("transient"));
-    }
-
-    #[tokio::test]
-    async fn chat_stream_cancelled_while_awaiting_response() {
-        // A provider whose `stream()` never resolves — the shape of a silent
-        // network drop while waiting for response headers. Cancelling must
-        // abort the wait instead of hanging forever.
-        struct NeverResolves;
-
-        #[async_trait]
-        impl LlmProvider for NeverResolves {
-            async fn stream(&self, _request: ChatRequest) -> Result<ChatStream, LlmError> {
-                std::future::pending().await
-            }
-
-            async fn chat(
-                &self,
-                _request: ChatRequest,
-            ) -> Result<llm_trait::ChatResponse, LlmError> {
-                Err(LlmError::Llm("not implemented".into()))
-            }
-
-            fn capabilities(&self) -> Capabilities {
-                Capabilities::default()
-            }
-
-            fn info(&self) -> ProviderInfo {
-                ProviderInfo {
-                    name: "never-resolves".to_string(),
-                    model: "never-resolves".to_string(),
-                    version: None,
-                }
-            }
-        }
-
-        let engine = LlmEngine::new(Arc::new(NeverResolves), EventBus::new(16));
-        let token = tokio_util::sync::CancellationToken::new();
-        let fut = engine.chat_stream(&[], &[], None, None, false, &token);
-        tokio::pin!(fut);
-        token.cancel();
-        let err = tokio::time::timeout(std::time::Duration::from_secs(5), fut)
-            .await
-            .expect("chat_stream must resolve after cancel")
-            .err()
-            .expect("must be cancelled");
-        assert!(err.is_cancelled(), "expected Cancelled, got: {err}");
-    }
-
-    #[tokio::test]
-    async fn process_stream_tool_call_missing_delta_continues() {
-        let bus = EventBus::new(16);
-        let engine = LlmEngine::new(Arc::new(StubProvider("x")), bus.clone());
-        let chunks = vec![
-            Ok(StreamChunk::ToolCall(
-                serde_json::json!({ "no_delta": true }),
-            )),
-            Ok(StreamChunk::Stop {
-                finish_reason: Some("stop".into()),
-            }),
-        ];
-        let stream = Box::pin(futures_util::stream::iter(chunks));
-        let mut rx = bus.subscribe();
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let result = engine
-            .process_stream(
-                &SessionId::new(1),
-                stream,
-                tracing::Span::none(),
-                &mut rx,
-                std::sync::Arc::new(std::sync::Mutex::new(|_e| Ok(()))),
-                &cancel,
-            )
-            .await
-            .unwrap();
-        assert!(result.is_tool_call);
-        assert!(result.tool_calls.is_empty());
-    }
-
-    #[tokio::test]
-    async fn process_stream_tool_call_empty_id_and_name_ignored() {
-        let bus = EventBus::new(16);
-        let engine = LlmEngine::new(Arc::new(StubProvider("x")), bus.clone());
-        let chunks = vec![Ok(StreamChunk::ToolCall(serde_json::json!({
-            "delta": { "tool_calls": [
-                { "index": 0, "id": "", "function": { "name": "", "arguments": "{}" } }
-            ] }
-        })))];
-        let stream = Box::pin(futures_util::stream::iter(chunks));
-        let mut rx = bus.subscribe();
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let result = engine
-            .process_stream(
-                &SessionId::new(1),
-                stream,
-                tracing::Span::none(),
-                &mut rx,
-                std::sync::Arc::new(std::sync::Mutex::new(|_e| Ok(()))),
-                &cancel,
-            )
-            .await
-            .unwrap();
-        // A bucket that carries an index but never a function name is a
-        // phantom fragment some OpenAI-compatible providers emit. It must NOT
-        // surface as a tool call — kept, it becomes a name-less assistant
-        // tool_call and the NEXT request is rejected HTTP 400 "missing a
-        // function name". The stream is fully drained here, so an empty name
-        // at assembly time is permanent, not a name that arrives later.
-        assert_eq!(result.tool_calls.len(), 0);
-    }
-
-    #[tokio::test]
-    async fn process_stream_stop_none_finish_reason_ignored() {
-        let bus = EventBus::new(16);
-        let engine = LlmEngine::new(Arc::new(StubProvider("x")), bus.clone());
-        let chunks = vec![
-            Ok(StreamChunk::Stop {
-                finish_reason: Some("length".into()),
-            }),
-            Ok(StreamChunk::Stop {
-                finish_reason: None,
-            }),
-        ];
-        let stream = Box::pin(futures_util::stream::iter(chunks));
-        let mut rx = bus.subscribe();
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let result = engine
-            .process_stream(
-                &SessionId::new(1),
-                stream,
-                tracing::Span::none(),
-                &mut rx,
-                std::sync::Arc::new(std::sync::Mutex::new(|_e| Ok(()))),
-                &cancel,
-            )
-            .await
-            .unwrap();
-        assert_eq!(result.finish_reason.as_deref(), Some("length"));
-    }
-
-    #[test]
-    fn emit_text_delta_emits_event() {
-        let bus = EventBus::new(16);
-        let engine = LlmEngine::new(Arc::new(StubProvider("x")), bus.clone());
-        let mut rx = bus.subscribe();
-        engine.emit_text_delta(&SessionId::new(1), "hello".into());
-        let ev = rx.try_recv().expect("event should be emitted");
-        assert!(matches!(ev, RuntimeEvent::TextDelta { text, .. } if text == "hello"));
-    }
-
-    fn one_picture() -> llm_trait::ImageAttachment {
-        llm_trait::ImageAttachment::Base64 {
-            data: "aGVsbG8=".to_string(),
-            media_type: Some("image/png".to_string()),
-            detail: None,
-        }
-    }
-
-    #[test]
-    fn only_the_newest_pictures_reach_the_wire() {
-        let mut messages = vec![
-            ChatMessage::user("look at the board"),
-            ChatMessage::tool_with_images("t1", "shot 1", vec![one_picture()]),
-            ChatMessage::tool_with_images("t2", "shot 2", vec![one_picture()]),
-            ChatMessage::tool_with_images("t3", "shot 3", vec![one_picture()]),
-        ];
-        bound_wire_images(&mut messages);
-
-        let ChatMessage::Tool {
-            images: oldest,
-            content: oldest_text,
-            ..
-        } = &messages[1]
-        else {
-            panic!("expected a tool result");
-        };
-        assert!(oldest.is_empty(), "the oldest picture is off the wire");
-        assert!(
-            oldest_text.contains("not attached to this request"),
-            "the omission is spoken, never silent: {oldest_text}"
-        );
-        assert!(
-            oldest_text.starts_with("shot 1"),
-            "the text face survives intact: {oldest_text}"
-        );
-        for i in [2, 3] {
-            let ChatMessage::Tool { images, .. } = &messages[i] else {
-                panic!("expected a tool result");
-            };
-            assert_eq!(images.len(), 1, "the newest two keep their pictures");
-        }
-    }
-
-    #[test]
-    fn a_word_only_history_is_untouched() {
-        let mut messages = vec![
-            ChatMessage::user("hi"),
-            ChatMessage::tool("t1", "done"),
-            ChatMessage::assistant("ok"),
-        ];
-        let before = format!("{messages:?}");
-        bound_wire_images(&mut messages);
-        assert_eq!(format!("{messages:?}"), before);
-    }
-
-    #[test]
-    fn a_picture_batch_keeps_all_or_none() {
-        let mut messages = vec![
-            ChatMessage::tool_with_images("t1", "older", vec![one_picture()]),
-            ChatMessage::tool_with_images(
-                "t2",
-                "a fresh batch of three",
-                vec![one_picture(), one_picture(), one_picture()],
-            ),
-        ];
-        bound_wire_images(&mut messages);
-
-        let ChatMessage::Tool {
-            images, content, ..
-        } = &messages[1]
-        else {
-            panic!("expected a tool result");
-        };
-        assert!(
-            images.is_empty(),
-            "three pictures do not fit a budget of two"
-        );
-        assert!(
-            content.contains("3 image(s)"),
-            "the count is named: {content}"
-        );
-        let ChatMessage::Tool { images, .. } = &messages[0] else {
-            panic!("expected a tool result");
-        };
-        assert!(
-            images.is_empty(),
-            "once the newest does not fit, older pictures never jump the queue"
-        );
-    }
-
-    #[test]
-    fn the_request_leaves_the_throat_already_bounded() {
-        let messages = vec![
-            ChatMessage::tool_with_images("t1", "shot 1", vec![one_picture()]),
-            ChatMessage::tool_with_images("t2", "shot 2", vec![one_picture()]),
-            ChatMessage::tool_with_images("t3", "shot 3", vec![one_picture()]),
-        ];
-        let request = build_chat_request(&messages, &[], None, None, false, None);
-        assert_eq!(
-            request.messages.len(),
-            messages.len(),
-            "nothing is discarded, only trimmed"
-        );
-        let carried: usize = request
-            .messages
-            .iter()
-            .map(|m| match m {
-                ChatMessage::Tool { images, .. } | ChatMessage::User { images, .. } => images.len(),
-                _ => 0,
-            })
-            .sum();
-        assert_eq!(carried, MAX_WIRE_IMAGES, "the throat applies the bound");
-    }
-}
+mod image_tests;
+#[cfg(test)]
+mod tests;

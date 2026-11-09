@@ -8,7 +8,7 @@ use crate::engine::runtime::is_self_echo_user_event;
 use crate::engine::runtime::plan_runner::RuntimeCore;
 use crate::types::{
     ActionFormat, ActionOutcome, AgentError, AgentResult, CheckpointData, CheckpointStep,
-    MessageRole, RunOutcome, RuntimeEvent, SessionId,
+    ImageAttachment, MessageRole, RunOutcome, RuntimeEvent, SessionId,
 };
 
 /// Drain events from a `broadcast::Receiver` and invoke a `Mutex<FnMut>` callback
@@ -50,6 +50,28 @@ where
         }
     }
     Ok(())
+}
+
+/// Publish the terminal `RunCancelled` on the event bus, then loop it back to
+/// the run's own `on_event` callback via [`drain_locked`] — the same delivery
+/// contract as `RunFinished` (bus first, loopback second). External
+/// subscribers (`subscribe_runtime_events`) must see the cancellation; the
+/// run's recorder gets its copy from the loopback like every other event.
+fn emit_run_cancelled<F>(
+    runtime: &RuntimeCore,
+    session_id: &SessionId,
+    event_rx: &mut broadcast::Receiver<RuntimeEvent>,
+    on_event: &Mutex<F>,
+) -> AgentResult<()>
+where
+    F: FnMut(RuntimeEvent) -> AgentResult<()>,
+{
+    runtime.event_bus.emit(RuntimeEvent::RunCancelled {
+        session_id: session_id.clone(),
+        agent_id: None,
+        trace_id: None,
+    });
+    drain_locked(event_rx, on_event)
 }
 
 /// Provenance of a turn's user input: how it is pushed into the transcript
@@ -137,22 +159,10 @@ impl RuntimeCore {
         // Emit RunCancelled if cancelled, RunFinished otherwise (same as run_turn)
         match &result {
             Ok((RunOutcome::Cancelled, _)) => {
-                if let Ok(mut cb) = on_event.lock() {
-                    cb(RuntimeEvent::RunCancelled {
-                        session_id: session_id.clone(),
-                        agent_id: None,
-                        trace_id: None,
-                    })?;
-                }
+                emit_run_cancelled(self, &session_id, &mut event_rx, &on_event)?;
             }
             Err(e) if e.is_cancelled() => {
-                if let Ok(mut cb) = on_event.lock() {
-                    cb(RuntimeEvent::RunCancelled {
-                        session_id: session_id.clone(),
-                        agent_id: None,
-                        trace_id: None,
-                    })?;
-                }
+                emit_run_cancelled(self, &session_id, &mut event_rx, &on_event)?;
             }
             _ => {
                 // Notice pump (Batch E): deliver guard/mechanism notices
@@ -192,8 +202,39 @@ impl RuntimeCore {
     where
         F: FnMut(RuntimeEvent) -> AgentResult<()> + Send + 'static,
     {
-        self.run_turn_impl(session_id, user_input, UserInputKind::Real, on_event)
-            .await
+        self.run_turn_impl(
+            session_id,
+            user_input,
+            UserInputKind::Real,
+            Vec::new(),
+            on_event,
+        )
+        .await
+    }
+
+    /// Like `run_turn`, but the user message carries pictures (the paste
+    /// pipeline's face): the images ride the message through the existing
+    /// vision channel as [`ImageAttachment`]s. They land in the session's
+    /// history with the text — the wire budget shrinks and judges them at
+    /// send time.
+    pub async fn run_turn_with_images<F>(
+        &self,
+        session_id: SessionId,
+        user_input: &str,
+        images: Vec<ImageAttachment>,
+        on_event: F,
+    ) -> AgentResult<RunOutcome>
+    where
+        F: FnMut(RuntimeEvent) -> AgentResult<()> + Send + 'static,
+    {
+        self.run_turn_impl(
+            session_id,
+            user_input,
+            UserInputKind::Real,
+            images,
+            on_event,
+        )
+        .await
     }
 
     /// Like `run_turn`, but the user input is pushed as an **ephemeral**
@@ -211,8 +252,14 @@ impl RuntimeCore {
     where
         F: FnMut(RuntimeEvent) -> AgentResult<()> + Send + 'static,
     {
-        self.run_turn_impl(session_id, user_input, UserInputKind::Ephemeral, on_event)
-            .await
+        self.run_turn_impl(
+            session_id,
+            user_input,
+            UserInputKind::Ephemeral,
+            Vec::new(),
+            on_event,
+        )
+        .await
     }
 
     /// Like `run_turn`, but the input is **synthetic**: machine-composed
@@ -229,8 +276,14 @@ impl RuntimeCore {
     where
         F: FnMut(RuntimeEvent) -> AgentResult<()> + Send + 'static,
     {
-        self.run_turn_impl(session_id, user_input, UserInputKind::Synthetic, on_event)
-            .await
+        self.run_turn_impl(
+            session_id,
+            user_input,
+            UserInputKind::Synthetic,
+            Vec::new(),
+            on_event,
+        )
+        .await
     }
 
     async fn run_turn_impl<F>(
@@ -238,6 +291,7 @@ impl RuntimeCore {
         session_id: SessionId,
         user_input: &str,
         input_kind: UserInputKind,
+        images: Vec<ImageAttachment>,
         on_event: F,
     ) -> AgentResult<RunOutcome>
     where
@@ -272,6 +326,32 @@ impl RuntimeCore {
             }
         };
 
+        // Turn-input size gate (the safety valve's visible face): the valve
+        // pops an oversized message at push time, which for the turn's own
+        // input means the user's words silently vanish and the turn runs on
+        // nothing. Refuse the turn BEFORE the push instead, with the size
+        // spelled out — the same voice as the image budget's "NOT sent".
+        {
+            let est = crate::engine::context::ContextWindowManager::user_message_tokens(
+                &user_input_owned,
+                &images,
+            );
+            let limit = self.config.read().await.session.max_message_tokens;
+            if let Some(max) = limit
+                && est > max
+            {
+                let _ = on_event.lock().unwrap()(RuntimeEvent::RunFinished {
+                    session_id: session_id.clone(),
+                    agent_id: None,
+                    trace_id: None,
+                });
+                return Err(AgentError::llm(format!(
+                    "message NOT sent - too large for one turn (about {est} tokens, limit {max}); \
+                     split it into smaller messages or send the pictures across fewer turns"
+                )));
+            }
+        }
+
         // Reset the run-level counting state for the new turn
         if let Err(e) = self
             .with_session_mut(&session_id, |session| {
@@ -293,7 +373,13 @@ impl RuntimeCore {
             .with_session_mut(&session_id, |session| {
                 match input_kind {
                     UserInputKind::Real => {
-                        session.push_message(MessageRole::User, &user_input_owned);
+                        if images.is_empty() {
+                            session.push_message(MessageRole::User, &user_input_owned);
+                        } else {
+                            // The paste pipeline's face: the pictures ride the
+                            // user message through the vision channel.
+                            session.push_user_message_with_images(&user_input_owned, images);
+                        }
                     }
                     UserInputKind::Ephemeral => {
                         session.push_message_ephemeral(MessageRole::User, &user_input_owned);
@@ -354,22 +440,10 @@ impl RuntimeCore {
         // Emit RunCancelled event if cancelled
         match &result {
             Ok((RunOutcome::Cancelled, _)) => {
-                if let Ok(mut cb) = on_event.lock() {
-                    cb(RuntimeEvent::RunCancelled {
-                        session_id: session_id.clone(),
-                        agent_id: None,
-                        trace_id: None,
-                    })?;
-                }
+                emit_run_cancelled(self, &session_id, &mut event_rx, &on_event)?;
             }
             Err(e) if e.is_cancelled() => {
-                if let Ok(mut cb) = on_event.lock() {
-                    cb(RuntimeEvent::RunCancelled {
-                        session_id: session_id.clone(),
-                        agent_id: None,
-                        trace_id: None,
-                    })?;
-                }
+                emit_run_cancelled(self, &session_id, &mut event_rx, &on_event)?;
             }
             _ => {}
         }
@@ -574,22 +648,10 @@ impl RuntimeCore {
         // Emit RunCancelled if cancelled, same as run_turn
         match &result {
             Ok((RunOutcome::Cancelled, _)) => {
-                if let Ok(mut cb) = on_event.lock() {
-                    cb(RuntimeEvent::RunCancelled {
-                        session_id: session_id.clone(),
-                        agent_id: None,
-                        trace_id: None,
-                    })?;
-                }
+                emit_run_cancelled(self, &session_id, &mut event_rx, &on_event)?;
             }
             Err(e) if e.is_cancelled() => {
-                if let Ok(mut cb) = on_event.lock() {
-                    cb(RuntimeEvent::RunCancelled {
-                        session_id: session_id.clone(),
-                        agent_id: None,
-                        trace_id: None,
-                    })?;
-                }
+                emit_run_cancelled(self, &session_id, &mut event_rx, &on_event)?;
             }
             _ => {}
         }
@@ -725,13 +787,7 @@ impl RuntimeCore {
             // Emit RunCancelled if cancelled
             let is_cancelled = matches!(&result, Err(e) if e.is_cancelled());
             if is_cancelled {
-                if let Ok(mut cb) = on_event.lock() {
-                    cb(RuntimeEvent::RunCancelled {
-                        session_id: session_id.clone(),
-                        agent_id: None,
-                        trace_id: None,
-                    })?;
-                }
+                emit_run_cancelled(self, &session_id, &mut event_rx, &on_event)?;
                 self.cleanup_ephemeral(&session_id).await;
                 // Safe: we just checked it's Err and cancelled
                 return Err(result.unwrap_err());
@@ -739,13 +795,7 @@ impl RuntimeCore {
 
             // Emit RunCancelled for Ok(Cancelled) outcome
             if let Ok((RunOutcome::Cancelled, _)) = &result {
-                if let Ok(mut cb) = on_event.lock() {
-                    cb(RuntimeEvent::RunCancelled {
-                        session_id: session_id.clone(),
-                        agent_id: None,
-                        trace_id: None,
-                    })?;
-                }
+                emit_run_cancelled(self, &session_id, &mut event_rx, &on_event)?;
                 self.cleanup_ephemeral(&session_id).await;
                 return Ok(RunOutcome::Cancelled);
             }

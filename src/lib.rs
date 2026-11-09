@@ -1,4 +1,5 @@
 pub mod engine;
+pub mod image_ops;
 pub mod llm;
 pub mod tool;
 pub mod types;
@@ -46,7 +47,7 @@ pub use engine::{
     AllowAllApprovalHandler, ApprovalDecision, ApprovalHandler, ApprovalRequest, CompactionKind,
     CompactionOutcome, ConsecutiveFailureRecovery, ContextCompaction, ContextWindowManager,
     DenyAllApprovalHandler, GuardCtx, GuardDecision, Middleware, NoopGuard, NoticeHandle,
-    PostLlmCtx, PreLlmCtx, ReactLoopGuard, RetryOnError, RiskLevel, StopOnError,
+    PostLlmCtx, PreLlmCtx, ProviderHandle, ReactLoopGuard, RetryOnError, RiskLevel, StopOnError,
     ToolEnforcementConfig, ToolEnforcementMiddleware, ToolErrorAction, ToolErrorRecovery,
     TurnFactMiddleware, TurnToolLimitMiddleware, UserMessageCtx, estimate_messages_tokens,
     first_system_prompt,
