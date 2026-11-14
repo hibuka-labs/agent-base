@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-11-14
+
+### Added
+- **A notice can say "look at this" without saying "this failed."**
+  `NoticeKind` gains an `Attention` variant (amber) beside `Warning` (red).
+  The two answer different questions: red means something broke, amber means
+  a state change the human owns — a task blocked on a prompt, a decision
+  waiting. A product that only had `Warning` had to paint "waiting for you"
+  the same red as "this died", and the user learned to ignore both.
+
+### Changed
+- **Breaking (dependency):** `agent-types` requirement bumped from 0.6.0 to
+  0.7.0. The new enum variant is additive at the type level but breaks any
+  downstream `match` on `NoticeKind` that is not exhaustive — the whole family
+  is republished in one chain so a single `agent-types` version stays on the
+  graph.
+
+
+
 ## [0.13.0] - 2026-11-09
 
 ### Added

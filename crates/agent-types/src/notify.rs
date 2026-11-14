@@ -12,6 +12,12 @@ pub enum NoticeKind {
     Progress,
     /// Plain information line.
     Info,
+    /// Persistent attention line (amber), does not interrupt the turn.
+    ///
+    /// "Look at this" without "this failed": a task blocked on an
+    /// interactive prompt, a state change the human owns. Red stays the
+    /// face of things that broke ([`NoticeKind::Warning`]).
+    Attention,
 }
 
 /// Display-only notice from an engine mechanism.
@@ -38,6 +44,7 @@ mod tests {
             (NoticeKind::Warning, "warning"),
             (NoticeKind::Progress, "progress"),
             (NoticeKind::Info, "info"),
+            (NoticeKind::Attention, "attention"),
         ] {
             let v = serde_json::to_value(&kind).unwrap();
             assert_eq!(v, json!(tag));
