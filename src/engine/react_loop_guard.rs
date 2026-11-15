@@ -78,6 +78,7 @@ mod tests {
     async fn test_noop_guard_returns_complete() {
         let guard = NoopGuard;
         let ctx = GuardCtx {
+            run_actions: vec![],
             session_id: SessionId {
                 id: 1,
                 external_id: None,
@@ -119,6 +120,7 @@ mod tests {
             reasoning_only_strikes: 1,
             empty_response_strikes: 0,
             run_has_actions: false,
+            run_actions: vec![],
             last_tool_calls_invalid: false,
             all_user_inputs: vec!["test".to_string()],
             is_reasoning_only: true,

@@ -511,7 +511,10 @@ impl<'c> ToolCallExecutor<'c> {
         let run_state = self
             .core
             .with_session_mut(session_id, |session| {
-                session.run_state.record_actions(n);
+                session.run_state.record_actions(
+                    n,
+                    &tool_calls.iter().map(|c| c.1.clone()).collect::<Vec<_>>(),
+                );
                 session.run_state.clone()
             })
             .await?;

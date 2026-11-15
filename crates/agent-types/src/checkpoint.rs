@@ -804,7 +804,7 @@ mod tests {
         // D5+OV-11 事务同写: a native write always carries the counting state
         // alongside the step in one payload.
         let mut run_state = RunState::default();
-        run_state.record_actions(2);
+        run_state.record_actions(2, &[]);
         let data = CheckpointData::new(
             SessionId::with_external_id(42, "test-session"),
             "go",

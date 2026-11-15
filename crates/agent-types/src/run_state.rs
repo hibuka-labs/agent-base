@@ -47,6 +47,14 @@ pub struct RunState {
     /// to determine if actions were used before a text-only response.
     #[serde(default, alias = "run_has_tool_calls")]
     pub run_has_actions: bool,
+    /// The tools this run has called, in order, by name. The completion judge
+    /// is handed the response and nothing else, so without this it cannot tell
+    /// "the agent did the work and is reporting" from "the agent said a few
+    /// words and stopped" — both look like a short text-only turn.
+    /// Names only: no arguments, so nothing sensitive rides along.
+    /// Reset by [`reset_for_new_run`](Self::reset_for_new_run).
+    #[serde(default)]
+    pub run_actions: Vec<String>,
     /// Number of consecutive LLM turns that produced only reasoning_content
     /// (no text, no tool call). Reset to 0 when a normal response or tool call
     /// is produced. Used by the react loop to fail instead of looping forever
@@ -101,6 +109,7 @@ impl RunState {
     pub fn reset_for_new_run(&mut self) {
         self.turn_actions = 0;
         self.run_has_actions = false;
+        self.run_actions.clear();
         self.reasoning_only_strikes = 0;
         self.empty_response_strikes = 0;
         self.nudge_count = 0;
@@ -115,10 +124,11 @@ impl RunState {
     /// Counts them against both the turn and the session total (D5: one
     /// counting entry point, unit = actions) and resets reasoning_only_strikes,
     /// empty_response_strikes, and truncation_strikes.
-    pub fn record_actions(&mut self, n: usize) {
+    pub fn record_actions(&mut self, n: usize, names: &[String]) {
         self.turn_actions += n;
         self.total_actions += n;
         self.run_has_actions = true;
+        self.run_actions.extend_from_slice(names);
         self.reasoning_only_strikes = 0;
         self.empty_response_strikes = 0;
         self.truncation_strikes = 0;
@@ -158,6 +168,36 @@ impl RunState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Value: protects=the run's tool trace reaches the completion judge, so
+    /// it can tell "the agent did the work and is reporting" from "the agent
+    /// said a few words and stopped"; fails_when=the trace is dropped and the
+    /// judge sees only `user_input` + `model_response` again.
+    /// why_new=no test today records *which* actions ran — `record_actions`
+    /// takes a bare count.
+    /// seam=none; no_claim=judge quality from the trace alone.
+    #[test]
+    fn record_actions_keeps_the_tool_trace_and_a_new_run_clears_it() {
+        let mut s = RunState::default();
+        s.record_actions(
+            3,
+            &[
+                "read_file".into(),
+                "execute_command".into(),
+                "read_file".into(),
+            ],
+        );
+        assert_eq!(s.run_actions, ["read_file", "execute_command", "read_file"]);
+        assert_eq!(s.total_actions, 3);
+        assert!(s.run_has_actions);
+
+        s.reset_for_new_run();
+        assert!(
+            s.run_actions.is_empty(),
+            "a new run must start with an empty trace"
+        );
+        assert!(!s.run_has_actions);
+    }
 
     #[test]
     fn run_state_default() {
@@ -209,7 +249,7 @@ mod tests {
             ..RunState::default()
         };
 
-        rs.record_actions(3);
+        rs.record_actions(3, &[]);
 
         assert_eq!(rs.turn_actions, 3);
         assert_eq!(rs.total_actions, 3);
@@ -221,8 +261,8 @@ mod tests {
     #[test]
     fn run_state_record_actions_accumulates() {
         let mut rs = RunState::default();
-        rs.record_actions(2);
-        rs.record_actions(3);
+        rs.record_actions(2, &[]);
+        rs.record_actions(3, &[]);
 
         assert_eq!(rs.turn_actions, 5);
         assert_eq!(rs.total_actions, 5);
@@ -285,7 +325,7 @@ mod tests {
         assert_eq!(rs.reasoning_only_strikes, 1);
 
         // Branch 3: actions (should reset reasoning_only_strikes)
-        rs.record_actions(2);
+        rs.record_actions(2, &[]);
         assert_eq!(rs.reasoning_only_strikes, 0);
         assert_eq!(rs.turn_actions, 2);
 
@@ -364,7 +404,7 @@ mod tests {
 
         // Actions should NOT reset thinking_disabled_for_rest_of_run
         // (it should stay disabled for the rest of the run)
-        rs.record_actions(2);
+        rs.record_actions(2, &[]);
         assert!(rs.thinking_disabled_for_rest_of_run);
         assert_eq!(rs.reasoning_only_strikes, 0); // strikes reset, but thinking stays disabled
     }
@@ -390,7 +430,7 @@ mod tests {
     #[test]
     fn run_state_round_trips_under_the_new_wire_keys() {
         let mut rs = RunState::default();
-        rs.record_actions(3);
+        rs.record_actions(3, &[]);
         let json = serde_json::to_string(&rs).unwrap();
         assert!(json.contains("\"total_actions\":3"), "new key: {json}");
         assert!(json.contains("\"turn_actions\":3"), "new key: {json}");
@@ -447,7 +487,7 @@ mod proptest_tests {
         #[test]
         fn record_actions_accumulates(n in 0usize..100) {
             let mut rs = RunState::default();
-            rs.record_actions(n);
+            rs.record_actions(n, &[]);
             assert_eq!(rs.turn_actions, n);
             assert_eq!(rs.total_actions, n);
             assert!(rs.run_has_actions);

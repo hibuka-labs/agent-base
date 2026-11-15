@@ -388,7 +388,7 @@ fn set_chat_messages_leaves_counters_alone() {
     // recount. (Replaces `test_set_chat_messages_recalculates_total_tool_calls`,
     // a named D13 exception: the demotion is the designed behavior change.)
     let mut s = make_session();
-    s.run_state.record_actions(2);
+    s.run_state.record_actions(2, &[]);
     let msgs = vec![
         ChatMessage::user("do"),
         ChatMessage::assistant_tool_call("c1", "t", "{}"),

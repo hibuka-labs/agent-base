@@ -491,7 +491,10 @@ impl RuntimeCore {
                 //    batch ran to fates (D15), so it counts as one batch.
                 let run_state = self
                     .with_session_mut(session_id, |session| {
-                        session.run_state.record_actions(actions.len());
+                        session.run_state.record_actions(
+                            actions.len(),
+                            &actions.iter().map(|a| a.name.clone()).collect::<Vec<_>>(),
+                        );
                         session.run_state.clone()
                     })
                     .await?;

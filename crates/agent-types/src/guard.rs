@@ -48,6 +48,12 @@ pub struct GuardCtx {
     pub empty_response_strikes: usize,
     #[serde(alias = "run_has_tool_calls")]
     pub run_has_actions: bool,
+    /// The tools this run has called so far, in order, by name. A completion
+    /// judge handed only `user_input` and `model_response` cannot tell a report
+    /// from a shrug — both are a short text-only turn. This is the work it can
+    /// check the response against. Names only; nothing sensitive rides along.
+    #[serde(default)]
+    pub run_actions: Vec<String>,
     /// The most recent assistant tool calls were ALL rejected before
     /// execution (truncated/invalid arguments) and the model was told to
     /// re-issue them (`RunState.truncation_strikes > 0`). While this is
