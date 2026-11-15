@@ -57,9 +57,9 @@ pub use engine::{
 // Tools
 // ---------------------------------------------------------------------------
 pub use tool::{
-    ActivationContext, AutoContinueTool, Content, DenyAllToolPolicy, ExecClock, ExecPauseGuard,
-    Tool, ToolContext, ToolDecision, ToolExposure, ToolMetadata, ToolPolicy, ToolRegistry,
-    TypedTool, UpdatePlanTool,
+    ActivateTool, ActivationContext, AutoContinueTool, Content, DeferredTool, DenyAllToolPolicy,
+    ExecClock, ExecPauseGuard, Tool, ToolActivation, ToolContext, ToolDecision, ToolExposure,
+    ToolMetadata, ToolPolicy, ToolRegistry, TypedTool, UpdatePlanTool,
 };
 
 // ---------------------------------------------------------------------------

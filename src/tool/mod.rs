@@ -13,6 +13,16 @@ pub mod auto_continue;
 pub mod policy;
 pub mod update_plan;
 
+pub(crate) mod schema_budget;
+
+mod activate_tool;
+mod activation;
+mod deferred;
+
+pub use activate_tool::ActivateTool;
+pub use activation::ToolActivation;
+pub use deferred::DeferredTool;
+
 pub use auto_continue::AutoContinueTool;
 pub use update_plan::UpdatePlanTool;
 
@@ -302,8 +312,14 @@ pub trait Tool: Send + Sync {
     /// Called once per turn for each `Deferred` tool. Return `true` to
     /// include this tool in the model's tool list this turn. Ignored for
     /// `Direct` and `Hidden` tools.
-    fn should_activate(&self, _ctx: &ActivationContext) -> bool {
-        true
+    ///
+    /// The default makes `Deferred` mean what it says: open only once the model
+    /// has asked for this tool by name, via
+    /// [`crate::tool::ActivateTool`]. `ctx.current_tools` carries the names the
+    /// session has opened so far. Override only to auto-open on something else
+    /// — a workspace shape, a config flag — and say so in the override.
+    fn should_activate(&self, ctx: &ActivationContext) -> bool {
+        ctx.current_tools.iter().any(|n| n == self.name())
     }
 }
 
@@ -344,8 +360,9 @@ pub trait TypedTool: Send + Sync {
     }
 
     /// Activation condition for `Deferred` tools. Ignored for `Direct`/`Hidden`.
-    fn should_activate(&self, _ctx: &ActivationContext) -> bool {
-        true
+    /// Defaults to the same opt-in rule as [`Tool::should_activate`].
+    fn should_activate(&self, ctx: &ActivationContext) -> bool {
+        ctx.current_tools.iter().any(|n| n == self.name())
     }
 }
 
@@ -411,13 +428,36 @@ impl<T: TypedTool + Send + Sync + 'static> Tool for T {
 /// envelope. Tools only provide `name`/`description`/`schema`; the envelope is
 /// assembled here at the LLM boundary (Anthropic gets its own renderer, and
 /// tool authors stay protocol-agnostic).
+///
+/// The schema passes through [`schema_budget`] on the way out. That is the
+/// only place every definition is guaranteed to cross, so it is where a
+/// per-tool ceiling belongs — see the module docs for why it is best-effort.
 pub fn render_tool_definition(tool: &dyn Tool) -> Value {
+    let mut parameters = tool.schema();
+    match schema_budget::fit_schema_to_budget(&mut parameters) {
+        schema_budget::FitOutcome::Untouched => {}
+        schema_budget::FitOutcome::Compressed(pass) => {
+            tracing::info!(
+                tool = tool.name(),
+                pass,
+                "tool schema compressed to fit the request budget"
+            );
+        }
+        schema_budget::FitOutcome::OverBudget => {
+            // Kept on purpose: a tool the model cannot see, it routes around.
+            tracing::warn!(
+                tool = tool.name(),
+                budget = schema_budget::MAX_TOOL_SCHEMA_BYTES,
+                "tool schema exceeds the request budget after every pass; sent as-is"
+            );
+        }
+    }
     json!({
         "type": "function",
         "function": {
             "name": tool.name(),
             "description": tool.description(),
-            "parameters": tool.schema(),
+            "parameters": parameters,
         }
     })
 }
@@ -470,6 +510,11 @@ impl ToolRegistry {
         // all Direct + previously-activated Deferred tools in ctx.current_tools.
         // Evaluation order matters: a later Deferred tool can see an earlier one,
         // but not vice versa.
+        //
+        // `ctx.current_tools` arrives seeded with the session's openings (see
+        // [`ToolActivation`]); the default `should_activate` reads them from
+        // here, so they must be in the pool before the first Deferred tool is
+        // asked.
         let direct_names: Vec<String> = tools
             .iter()
             .filter(|t| t.exposure() == ToolExposure::Direct)
@@ -477,6 +522,11 @@ impl ToolRegistry {
             .collect();
 
         let mut activated_names = direct_names.clone();
+        for name in &ctx.current_tools {
+            if !activated_names.contains(name) {
+                activated_names.push(name.clone());
+            }
+        }
         for t in &tools {
             if t.exposure() == ToolExposure::Deferred {
                 let mut ctx_with_tools = ctx.clone();

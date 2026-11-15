@@ -571,10 +571,50 @@ fn tool_exposure_default_is_direct() {
     assert_eq!(t.exposure(), ToolExposure::Direct);
 }
 
+/// Value: protects=what `Deferred` means — opt-in, not opt-out. A tool that is
+/// named in the roster but unopened must cost the request nothing, and the
+/// default must not hand it back anyway; fails_when=an unopened tool is
+/// included, or an opened one is not. why_new=the default used to return `true`,
+/// which made `Deferred` a no-op label. seam=Tool::should_activate; no_claim=
+/// about overrides that auto-open on a workspace shape.
 #[test]
-fn tool_should_activate_default_is_true() {
-    let t = NamedTool("x");
-    assert!(t.should_activate(&default_ctx()));
+fn a_deferred_tool_is_closed_until_the_model_opens_it() {
+    let t = NamedTool("browser_navigate");
+    let closed = default_ctx();
+    assert!(
+        !t.should_activate(&closed),
+        "unopened means absent from the request"
+    );
+
+    let mut open = default_ctx();
+    open.current_tools = vec!["browser_navigate".to_string()];
+    assert!(t.should_activate(&open), "opening it is what puts it back");
+}
+
+/// Value: protects=the end-to-end promise of the roster — what the model opens
+/// is exactly what it gets, no more and no less; fails_when=the activation
+/// names never reach the filter, so every Deferred tool is stuck shut.
+/// why_new=the seeding is new. seam=ToolActivation -> definitions_filtered;
+/// no_claim=that the roster is the only way a tool can open.
+#[test]
+fn definitions_filtered_honours_the_session_openings() {
+    let mut r = ToolRegistry::default();
+    r.register(ExposureTool("direct_a", ToolExposure::Direct));
+    r.register(ExposureTool("deferred_a", ToolExposure::Deferred));
+    r.register(ExposureTool("deferred_b", ToolExposure::Deferred));
+
+    let mut ctx = default_ctx();
+    ctx.current_tools = vec!["deferred_b".to_string()];
+    let defs = r.definitions_filtered(&ctx);
+    let names: Vec<&str> = defs
+        .iter()
+        .map(|d| d["function"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["deferred_b", "direct_a"],
+        "the opened one comes back and the unopened one does not"
+    );
 }
 
 #[test]

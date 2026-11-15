@@ -62,6 +62,19 @@ fn build_chat_request(
     let cache_through = request.messages.len().saturating_sub(1);
     request = request.with_cache_through(cache_through);
 
+    // Tool-call batching is a permission, and the engine can honour it: the
+    // orchestrator already runs an approved batch concurrently. Claiming it
+    // costs nothing when the model emits one call per turn, and the alternative
+    // is a provider default we did not choose. It is not a promise the model
+    // will batch — phimint session 20261115_2fbff82e issued 1.41 calls per turn
+    // with nothing forbidding it.
+    //
+    // Note what this cannot do: on an Anthropic-shaped request there is nowhere
+    // to put the claim, because that protocol has no such field and the model
+    // batches on its own. This is the OpenAI-side lever only — see
+    // `notes/tool-face-design.md` §2.4 for the probe that established that.
+    request = request.with_parallel_tool_calls(true);
+
     // Apply model override if specified
     if let Some(model) = model_override {
         request = request.with_model(model);

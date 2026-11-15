@@ -862,6 +862,25 @@ fn a_word_only_history_is_untouched() {
     );
 }
 
+/// protects: the model's freedom to batch independent tool calls — the engine
+/// must claim it on every request, or the provider applies its own default and
+/// the harness may quietly serialize.
+/// fails_when: the claim is dropped from the request, which no later test can
+/// see because it lives on the wire.
+/// no_claim: that the model will actually batch; phimint session
+/// 20261115_2fbff82e averaged 1.41 calls/turn with nothing forbidding it.
+#[test]
+fn every_request_claims_tool_call_batching() {
+    let messages = vec![ChatMessage::user("hi")];
+    let request = build_chat_request(&messages, &[], None, None, false, None)
+        .expect("a one-message request builds");
+    assert_eq!(
+        request.parallel_tool_calls,
+        Some(true),
+        "the engine must claim batching on every request"
+    );
+}
+
 // ── Turn-safe provider swap (set_provider_when_idle) ───────────────────────
 
 /// protects: a swap staged while a run executes lands only when the last

@@ -251,9 +251,14 @@ impl RuntimeCore {
 
             // Refresh tool definitions each iteration (supports MCP dynamic tools)
             // Respects ToolExposure: Direct always visible, Deferred conditional, Hidden never.
+            //
+            // `current_tools` is the session's openings, so a tool the model
+            // mounted with `activate_tool` is on this request without asking
+            // again — that is what makes opening cost one turn and not one per
+            // use.
             let activation_ctx = crate::tool::ActivationContext {
                 session_id: session_id.clone(),
-                current_tools: vec![],
+                current_tools: self.activation.snapshot(),
                 workspace: std::env::current_dir().unwrap_or_default(),
             };
             let tool_definitions = self.tool_engine.definitions_filtered(&activation_ctx).await;

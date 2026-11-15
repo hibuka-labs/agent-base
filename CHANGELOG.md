@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-16
+
+### Added
+- **A tool can wait for the model to ask for it.** A `Deferred` tool is
+  named in the roster but costs the request nothing until it is opened:
+  `ActivateTool` opens a tool by name, and `ToolActivation` carries the
+  set of names the session has opened so far. `Tool::should_activate`
+  now defaults to "has the model asked for this by name?" instead of
+  always saying yes — a session that registers a hundred tools no longer
+  sends a hundred schemas to every request. `AgentBuilder::defer_tool`
+  re-wraps a registered tool, and `with_tool_activation` hands the
+  session's set to the engine.
+
+- **Every tool definition passes one place on the way out.** The schema
+  crosses `schema_budget` at the LLM boundary, which is the only place
+  every definition is guaranteed to pass — so that is where a per-tool
+  ceiling belongs. Best-effort by design: a tool whose schema cannot be
+  trimmed is still sent.
+
+- **The engine may claim that the conversation prefix is cacheable.**
+  `build_chat_request` sets `cache_through` on the request, naming the
+  stable prefix rather than guessing where it ends.
+
+- **The engine may claim that the model may batch its tool calls.**
+  `build_chat_request` sets `parallel_tool_calls` on the request. This is
+  the OpenAI-side lever only — the Anthropic-shaped request has nowhere to
+  put the claim, because that protocol has no such field.
+
+### Changed
+- **Breaking (dependency):** `agent-types` requirement bumped from 0.7.0
+  to 0.8.0, `llm-trait` from 0.1.5 to 0.2.0 and `llm-unified` from 0.2.0
+  to 0.3.0, keeping the family on a single version of each crate. The
+  trait's public structs gained fields, so consumers that built them
+  exhaustively must be recompiled against the new versions.
+
 ## [0.14.0] - 2026-11-14
 
 ### Added

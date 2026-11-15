@@ -39,6 +39,10 @@ pub struct AgentBuilder {
     /// Outer `None` = unset (the default watchdog); inner `None` = explicitly
     /// unbounded human time.
     interact_timeout: Option<Option<Duration>>,
+    /// Which `Deferred` tools the model may open this session. A product that
+    /// registers [`crate::tool::ActivateTool`] MUST pass the same set it gave
+    /// that tool, or openings land in a set the engine never reads.
+    activation: crate::tool::ToolActivation,
 }
 
 impl AgentBuilder {
@@ -62,7 +66,38 @@ impl AgentBuilder {
             action_backend: None,
             interact: None,
             interact_timeout: None,
+            activation: crate::tool::ToolActivation::new(),
         }
+    }
+
+    /// Share the session's tool-activation set with the engine. See the field
+    /// docs: a product that registers [`crate::tool::ActivateTool`] must hand
+    /// that tool this same set.
+    pub fn with_tool_activation(mut self, activation: crate::tool::ToolActivation) -> Self {
+        self.activation = activation;
+        self
+    }
+
+    /// Re-wrap a registered tool as [`crate::tool::DeferredTool`]: it stays on
+    /// the roster and is callable once opened, but costs the request nothing
+    /// until then.
+    ///
+    /// Returns the tool's rendered wire definition, which is what
+    /// [`crate::tool::ActivateTool`] hands back when the model opens it. The
+    /// product needs that here because the tools worth deferring are built
+    /// inside the framework's own builder — it never holds the instances, so
+    /// it cannot render them itself. `None` when the name is not registered.
+    ///
+    /// Registration-time wrapping would be cleaner if every tool were built
+    /// where the product can see it. This moves the call to the product all the
+    /// same, which is the only layer that knows what its work actually needs.
+    pub fn defer_tool(&mut self, name: &str) -> Option<serde_json::Value> {
+        let inner = self.tools.get(name)?;
+        if inner.exposure() != crate::tool::ToolExposure::Deferred {
+            self.tools
+                .register_arc(Arc::new(crate::tool::DeferredTool::new(inner.clone())));
+        }
+        Some(crate::tool::render_tool_definition(inner.as_ref()))
     }
 
     pub fn event_bus_capacity(mut self, capacity: usize) -> Self {
@@ -355,6 +390,7 @@ impl AgentBuilder {
             self.action_backend,
             interact,
             interact_timeout,
+            self.activation,
         ));
 
         Ok(AgentRuntime { runner })
@@ -366,7 +402,7 @@ mod tests {
     use super::*;
     use crate::engine::DenyAllApprovalHandler;
     use crate::llm::ReasoningEffort;
-    use crate::tool::{Content, ToolContext};
+    use crate::tool::{Content, ToolActivation, ToolContext};
     use crate::types::{AgentError, AgentResult, ApprovalRequest, Language, ResponseFormat};
     use async_trait::async_trait;
     use llm_trait::{Capabilities, ChatRequest, ChatResponse, ChatStream, LlmError, ProviderInfo};
@@ -578,6 +614,114 @@ mod tests {
     #[test]
     fn build_ok_with_defaults() {
         assert!(b().build().is_ok());
+    }
+
+    /// Value: protects=the one hand-off that makes opening a tool worth a turn —
+    /// the set `activate_tool` writes to must be the set the engine reads from,
+    /// or every open lands somewhere nobody looks and the roster silently does
+    /// nothing. fails_when=the builder keeps its own set instead of the one it
+    /// was handed. why_new=the field is new. seam=AgentBuilder -> RuntimeCore;
+    /// no_claim=that the turn loop reads it — that is one line, and covered
+    /// only by inspection.
+    #[test]
+    fn the_builder_hands_the_engine_the_activation_set_it_was_given() {
+        let activation = ToolActivation::new();
+        let runtime = b()
+            .with_tool_activation(activation.clone())
+            .build()
+            .expect("builds");
+        activation.activate("browser_navigate");
+        assert!(
+            runtime
+                .runner
+                .activation
+                .snapshot()
+                .contains(&"browser_navigate".to_string()),
+            "the engine must read the set the product's ActivateTool writes to"
+        );
+    }
+
+    /// Value: protects=the product's one lever over a tool the framework
+    /// registered — deferring must work by name at the builder, or a product
+    /// that cannot rebuild the framework's tools has no way to put the roster
+    /// to work; fails_when=the name is ignored or the tool is dropped instead
+    /// of re-wrapped. why_new=the method is new. seam=AgentBuilder -> registry;
+    /// no_claim=that these are the tools a given product should defer.
+    #[tokio::test]
+    async fn a_registered_tool_can_be_deferred_by_name() {
+        use crate::tool::Tool;
+
+        struct Probe;
+        #[async_trait]
+        impl Tool for Probe {
+            fn name(&self) -> &'static str {
+                "browser_navigate"
+            }
+            fn description(&self) -> &'static str {
+                "probe"
+            }
+            fn schema(&self) -> Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn call(
+                &self,
+                _args: &Value,
+                _ctx: &ToolContext,
+            ) -> crate::types::AgentResult<Vec<Content>> {
+                Ok(vec![])
+            }
+        }
+
+        let mut builder = b().register_tool(Probe);
+        let definition = builder
+            .defer_tool("browser_navigate")
+            .expect("a registered name is deferred and hands back its definition");
+        assert_eq!(
+            definition["function"]["name"], "browser_navigate",
+            "the definition is the tool's own — this is what ActivateTool serves"
+        );
+        assert!(
+            builder.defer_tool("no_such_tool").is_none(),
+            "and an unknown name is reported, not silently ignored"
+        );
+        assert!(
+            builder.defer_tool("browser_navigate").is_some(),
+            "twice is a no-op, but still returns what the roster needs"
+        );
+
+        let runtime = builder.build().expect("builds");
+        let ctx = crate::tool::ActivationContext {
+            session_id: crate::types::SessionId::new(0),
+            current_tools: vec![],
+            workspace: std::path::PathBuf::from("/tmp"),
+        };
+        let names: Vec<String> = runtime
+            .runner
+            .tool_engine
+            .definitions_filtered(&ctx)
+            .await
+            .iter()
+            .map(|d| d["function"]["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            !names.contains(&"browser_navigate".to_string()),
+            "unopened, it costs the request nothing"
+        );
+
+        let mut opened = ctx.clone();
+        opened.current_tools = vec!["browser_navigate".to_string()];
+        let when_open: Vec<String> = runtime
+            .runner
+            .tool_engine
+            .definitions_filtered(&opened)
+            .await
+            .iter()
+            .map(|d| d["function"]["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            when_open.contains(&"browser_navigate".to_string()),
+            "and once opened it is on the request like any other"
+        );
     }
 
     #[test]

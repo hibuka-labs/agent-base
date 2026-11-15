@@ -52,6 +52,11 @@ pub(crate) struct RuntimeCore {
     /// Per-interaction deadline for the action backend's `ExecCtx` (`None` =
     /// unbounded human time — the run's cancel token is the only guard).
     pub(crate) interact_timeout: Option<Duration>,
+    /// Which `Deferred` tools the model has opened this session. Seeded into
+    /// every turn's [`crate::tool::ActivationContext`] so an opened tool is on
+    /// the next request without asking again. Shared with the
+    /// [`crate::tool::ActivateTool`] that writes to it — same `Arc`, same set.
+    pub(crate) activation: crate::tool::ToolActivation,
 }
 
 impl RuntimeCore {
@@ -70,6 +75,7 @@ impl RuntimeCore {
         action_backend: Option<Box<dyn ActionBackend>>,
         interact: Arc<dyn InteractionChannel>,
         interact_timeout: Option<Duration>,
+        activation: crate::tool::ToolActivation,
     ) -> Self {
         // Engine notice channel (Batch E): guards get the sender via
         // set_notice; drain_notices forwards pending notices at run end.
@@ -101,6 +107,7 @@ impl RuntimeCore {
             action_backend: action_backend.map(tokio::sync::Mutex::new),
             interact,
             interact_timeout,
+            activation,
         }
     }
 
