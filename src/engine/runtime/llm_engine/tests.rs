@@ -60,6 +60,7 @@ async fn process_stream_aggregates_text_usage_and_stop() {
             completion_tokens: Some(2),
             total_tokens: Some(7),
             reasoning_tokens: None,
+            cache_read_tokens: None,
         })),
         Ok(StreamChunk::Stop {
             finish_reason: Some("stop".into()),
@@ -119,12 +120,14 @@ async fn process_stream_merges_partial_usage_events() {
             completion_tokens: Some(0),
             total_tokens: None,
             reasoning_tokens: None,
+            cache_read_tokens: None,
         })),
         Ok(StreamChunk::Usage(UsageInfo {
             prompt_tokens: Some(63),
             completion_tokens: Some(26),
             total_tokens: None,
             reasoning_tokens: None,
+            cache_read_tokens: None,
         })),
         Ok(StreamChunk::Stop {
             finish_reason: Some("end_turn".into()),
@@ -163,12 +166,14 @@ async fn process_stream_keeps_usage_when_delta_omits_prompt() {
             completion_tokens: Some(1),
             total_tokens: None,
             reasoning_tokens: None,
+            cache_read_tokens: None,
         })),
         Ok(StreamChunk::Usage(UsageInfo {
             prompt_tokens: None,
             completion_tokens: Some(26),
             total_tokens: None,
             reasoning_tokens: None,
+            cache_read_tokens: None,
         })),
         Ok(StreamChunk::Stop {
             finish_reason: Some("end_turn".into()),

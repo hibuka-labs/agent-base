@@ -54,6 +54,14 @@ fn build_chat_request(
     }
     request.response_format = response_format.cloned();
 
+    // A conversation appends: it never rewrites its own prefix. Say so, so a
+    // provider that caches prefixes can stop re-billing the settled part of
+    // the prompt at the input rate. Marking through the newest message is the
+    // standard shape — the breakpoint trails the conversation and each call
+    // pays only for what is new. Providers without caching ignore the claim.
+    let cache_through = request.messages.len().saturating_sub(1);
+    request = request.with_cache_through(cache_through);
+
     // Apply model override if specified
     if let Some(model) = model_override {
         request = request.with_model(model);
