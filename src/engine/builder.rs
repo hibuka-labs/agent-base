@@ -92,12 +92,7 @@ impl AgentBuilder {
     /// where the product can see it. This moves the call to the product all the
     /// same, which is the only layer that knows what its work actually needs.
     pub fn defer_tool(&mut self, name: &str) -> Option<serde_json::Value> {
-        let inner = self.tools.get(name)?;
-        if inner.exposure() != crate::tool::ToolExposure::Deferred {
-            self.tools
-                .register_arc(Arc::new(crate::tool::DeferredTool::new(inner.clone())));
-        }
-        Some(crate::tool::render_tool_definition(inner.as_ref()))
+        self.tools.defer(name)
     }
 
     pub fn event_bus_capacity(mut self, capacity: usize) -> Self {

@@ -59,14 +59,17 @@ impl Tool for ActivateTool {
     }
 
     fn description(&self) -> &'static str {
-        "Mount a tool that the roster names but the session has not opened yet, \
-         so it can be called from the next turn on. Pass the tool's name exactly \
-         as the roster spells it; the result is that tool's full description and \
-         argument schema. Opening is once per session — it stays mounted, do not \
-         re-open it to use it again. Reach for this when the task needs a \
-         capability the roster lists as unmounted; do NOT use it for tools that \
-         are already mounted, and do not open a group on the chance it comes in \
-         handy — every open tool is sent on every later request."
+        "Mount a tool whose schema is not loaded yet.\n\n\
+         Some tools are named in the system message but their schemas are NOT loaded — until\n\
+         they are, only the name is known, and calling one fails: there is no parameter\n\
+         schema to call it with. This tool loads it.\n\
+         Pass the tool's name exactly as the roster spells it. The result is that tool's full\n\
+         description and argument schema, and from your next turn on it is callable exactly\n\
+         like any tool already in your list — and it stays mounted for the rest of the\n\
+         session, so open it once and use it as often as you need.\n\
+         A name that is not mountable comes back with the ones that are. A name that is\n\
+         already mounted comes back saying so. Do not open a capability on the chance it\n\
+         comes in handy: every mounted tool is sent on every later request."
     }
 
     fn schema(&self) -> Value {

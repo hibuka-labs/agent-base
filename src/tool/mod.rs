@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -467,6 +467,12 @@ pub(crate) type ToolRef = Arc<dyn Tool>;
 #[derive(Clone, Default)]
 pub struct ToolRegistry {
     tools: HashMap<String, ToolRef>,
+    /// Names that must mount as [`DeferredTool`] whenever they appear.
+    ///
+    /// Recording the intent rather than wrapping at call time makes the
+    /// registration order irrelevant: some tools are registered directly, some
+    /// arrive from a factory at build time, some come from plugins.
+    deferred: HashSet<String>,
 }
 
 impl ToolRegistry {
@@ -475,7 +481,13 @@ impl ToolRegistry {
     }
 
     pub fn register_arc(&mut self, tool: Arc<dyn Tool>) {
-        self.tools.insert(tool.name().to_string(), tool);
+        let name = tool.name().to_string();
+        let tool = if self.deferred.contains(&name) && tool.exposure() != ToolExposure::Deferred {
+            Arc::new(DeferredTool::new(tool)) as ToolRef
+        } else {
+            tool
+        };
+        self.tools.insert(name, tool);
     }
 
     /// Remove a tool from the registry by name.
@@ -485,6 +497,22 @@ impl ToolRegistry {
 
     pub fn get(&self, name: &str) -> Option<ToolRef> {
         self.tools.get(name).cloned()
+    }
+
+    /// Mark `name` to mount as deferred whenever it appears, and wrap it now if
+    /// it is already registered. Returns the rendered definition — what
+    /// [`crate::tool::ActivateTool`] hands back on open — or `None` when the
+    /// tool is not registered **yet**. The mark still holds, so a later
+    /// registration is deferred too.
+    pub fn defer(&mut self, name: &str) -> Option<Value> {
+        self.deferred.insert(name.to_string());
+        let inner = self.tools.get(name)?;
+        let definition = render_tool_definition(inner.as_ref());
+        if inner.exposure() != ToolExposure::Deferred {
+            let wrapped = Arc::new(DeferredTool::new(inner.clone())) as ToolRef;
+            self.tools.insert(name.to_string(), wrapped);
+        }
+        Some(definition)
     }
 
     pub fn definitions(&self) -> Vec<Value> {
