@@ -2,7 +2,7 @@
 
 [![crates.io](https://img.shields.io/crates/v/agent-base.svg)](https://crates.io/crates/agent-base)
 [![Documentation](https://docs.rs/agent-base/badge.svg)](https://docs.rs/agent-base)
-[![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 
 [English](README.md) | [中文](README_CN.md)
 
@@ -283,4 +283,4 @@ phi-agent / agent-works / ...              ← 框架 / 增强工具集
 
 ## 许可证
 
-MIT
+MIT OR Apache-2.0（见 [LICENSE-MIT](LICENSE-MIT) 与 [LICENSE-APACHE](LICENSE-APACHE)）。

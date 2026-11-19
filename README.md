@@ -2,7 +2,7 @@
 
 [![crates.io](https://img.shields.io/crates/v/agent-base.svg)](https://crates.io/crates/agent-base)
 [![Documentation](https://docs.rs/agent-base/badge.svg)](https://docs.rs/agent-base)
-[![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 [![codecov](https://codecov.io/gh/hibuka-labs/agent-base/branch/master/graph/badge.svg)](https://codecov.io/gh/hibuka-labs/agent-base)
 
 [English](README.md) | [中文](README_CN.md)
@@ -304,4 +304,4 @@ This project is in early development (v0.2.1). The core abstractions are settlin
 
 ## License
 
-MIT
+MIT OR Apache-2.0 — see [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).

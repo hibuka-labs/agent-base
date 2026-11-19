@@ -3,7 +3,7 @@ name = "agent-types"
 version = "0.8.0"
 edition = "2024"
 description = "Pure type definitions for the agent-base runtime"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/hibuka-labs/agent-base"
 
 [dependencies]
