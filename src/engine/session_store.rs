@@ -376,7 +376,7 @@ mod sqlite_tests {
 mod tests {
     use super::*;
 
-    fn make_session(id: u64) -> AgentSession {
+    fn seeded(id: u64) -> AgentSession {
         let mut s = AgentSession::new(SessionId::new(id));
         s.push_message(crate::types::MessageRole::User, "hello");
         s.push_message(crate::types::MessageRole::Assistant, "hi");
@@ -384,16 +384,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn save_and_load_roundtrips_fields() {
+    async fn roundtrip_preserves_allow_list_and_counters() {
         let store = InMemorySessionStore::new();
-        let mut session = make_session(1);
+        let mut session = seeded(1);
         session.allow_action("read_file");
         session.run_state.total_actions = 2;
         store.save(&session).await.unwrap();
 
-        let loaded = store.load(&SessionId::new(1)).await.unwrap();
-        assert!(loaded.is_some());
-        let loaded = loaded.unwrap();
+        let loaded = store
+            .load(&SessionId::new(1))
+            .await
+            .unwrap()
+            .expect("just saved");
         assert_eq!(loaded.id(), Some(SessionId::new(1)));
         assert_eq!(loaded.chat_messages().len(), 2);
         assert!(loaded.is_action_allowed("read_file"));
@@ -401,33 +403,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_nonexistent_returns_none() {
+    async fn unknown_id_loads_as_none() {
         let store = InMemorySessionStore::new();
         let result = store.load(&SessionId::new(999)).await.unwrap();
         assert!(result.is_none());
     }
 
     #[tokio::test]
-    async fn list_returns_all_saved_ids() {
+    async fn list_reports_every_stored_id_in_order() {
         let store = InMemorySessionStore::new();
-        store.save(&make_session(1)).await.unwrap();
-        store.save(&make_session(2)).await.unwrap();
-        store.save(&make_session(3)).await.unwrap();
+        store.save(&seeded(1)).await.unwrap();
+        store.save(&seeded(2)).await.unwrap();
+        store.save(&seeded(3)).await.unwrap();
 
-        let ids = store.list().await.unwrap();
-        assert_eq!(ids.len(), 3);
-        let mut sorted = ids.clone();
-        sorted.sort_by_key(|id| id.id);
+        let mut ids = store.list().await.unwrap();
+        ids.sort_by_key(|id| id.id);
         assert_eq!(
-            sorted.iter().map(|id| id.id).collect::<Vec<_>>(),
+            ids.iter().map(|id| id.id).collect::<Vec<_>>(),
             vec![1, 2, 3]
         );
     }
 
     #[tokio::test]
-    async fn delete_removes_session() {
+    async fn delete_forgets_the_session_and_empties_the_list() {
         let store = InMemorySessionStore::new();
-        store.save(&make_session(1)).await.unwrap();
+        store.save(&seeded(1)).await.unwrap();
         assert!(store.load(&SessionId::new(1)).await.unwrap().is_some());
 
         store.delete(&SessionId::new(1)).await.unwrap();
@@ -436,17 +436,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_nonexistent_is_noop() {
+    async fn deleting_an_unknown_id_is_silent() {
         let store = InMemorySessionStore::new();
-        // Deleting an unknown session must succeed without error.
         store.delete(&SessionId::new(999)).await.unwrap();
         assert!(store.list().await.unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn save_overwrites_existing_session() {
+    async fn second_save_replaces_the_first() {
         let store = InMemorySessionStore::new();
-        let mut session = make_session(1);
+        let mut session = seeded(1);
         store.save(&session).await.unwrap();
 
         session.push_message(crate::types::MessageRole::User, "another");
@@ -457,7 +456,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn save_without_id_errors() {
+    async fn save_without_an_id_is_rejected() {
         let store = InMemorySessionStore::new();
         let session = AgentSession::default(); // id is None
         let err = store.save(&session).await.unwrap_err();
@@ -465,27 +464,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn save_with_external_id_roundtrips() {
+    async fn external_session_ids_roundtrip() {
         let store = InMemorySessionStore::new();
-        let mut s = AgentSession::new(SessionId::with_external_id(42, "my-ext-id"));
+        let key = SessionId::with_external_id(42, "my-ext-id");
+        let mut s = AgentSession::new(key.clone());
         s.push_message(crate::types::MessageRole::User, "test");
         store.save(&s).await.unwrap();
 
-        let loaded = store
-            .load(&SessionId::with_external_id(42, "my-ext-id"))
-            .await
-            .unwrap();
-        assert!(loaded.is_some());
+        assert!(store.load(&key).await.unwrap().is_some());
     }
 
     #[tokio::test]
-    async fn list_empty_store() {
+    async fn fresh_store_lists_nothing() {
         let store = InMemorySessionStore::new();
         assert!(store.list().await.unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn append_event_default_noop() {
+    async fn append_event_on_the_default_path_is_a_noop() {
         let store = InMemorySessionStore::new();
         store
             .append_event(

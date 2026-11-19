@@ -216,6 +216,7 @@ mod tests {
             total_actions: 9,
             turn_actions: 5,
             run_has_actions: true,
+            run_actions: vec!["read_file".into()],
             reasoning_only_strikes: 2,
             empty_response_strikes: 1,
             nudge_count: 3,
@@ -231,6 +232,7 @@ mod tests {
         assert_eq!(rs.total_actions, 9);
         assert_eq!(rs.turn_actions, 0);
         assert!(!rs.run_has_actions);
+        assert!(rs.run_actions.is_empty());
         assert_eq!(rs.reasoning_only_strikes, 0);
         assert_eq!(rs.empty_response_strikes, 0);
         assert_eq!(rs.nudge_count, 0);
@@ -461,6 +463,7 @@ mod proptest_tests {
                 total_actions,
                 turn_actions,
                 run_has_actions,
+                run_actions: vec!["tool_a".into(), "tool_b".into()],
                 reasoning_only_strikes,
                 empty_response_strikes,
                 nudge_count,
@@ -474,6 +477,7 @@ mod proptest_tests {
             assert_eq!(rs.total_actions, total_actions);
             assert_eq!(rs.turn_actions, 0);
             assert!(!rs.run_has_actions);
+            assert!(rs.run_actions.is_empty());
             assert_eq!(rs.reasoning_only_strikes, 0);
             assert_eq!(rs.empty_response_strikes, 0);
             assert_eq!(rs.nudge_count, 0);

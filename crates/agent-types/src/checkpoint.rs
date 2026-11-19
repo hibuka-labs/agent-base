@@ -385,22 +385,21 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_step_after_user_input_round_trips() {
-        let step = CheckpointStep::AfterUserInput;
-        let json = serde_json::to_string(&step).unwrap();
-        let decoded: CheckpointStep = serde_json::from_str(&json).unwrap();
-        assert!(matches!(decoded, CheckpointStep::AfterUserInput));
+    fn after_user_input_variant_survives_serde() {
+        let wire = serde_json::to_string(&CheckpointStep::AfterUserInput).unwrap();
+        let back: CheckpointStep = serde_json::from_str(&wire).unwrap();
+        assert!(matches!(back, CheckpointStep::AfterUserInput));
     }
 
     #[test]
-    fn checkpoint_step_before_llm_round_trips() {
-        let step = CheckpointStep::BeforeLlm {
+    fn before_llm_variant_keeps_its_payload_through_serde() {
+        let original = CheckpointStep::BeforeLlm {
             messages: sample_messages(),
             tools: sample_tools(),
         };
-        let json = serde_json::to_string(&step).unwrap();
-        let decoded: CheckpointStep = serde_json::from_str(&json).unwrap();
-        match decoded {
+        let wire = serde_json::to_string(&original).unwrap();
+        let back: CheckpointStep = serde_json::from_str(&wire).unwrap();
+        match back {
             CheckpointStep::BeforeLlm { messages, tools } => {
                 // ChatMessage has no PartialEq, so compare canonical JSON.
                 assert_eq!(
@@ -414,13 +413,13 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_step_before_actions_round_trips() {
-        let step = CheckpointStep::BeforeActions {
+    fn before_actions_variant_keeps_its_payload_through_serde() {
+        let original = CheckpointStep::BeforeActions {
             actions: sample_actions(),
         };
-        let json = serde_json::to_string(&step).unwrap();
-        let decoded: CheckpointStep = serde_json::from_str(&json).unwrap();
-        match decoded {
+        let wire = serde_json::to_string(&original).unwrap();
+        let back: CheckpointStep = serde_json::from_str(&wire).unwrap();
+        match back {
             CheckpointStep::BeforeActions { actions } => {
                 assert_eq!(actions, sample_actions());
             }
@@ -429,14 +428,14 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_step_after_actions_round_trips() {
-        let step = CheckpointStep::AfterActions {
+    fn after_actions_variant_keeps_actions_and_observation_through_serde() {
+        let original = CheckpointStep::AfterActions {
             actions: sample_actions(),
             observation: Some(sample_observation()),
         };
-        let json = serde_json::to_string(&step).unwrap();
-        let decoded: CheckpointStep = serde_json::from_str(&json).unwrap();
-        match decoded {
+        let wire = serde_json::to_string(&original).unwrap();
+        let back: CheckpointStep = serde_json::from_str(&wire).unwrap();
+        match back {
             CheckpointStep::AfterActions {
                 actions,
                 observation,
@@ -514,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_step_deserialization_fails_gracefully_on_malformed_input() {
+    fn checkpoint_step_rejects_malformed_json_instead_of_panicking() {
         // Unknown variant tag.
         assert!(serde_json::from_str::<CheckpointStep>(r#"{"NotAStep":{}}"#).is_err());
         // Wrong field type on a known variant.
@@ -531,7 +530,7 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_data_deserialization_fails_gracefully_on_malformed_input() {
+    fn checkpoint_data_rejects_malformed_json_instead_of_panicking() {
         // Missing required fields.
         assert!(
             serde_json::from_str::<CheckpointData>(r#"{"session_id":{"id":1},"user_input":"hi"}"#,)
