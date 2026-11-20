@@ -1,6 +1,6 @@
 [package]
 name = "agent-types"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 description = "Pure type definitions for the agent-base runtime"
 license = "MIT OR Apache-2.0"
