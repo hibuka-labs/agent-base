@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-11-20
+
+### Added
+- **A corrupt turn is discarded whole, and the model is asked again.** A
+  provider can cut a tool call's argument stream mid-JSON and still report
+  the turn as complete. The response now behaves like a transaction: a
+  structurally corrupt batch is detected by shape (never by provider
+  metadata), the whole response is discarded before anything is committed
+  or executed, and the LLM is re-asked from the untouched history. The
+  guard seam decides; the kernel executes. `agent-types` gains the signal
+  vocabulary — `StreamIntegrity`, `GuardDecision::RetryTurn`, and the
+  `GuardCtx` facts `integrity`, `has_visible_text`, `has_thinking`,
+  `silent_retries_in_round`.
+
+- **A tool can be deferred by name, whatever order it arrives in.**
+  `ToolRegistry::defer` records the intent and `register_arc` applies it, so
+  a tool is deferred whether it is registered directly, arrives from a
+  factory at build time, or comes from a plugin. `ActivateTool` stays
+  `Direct` — nothing can be opened if the opener is not mounted.
+
+### Changed
+- **A model without vision gets words about the picture, never pixels.** The
+  wire copy normalizes modality: the message says a picture existed and how
+  to recover it, while the session history keeps the originals — so a
+  hot-swap to a vision model sees the picture again for free.
+
+- **Breaking (dependency):** `agent-types` requirement bumped from 0.8.0 to
+  0.9.0, alongside the new `StreamIntegrity` vocabulary.
+
+### License
+- **Dual-licensed as MIT OR Apache-2.0.**
+
 ## [0.15.0] - 2026-11-16
 
 ### Added
