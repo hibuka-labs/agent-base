@@ -40,7 +40,7 @@ fn every_in_budget_picture_reaches_the_request() {
             vec![picture(200, 200), picture(200, 200)],
         ),
     ];
-    let request = build_chat_request(&messages, &[], None, None, false, None)
+    let request = build_chat_request(&messages, &[], None, None, false, None, true)
         .expect("small pictures fit the budget");
     assert_eq!(request.messages.len(), 4, "no message is discarded");
     let carried: usize = request
@@ -67,7 +67,7 @@ fn an_over_budget_request_is_refused_with_an_inventory() {
         detail: None,
     };
     let messages = vec![ChatMessage::tool_with_images("t1", "a fat one", vec![fat])];
-    let err = build_chat_request(&messages, &[], None, None, false, None)
+    let err = build_chat_request(&messages, &[], None, None, false, None, true)
         .expect_err("over the per-image line");
     let text = err.to_string();
     assert!(
@@ -94,7 +94,7 @@ fn the_throat_shrinks_the_wire_copy_and_keeps_the_history() {
         detail: None,
     };
     let messages = vec![ChatMessage::tool_with_images("t1", "shot", vec![big])];
-    let request = build_chat_request(&messages, &[], None, None, false, None)
+    let request = build_chat_request(&messages, &[], None, None, false, None, true)
         .expect("a big picture shrinks to fit");
     let ChatMessage::Tool { images, .. } = &request.messages[0] else {
         panic!("expected a tool result");
@@ -125,4 +125,105 @@ fn the_throat_shrinks_the_wire_copy_and_keeps_the_history() {
         image_ops::to_base64(&original),
         "the history keeps the original bytes"
     );
+}
+
+// ── modality normalization: a text-only model gets words, never pixels ──
+
+fn user_with_picture() -> ChatMessage {
+    ChatMessage::user_with_images("what is in this screenshot?", vec![picture(200, 200)])
+}
+
+/// protects: a model without vision never receives pixel payloads on the
+/// wire — and the withholding is visible: the message says a picture existed
+/// and how to recover it (switch with /model), never a silent text-only
+/// send. fails_when: base64 reaches the request for a non-vision model, or
+/// the picture vanishes without a word. no_claim: the residue's exact
+/// wording beyond the two routing markers.
+#[test]
+fn non_vision_models_get_words_about_the_picture_never_pixels() {
+    let messages = vec![user_with_picture()];
+    let request = build_chat_request(&messages, &[], None, None, false, None, false)
+        .expect("small picture fits the budget");
+    assert_eq!(request.messages.len(), 1);
+    match &request.messages[0] {
+        ChatMessage::User {
+            content, images, ..
+        } => {
+            assert!(
+                images.is_empty(),
+                "no picture may ride a text-only model's wire"
+            );
+            assert!(
+                content.contains("cannot see images"),
+                "the residue must name the withholding"
+            );
+            assert!(
+                content.contains("/model"),
+                "the residue must say how to recover"
+            );
+        }
+        other => panic!("unexpected message: {other:?}"),
+    }
+    let rendered = serde_json::to_string(&request.messages).expect("messages serialize");
+    let payload = image_ops::to_base64(&png_bytes(200, 200));
+    assert!(
+        !rendered.contains(&payload),
+        "no image payload may reach the wire"
+    );
+}
+
+/// protects: a vision model's request is untouched by the normalization
+/// pass. fails_when: pictures are withheld from a model that can see.
+#[test]
+fn vision_models_still_receive_the_picture() {
+    let messages = vec![user_with_picture()];
+    let request = build_chat_request(&messages, &[], None, None, false, None, true)
+        .expect("small picture fits the budget");
+    match &request.messages[0] {
+        ChatMessage::User { images, .. } => assert_eq!(images.len(), 1),
+        other => panic!("unexpected message: {other:?}"),
+    }
+    let rendered = serde_json::to_string(&request.messages).expect("messages serialize");
+    let payload = image_ops::to_base64(&png_bytes(200, 200));
+    assert!(rendered.contains(&payload), "the vision model gets pixels");
+}
+
+/// protects: the pass runs on the wire copy only — the session's history
+/// keeps the originals, so hot-swapping to a vision model next turn sees the
+/// picture again for free (same contract as `apply_image_budget`).
+/// fails_when: the caller's messages are mutated in place.
+#[test]
+fn normalization_leaves_the_session_history_untouched() {
+    let messages = vec![user_with_picture()];
+    let _ = build_chat_request(&messages, &[], None, None, false, None, false)
+        .expect("small picture fits the budget");
+    match &messages[0] {
+        ChatMessage::User { images, .. } => {
+            assert_eq!(images.len(), 1, "history must keep the picture");
+        }
+        other => panic!("unexpected message: {other:?}"),
+    }
+}
+
+/// protects: tool-result pictures (the vision channel) get the same
+/// withholding — a text-only model sees the metadata text, not the pixels.
+/// fails_when: tool images slip through the normalization.
+#[test]
+fn normalization_strips_tool_result_pictures_too() {
+    let messages = vec![ChatMessage::tool_with_images(
+        "t1",
+        "shot loaded",
+        vec![picture(200, 200)],
+    )];
+    let request = build_chat_request(&messages, &[], None, None, false, None, false)
+        .expect("small picture fits the budget");
+    match &request.messages[0] {
+        ChatMessage::Tool {
+            content, images, ..
+        } => {
+            assert!(images.is_empty(), "tool picture must be withheld");
+            assert!(content.contains("cannot see images"));
+        }
+        other => panic!("unexpected message: {other:?}"),
+    }
 }

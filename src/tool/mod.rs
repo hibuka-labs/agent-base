@@ -477,7 +477,7 @@ pub struct ToolRegistry {
 
 impl ToolRegistry {
     pub fn register(&mut self, tool: impl Tool + 'static) {
-        self.tools.insert(tool.name().to_string(), Arc::new(tool));
+        self.register_arc(Arc::new(tool));
     }
 
     pub fn register_arc(&mut self, tool: Arc<dyn Tool>) {

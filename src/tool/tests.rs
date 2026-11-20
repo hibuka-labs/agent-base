@@ -673,40 +673,41 @@ fn definitions_unfiltered_includes_hidden() {
 
     let defs = r.definitions();
     assert_eq!(defs.len(), 2);
-    /// Value: protects=order-independence — some tools are registered early,
-    /// some arrive from a factory at build time, some come from plugins. A
-    /// mark recorded before the tool exists must still defer it when it lands;
-    /// session 20261116_b97461af left 9 tools mounted because they registered
-    /// after the call that was supposed to defer them. fails_when=deferring
-    /// before registration is a no-op. why_new=the first cut wrapped at call
-    /// time and so depended on order. seam=ToolRegistry::defer -> register_arc.
-    #[test]
-    fn a_tool_deferred_before_registration_is_still_deferred() {
-        let mut r = ToolRegistry::default();
-        assert!(
-            r.defer("late").is_none(),
-            "not registered yet, so no definition"
-        );
-        r.register(NamedTool("late"));
+}
 
-        let ctx = default_ctx();
-        let defs = r.definitions_filtered(&ctx);
-        let names: Vec<&str> = defs
-            .iter()
-            .map(|d| d["function"]["name"].as_str().unwrap())
-            .collect();
-        assert!(
-            names.is_empty(),
-            "a deferred-before-registration tool must not mount: {names:?}"
-        );
+/// Value: protects=order-independence — some tools are registered early,
+/// some arrive from a factory at build time, some come from plugins. A
+/// mark recorded before the tool exists must still defer it when it lands;
+/// session 20261116_b97461af left 9 tools mounted because they registered
+/// after the call that was supposed to defer them. fails_when=deferring
+/// before registration is a no-op. why_new=the first cut wrapped at call
+/// time and so depended on order. seam=ToolRegistry::defer -> register_arc.
+#[test]
+fn a_tool_deferred_before_registration_is_still_deferred() {
+    let mut r = ToolRegistry::default();
+    assert!(
+        r.defer("late").is_none(),
+        "not registered yet, so no definition"
+    );
+    r.register(NamedTool("late"));
 
-        let mut open = ctx.clone();
-        open.current_tools = vec!["late".to_string()];
-        let defs = r.definitions_filtered(&open);
-        let names: Vec<&str> = defs
-            .iter()
-            .map(|d| d["function"]["name"].as_str().unwrap())
-            .collect();
-        assert_eq!(names, vec!["late"], "and it mounts once opened");
-    }
+    let ctx = default_ctx();
+    let defs = r.definitions_filtered(&ctx);
+    let names: Vec<&str> = defs
+        .iter()
+        .map(|d| d["function"]["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        names.is_empty(),
+        "a deferred-before-registration tool must not mount: {names:?}"
+    );
+
+    let mut open = ctx.clone();
+    open.current_tools = vec!["late".to_string()];
+    let defs = r.definitions_filtered(&open);
+    let names: Vec<&str> = defs
+        .iter()
+        .map(|d| d["function"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["late"], "and it mounts once opened");
 }
