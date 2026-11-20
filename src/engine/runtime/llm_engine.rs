@@ -33,8 +33,12 @@ fn build_chat_request(
     response_format: Option<&crate::types::ResponseFormat>,
     thinking_disabled: bool,
     model_override: Option<&str>,
+    supports_vision: bool,
 ) -> AgentResult<llm_trait::ChatRequest> {
     let mut messages = messages.to_vec();
+    if !supports_vision {
+        withhold_images_for_text_only(&mut messages);
+    }
     crate::image_ops::apply_image_budget(&mut messages)
         .map_err(|e| crate::types::AgentError::llm(e.to_string()))?;
     let mut request = llm_trait::ChatRequest::new(messages);
@@ -81,6 +85,34 @@ fn build_chat_request(
     }
 
     Ok(request)
+}
+
+/// Modality normalization: a text-only model gets words about the picture,
+/// never the picture. The pass runs on this wire copy only — the session's
+/// history keeps the originals (a later vision model sees them for free),
+/// the same contract [`crate::image_ops::apply_image_budget`] documents.
+/// Never silent: the residue says a picture existed and how to recover it.
+fn withhold_images_for_text_only(messages: &mut [ChatMessage]) {
+    for msg in messages.iter_mut() {
+        let (content, images) = match msg {
+            ChatMessage::User {
+                content, images, ..
+            }
+            | ChatMessage::Tool {
+                content, images, ..
+            } => (content, images),
+            _ => continue,
+        };
+        if images.is_empty() {
+            continue;
+        }
+        let count = images.len();
+        images.clear();
+        content.push_str(&format!(
+            "\n[image omitted: this model cannot see images — {count} picture(s) withheld; \
+             switch to a vision model with /model and ask again]"
+        ));
+    }
 }
 
 /// Convert a `ChatStream` (new) to the old stream type consumed by `process_stream`.
@@ -300,6 +332,7 @@ impl LlmEngine {
             response_format,
             thinking_disabled,
             model_override.as_deref(),
+            self.get_provider().capabilities().supports_vision,
         )?;
         let result = self.stream_cancellable(cancel_token, request).await;
         match &result {
@@ -329,6 +362,7 @@ impl LlmEngine {
             response_format,
             thinking_disabled,
             model_override.as_deref(),
+            self.get_provider().capabilities().supports_vision,
         )?;
         let mut attempt = 1;
         let mut delay_ms = retry.initial_backoff_ms;
@@ -607,6 +641,20 @@ impl LlmEngine {
             "LLM stream done"
         );
 
+        // Integrity facts (shape-based): orphan args bytes on name-less
+        // buckets (misplaced tail) and named calls whose args are non-empty
+        // but unparseable (wire truncation). Computed over ALL buckets —
+        // the filter below drops orphans from tool_calls but the evidence
+        // must survive into the record.
+        let mut integrity = StreamIntegrity::default();
+        for (_id, name, args) in aggregator.partials.values() {
+            if name.is_empty() {
+                integrity.orphan_args_bytes += args.len();
+            } else if !args.is_empty() && serde_json::from_str::<Value>(args).is_err() {
+                integrity.invalid_args += 1;
+            }
+        }
+
         let tool_calls = aggregator
             .partials
             .into_iter()
@@ -636,6 +684,7 @@ impl LlmEngine {
             reasoning_text: aggregator.reasoning_text,
             is_tool_call: aggregator.is_tool_call,
             tool_calls,
+            integrity,
             usage: aggregator.usage,
             finish_reason: aggregator.finish_reason,
             ttft_ms: aggregator.ttft_ms,
@@ -655,6 +704,11 @@ impl LlmEngine {
     }
 }
 
+/// Structural integrity facts about one assembled tool-call batch —
+/// shared vocabulary with the guard seam (single source of truth:
+/// `agent_types::StreamIntegrity`).
+pub use agent_types::StreamIntegrity;
+
 pub struct LlmTurnResult {
     pub full_text: String,
     /// Reasoning/thinking content accumulated from Thought stream chunks.
@@ -662,6 +716,10 @@ pub struct LlmTurnResult {
     pub reasoning_text: String,
     pub is_tool_call: bool,
     pub tool_calls: Vec<Value>,
+    /// Structural facts about the assembled tool calls (wire-corruption
+    /// detection). Computed from shape only — provider stop reasons are
+    /// never trusted (they lie; see notes/spawn-agent-truncation-analysis.md).
+    pub integrity: StreamIntegrity,
     pub usage: Option<UsageInfo>,
     /// Provider stop reason (e.g. "stop", "length", "tool_calls", "end_turn").
     /// `"length"` means the response hit the token limit — tool call arguments may be truncated.

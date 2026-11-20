@@ -29,7 +29,7 @@ pub use executor::{
 };
 pub use middleware::{Middleware, PostLlmCtx, PreLlmCtx, UserMessageCtx};
 pub use pipeline::{DefaultPipeline, ToolExecutionPipeline};
-pub use react_loop_guard::{GuardCtx, GuardDecision, NoopGuard, ReactLoopGuard};
+pub use react_loop_guard::{GuardCtx, GuardDecision, NoopGuard, ReactLoopGuard, StreamIntegrity};
 pub(crate) use runtime::EventBus;
 pub use runtime::{NoticeHandle, ProviderHandle};
 

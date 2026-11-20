@@ -205,10 +205,13 @@ impl<'c> ToolCallExecutor<'c> {
                     .into_iter()
                     .collect();
                 let error_msg = format!(
-                    "Tool [{}] repeatedly truncated ({} attempts). Model did not \
-                     follow redirect instruction. Stopping run.",
-                    failed_tools.join(", "),
+                    "Tool calls kept arriving with truncated arguments ({} consecutive \
+                     damaged responses; tools in the last batch: {}). The provider is \
+                     cutting off the argument stream mid-generation — this is not a \
+                     model mistake, and no truncated call was executed. Type `continue` \
+                     to resume from the last completed step.",
                     strikes_after,
+                    failed_tools.join(", "),
                 );
                 tracing::error!(
                     session_id = session_id.id,
@@ -249,15 +252,13 @@ impl<'c> ToolCallExecutor<'c> {
                     "truncation circuit breaker tripped — redirecting model away from truncated tool"
                 );
                 let redirect_msg = format!(
-                    "CRITICAL: The tool [{}] has had its arguments truncated {} \
-                     consecutive times. Its parameter schema is too complex for \
-                     this model to generate. You MUST NOT call [{}] again in this \
-                     session. Instead, perform the task directly using other \
-                     available tools (bash, read_file, write_file, etc.). \
-                     Do not attempt [{}] again.",
-                    failed_tools.join(", "),
+                    "CRITICAL: tool-call arguments arrived truncated {} consecutive \
+                     times — the provider is cutting off the argument stream; this is \
+                     not about your wording or the tool schema. You MUST NOT re-issue \
+                     the same call unchanged. Use other available tools (bash, \
+                     read_file, write_file, etc.) or answer directly. Affected tools: \
+                     [{}].",
                     strikes_after,
-                    failed_tools.join(", "),
                     failed_tools.join(", "),
                 );
                 self.core

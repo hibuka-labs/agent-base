@@ -74,6 +74,7 @@ fn classify_maps_envelope_states() {
         tool_calls: vec![serde_json::json!({
             "id": "call_1", "name": "echo", "arguments": "{\"x\":1}"
         })],
+        integrity: Default::default(),
         usage: None,
         finish_reason: Some("tool_calls".into()),
         ttft_ms: 1,

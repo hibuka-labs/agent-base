@@ -92,6 +92,13 @@ pub struct RunState {
     /// retrying and fail with an actionable message.
     #[serde(default)]
     pub truncation_strikes: usize,
+    /// Session-lifetime count of structurally corrupt tool-call batches seen.
+    #[serde(default)]
+    pub integrity_failures: u32,
+    /// Session-lifetime count of silent retries spent (corrupt round discarded
+    /// whole, LLM re-asked from the same state).
+    #[serde(default)]
+    pub silent_retries: u32,
 
     /// The latest tool batch parked on a human step (a design-canvas screen
     /// awaiting a pick) and no tool ran after it. Overwritten per batch by
@@ -162,6 +169,21 @@ impl RunState {
     pub fn record_truncation(&mut self) -> usize {
         self.truncation_strikes += 1;
         self.truncation_strikes
+    }
+
+    /// A tool-call batch arrived structurally corrupt (wire truncation /
+    /// misplaced args fragments). Counted per dirty batch — whether or not a
+    /// silent retry was spent on it. Session-lifetime (not reset per run).
+    pub fn record_integrity_failure(&mut self) -> u32 {
+        self.integrity_failures += 1;
+        self.integrity_failures
+    }
+
+    /// A corrupt round was discarded whole and the LLM re-asked. Session-
+    /// lifetime; the per-round budget travels with the retry itself.
+    pub fn record_silent_retry(&mut self) -> u32 {
+        self.silent_retries += 1;
+        self.silent_retries
     }
 }
 

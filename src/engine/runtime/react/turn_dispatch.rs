@@ -36,6 +36,7 @@ impl RuntimeCore {
         on_event: Arc<Mutex<F>>,
         all_user_inputs: &[String],
         max_turns: u32,
+        silent_retries_in_round: u32,
     ) -> AgentResult<TurnFlow>
     where
         F: FnMut(RuntimeEvent) -> AgentResult<()> + Send + 'static,
@@ -106,9 +107,10 @@ impl RuntimeCore {
             llm_duration_ms,
             reasoning_only,
             is_tool_call: _,
-            tool_calls: _,
+            tool_calls,
             finish_reason: _,
             thinking_signature: _,
+            integrity,
         } = turn;
 
         let turn_ctx = TurnCtx {
@@ -121,6 +123,11 @@ impl RuntimeCore {
             model,
             all_user_inputs,
             max_turns,
+            integrity: &integrity,
+            has_visible_text: !full_text.is_empty(),
+            has_thinking,
+            silent_retries_in_round,
+            raw_tool_calls: &tool_calls,
         };
         let metrics = TurnMetrics {
             ttft_ms,
@@ -341,6 +348,60 @@ impl RuntimeCore {
             .build_guard_ctx(turn_ctx, "", false, false, false, thinking_disabled)
             .await;
         let decision = self.guard.on_tool_call(&guard_ctx).await;
+
+        // Turn-as-transaction seam: RetryTurn discards this response whole —
+        // no history commit, no tool execution — and re-asks the LLM from the
+        // same state. Honored only while the round's retry budget has room
+        // under the kernel hard cap; past it the corrupt batch falls through
+        // to the existing ladder below (sanitize + re-issue), so a rogue
+        // guard can never spin the loop.
+        // A dirty batch is a wire-corruption event — count it whether or not
+        // the policy spends a silent retry on it.
+        if !turn_ctx.integrity.is_clean() {
+            self.with_session_mut(turn_ctx.session_id, |session| {
+                session.run_state.record_integrity_failure();
+            })
+            .await?;
+        }
+
+        if matches!(
+            decision,
+            crate::engine::react_loop_guard::GuardDecision::RetryTurn
+        ) {
+            const KERNEL_SILENT_RETRY_CAP: u32 = 2;
+            if turn_ctx.silent_retries_in_round < KERNEL_SILENT_RETRY_CAP {
+                tracing::warn!(
+                    session_id = turn_ctx.session_id.id,
+                    turn = turn_ctx.turn_count,
+                    integrity = ?turn_ctx.integrity,
+                    retries_in_round = turn_ctx.silent_retries_in_round,
+                    "stream integrity: discarding corrupt response whole and re-asking LLM \
+                     (turn-as-transaction; nothing committed, nothing executed)"
+                );
+                self.with_session_mut(turn_ctx.session_id, |session| {
+                    session.run_state.record_silent_retry();
+                })
+                .await?;
+                // Publish the discarded response — the session's event log
+                // keeps the evidence (raw calls, still broken).
+                self.event_bus.emit(RuntimeEvent::IntegrityDiscard {
+                    session_id: turn_ctx.session_id.clone(),
+                    turn: turn_ctx.turn_count,
+                    retries_in_round: turn_ctx.silent_retries_in_round,
+                    invalid_args: turn_ctx.integrity.invalid_args,
+                    orphan_args_bytes: turn_ctx.integrity.orphan_args_bytes,
+                    tool_calls: turn_ctx.raw_tool_calls.to_vec(),
+                    text: full_text.clone(),
+                });
+                return Ok(TurnFlow::RetryLlm);
+            }
+            tracing::warn!(
+                session_id = turn_ctx.session_id.id,
+                turn = turn_ctx.turn_count,
+                retries_in_round = turn_ctx.silent_retries_in_round,
+                "RetryTurn requested past kernel hard cap — falling through to the guard ladder"
+            );
+        }
 
         // 2. Handle RestoreThinking (update RunState)
         if matches!(
@@ -781,6 +842,34 @@ impl RuntimeCore {
     ) -> AgentResult<TurnFlow> {
         use crate::engine::react_loop_guard::GuardDecision;
         match decision {
+            GuardDecision::RetryTurn => {
+                // Out of contract here (on_turn paths commit or have no
+                // ladder to fall to) — never discard a committed response.
+                tracing::warn!(
+                    session_id = turn_ctx.session_id.id,
+                    turn = turn_ctx.turn_count,
+                    "RetryTurn from on_turn is not actionable (response already committed) — continuing"
+                );
+                self.fire_turn_end(TurnEndCtx {
+                    ttft_ms: metrics.ttft_ms,
+                    llm_duration_ms: metrics.llm_duration_ms,
+                    usage: metrics.usage,
+                    text_length: metrics.text_len,
+                    has_thinking: metrics.has_thinking,
+                    thinking_bytes: metrics.thinking_bytes,
+                    llm_calls: 1,
+                    ..TurnEndCtx::new(
+                        turn_ctx.session_id,
+                        turn_ctx.turn_count,
+                        turn_ctx.turn_start,
+                        turn_ctx.model,
+                        turn_ctx.user_input,
+                        RunOutcome::Continuing,
+                    )
+                })
+                .await;
+                Ok(TurnFlow::Continue)
+            }
             GuardDecision::Continue { nudge } => {
                 tracing::info!(
                     session_id = turn_ctx.session_id.id,

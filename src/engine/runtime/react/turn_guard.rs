@@ -29,6 +29,18 @@ pub(super) struct TurnCtx<'a> {
     pub model: &'a str,
     pub all_user_inputs: &'a [String],
     pub max_turns: u32,
+    /// Structural facts about the assembled tool-call batch (wire
+    /// corruption detection) — shape-based, provider stop reasons untrusted.
+    pub integrity: &'a agent_types::StreamIntegrity,
+    /// The response carried visible text (already streamed to the user).
+    pub has_visible_text: bool,
+    /// The response carried thinking content.
+    pub has_thinking: bool,
+    /// Silent retries already spent on the current logical round.
+    pub silent_retries_in_round: u32,
+    /// The turn's assembled tool calls, verbatim — the forensic payload of a
+    /// discarded (corrupt) round.
+    pub raw_tool_calls: &'a [serde_json::Value],
 }
 
 impl RuntimeCore {
@@ -85,6 +97,10 @@ impl RuntimeCore {
             thinking_disabled,
             original_thinking_enabled: session_data.4,
             remaining_turns: turn_ctx.max_turns.saturating_sub(turn_ctx.turn_count),
+            integrity: *turn_ctx.integrity,
+            has_visible_text: turn_ctx.has_visible_text,
+            has_thinking: turn_ctx.has_thinking,
+            silent_retries_in_round: turn_ctx.silent_retries_in_round,
         }
     }
 
@@ -191,6 +207,10 @@ mod tests {
             thinking_disabled: false,
             original_thinking_enabled: true,
             remaining_turns: 50,
+            integrity: Default::default(),
+            has_visible_text: false,
+            has_thinking: false,
+            silent_retries_in_round: 0,
         };
         let debug_str = format!("{:?}", ctx);
         assert!(debug_str.contains("session_id"));
@@ -220,6 +240,10 @@ mod tests {
             thinking_disabled: true,
             original_thinking_enabled: true,
             remaining_turns: 50,
+            integrity: Default::default(),
+            has_visible_text: false,
+            has_thinking: false,
+            silent_retries_in_round: 0,
         };
         assert!(ctx.is_reasoning_only);
         assert!(!ctx.is_empty_response);
@@ -253,6 +277,10 @@ mod tests {
             thinking_disabled: false,
             original_thinking_enabled: true,
             remaining_turns: 50,
+            integrity: Default::default(),
+            has_visible_text: false,
+            has_thinking: false,
+            silent_retries_in_round: 0,
         };
 
         let decision = guard.on_turn(&ctx).await;

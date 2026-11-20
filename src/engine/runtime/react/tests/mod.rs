@@ -26,6 +26,7 @@ mod cancel_paths;
 mod ephemeral;
 mod event_order;
 mod guards;
+mod integrity_retry;
 mod middleware;
 mod notice_pump;
 mod resume_code_backend;

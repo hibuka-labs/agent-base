@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 
 // Re-export from agent-types (single source of truth).
-pub use agent_types::{GuardCtx, GuardDecision};
+pub use agent_types::{GuardCtx, GuardDecision, StreamIntegrity};
 
 use crate::engine::runtime::{NoticeHandle, ProviderHandle};
 
@@ -100,6 +100,10 @@ mod tests {
             thinking_disabled: false,
             original_thinking_enabled: true,
             remaining_turns: 50,
+            integrity: Default::default(),
+            has_visible_text: false,
+            has_thinking: false,
+            silent_retries_in_round: 0,
         };
 
         assert!(matches!(guard.on_turn(&ctx).await, GuardDecision::Complete));
@@ -130,6 +134,10 @@ mod tests {
             thinking_disabled: false,
             original_thinking_enabled: true,
             remaining_turns: 50,
+            integrity: Default::default(),
+            has_visible_text: false,
+            has_thinking: false,
+            silent_retries_in_round: 0,
         };
         assert!(matches!(
             guard.on_turn(&ctx).await,

@@ -32,6 +32,41 @@ pub enum GuardDecision {
     /// 1. Restore thinking_disabled_for_rest_of_run to original state
     /// 2. Reset related counters
     RestoreThinking,
+
+    // ─── Turn-as-transaction (stream integrity) ───────────────
+    /// Discard this response whole and re-ask the LLM from the same state.
+    ///
+    /// For silent rounds whose tool-call batch is structurally corrupt (wire
+    /// truncation / misplaced args fragments). The kernel executes the
+    /// discard: NO history commit, NO tool execution — the response never
+    /// happened. The retry stays inside the current turn (`turn_count`
+    /// unchanged) and is bounded by the policy budget carried in
+    /// [`GuardCtx::silent_retries_in_round`] plus a kernel hard cap.
+    /// Never returned for rounds whose text already reached the user.
+    RetryTurn,
+}
+
+/// Structural integrity facts about one assembled tool-call batch.
+///
+/// Detection is shape-based (never provider metadata — stop reasons lie):
+/// a named call whose args are non-empty but not valid JSON is wire
+/// truncation; args fragments arriving on a name-less bucket are a misplaced
+/// tail (the provider leaked them past the owning block, e.g. into a
+/// thinking block's index).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamIntegrity {
+    /// Named tool calls with non-empty, unparseable args.
+    #[serde(default)]
+    pub invalid_args: usize,
+    /// Bytes of args fragments that landed on name-less buckets.
+    #[serde(default)]
+    pub orphan_args_bytes: usize,
+}
+
+impl StreamIntegrity {
+    pub fn is_clean(&self) -> bool {
+        self.invalid_args == 0 && self.orphan_args_bytes == 0
+    }
 }
 
 /// Guard context information — built by runtime, passed to guard.
@@ -78,6 +113,23 @@ pub struct GuardCtx {
     /// choices for them).
     #[serde(default)]
     pub awaiting_human: bool,
+    /// Structural facts about this turn's assembled tool-call batch (wire
+    /// corruption detection). Clean on healthy streams.
+    #[serde(default)]
+    pub integrity: StreamIntegrity,
+    /// The response carried visible text (already streamed to the user) —
+    /// a round with text can never be silently discarded.
+    #[serde(default)]
+    pub has_visible_text: bool,
+    /// The response carried thinking content (tolerated as "silent" by
+    /// default policy; tighten via config).
+    #[serde(default)]
+    pub has_thinking: bool,
+    /// Silent retries already spent on the current logical round (a retry
+    /// keeps the same round). Policy budget compares against this; the kernel
+    /// enforces its own hard cap on top.
+    #[serde(default)]
+    pub silent_retries_in_round: u32,
     // Environment state
     pub thinking_disabled: bool,
     /// Original thinking configuration (for restoration)

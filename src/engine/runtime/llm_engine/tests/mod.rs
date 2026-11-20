@@ -4,6 +4,8 @@ use async_trait::async_trait;
 use llm_trait::{Capabilities, ChatRequest, ChatStream, LlmError, LlmProvider, ProviderInfo};
 use std::pin::Pin;
 
+mod integrity;
+
 struct StubProvider(&'static str);
 
 #[async_trait]
@@ -853,7 +855,7 @@ fn a_word_only_history_is_untouched() {
         ChatMessage::tool("t1", "done"),
         ChatMessage::assistant("ok"),
     ];
-    let request = build_chat_request(&messages, &[], None, None, false, None)
+    let request = build_chat_request(&messages, &[], None, None, false, None, true)
         .expect("a word-only history builds");
     assert_eq!(
         format!("{:?}", request.messages),
@@ -872,7 +874,7 @@ fn a_word_only_history_is_untouched() {
 #[test]
 fn every_request_claims_tool_call_batching() {
     let messages = vec![ChatMessage::user("hi")];
-    let request = build_chat_request(&messages, &[], None, None, false, None)
+    let request = build_chat_request(&messages, &[], None, None, false, None, true)
         .expect("a one-message request builds");
     assert_eq!(
         request.parallel_tool_calls,

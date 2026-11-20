@@ -57,4 +57,8 @@ pub struct TurnContext {
     pub approval_count: u32,
     /// Number of LLM calls made (≥ 1; includes retries).
     pub llm_calls: u32,
+    /// Session-lifetime count of silent retries spent on corrupt rounds.
+    pub silent_retries: u32,
+    /// Session-lifetime count of structurally corrupt tool-call batches seen.
+    pub integrity_failures: u32,
 }

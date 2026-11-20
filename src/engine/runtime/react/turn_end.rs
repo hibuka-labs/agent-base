@@ -7,6 +7,16 @@ impl RuntimeCore {
     /// (e.g. phi-telemetry) do that via their registered callback.
     pub(super) async fn fire_turn_end(&self, ctx: TurnEndCtx<'_>) {
         let duration_ms = ctx.turn_start.elapsed().as_millis() as u64;
+        // Session-lifetime integrity counters (metrics seam): how many
+        // corrupt batches this session saw and how many silent retries it
+        // spent. Read at turn end so the numbers reflect the round that just
+        // committed.
+        let (silent_retries, integrity_failures) = self
+            .session_manager
+            .session_or_err(ctx.session_id)
+            .await
+            .map(|s| (s.run_state.silent_retries, s.run_state.integrity_failures))
+            .unwrap_or((0, 0));
 
         let turn_ctx = crate::types::TurnContext {
             session_id: ctx.session_id.id,
@@ -30,6 +40,8 @@ impl RuntimeCore {
             plan_updates: self.event_bus.take_plan_updates(),
             approval_count: self.event_bus.take_approval_count(),
             llm_calls: ctx.llm_calls,
+            silent_retries,
+            integrity_failures,
         };
 
         let callbacks = self.turn_end_callbacks.read().unwrap();

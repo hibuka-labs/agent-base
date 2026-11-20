@@ -90,9 +90,12 @@ async fn truncation_circuit_breaker_redirects_then_hard_stops() {
     match &outcome {
         RunOutcome::Failed { error } => {
             assert!(
-                error.contains("repeatedly truncated"),
-                "error should mention repeated truncation: {}",
-                error,
+                error.contains("consecutive damaged responses"),
+                "hard-stop copy must state the real cause (provider-side                  truncation, cross-tool streak): {error}"
+            );
+            assert!(
+                !error.contains("did not follow redirect"),
+                "hard-stop copy must not blame the model for the redirect: {error}"
             );
         }
         other => panic!("expected RunOutcome::Failed at hard limit, got {:?}", other),

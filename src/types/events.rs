@@ -106,6 +106,28 @@ pub enum RuntimeEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         trace_id: Option<String>,
     },
+    /// A corrupt tool-call batch was discarded whole and the LLM re-asked
+    /// (turn-as-transaction). Carries the discarded response so the session's
+    /// event log keeps the evidence: the raw tool calls (arguments still
+    /// broken — that IS the evidence), the structural facts, and the text the
+    /// round carried.
+    #[serde(alias = "integrityDiscard")]
+    IntegrityDiscard {
+        session_id: SessionId,
+        /// Turn the discard happened in.
+        turn: u32,
+        /// Silent retries already spent on this logical round.
+        retries_in_round: u32,
+        /// Named tool calls whose arguments did not parse.
+        invalid_args: usize,
+        /// Bytes of args fragments that landed on name-less buckets (the
+        /// provider leaked the tail past its owning block).
+        orphan_args_bytes: usize,
+        /// The discarded calls, verbatim (arguments as the provider sent them).
+        tool_calls: Vec<serde_json::Value>,
+        /// The text the discarded round carried (empty on silent rounds).
+        text: String,
+    },
     #[serde(alias = "toolCallFinished")]
     ActionFinished {
         session_id: SessionId,
@@ -187,6 +209,7 @@ impl RuntimeEvent {
             RuntimeEvent::ThoughtDelta { session_id, .. } => session_id,
             RuntimeEvent::ActionDraft { session_id, .. } => session_id,
             RuntimeEvent::ActionStarted { session_id, .. } => session_id,
+            RuntimeEvent::IntegrityDiscard { session_id, .. } => session_id,
             RuntimeEvent::ActionFinished { session_id, .. } => session_id,
             RuntimeEvent::AwaitingApproval { session_id, .. } => session_id,
             RuntimeEvent::Checkpoint { session_id, .. } => session_id,
@@ -211,6 +234,7 @@ impl RuntimeEvent {
             RuntimeEvent::RunCancelled { agent_id, .. } => agent_id.as_deref(),
             RuntimeEvent::PlanUpdated { agent_id, .. } => agent_id.as_deref(),
             RuntimeEvent::UserEvent { agent_id, .. } => agent_id.as_deref(),
+            RuntimeEvent::IntegrityDiscard { .. } => None,
         }
     }
 
@@ -228,6 +252,7 @@ impl RuntimeEvent {
             RuntimeEvent::RunCancelled { trace_id, .. } => trace_id.as_deref(),
             RuntimeEvent::PlanUpdated { trace_id, .. } => trace_id.as_deref(),
             RuntimeEvent::UserEvent { trace_id, .. } => trace_id.as_deref(),
+            RuntimeEvent::IntegrityDiscard { .. } => None,
         }
     }
 
@@ -246,6 +271,8 @@ impl RuntimeEvent {
             | RuntimeEvent::RunCancelled { agent_id, .. }
             | RuntimeEvent::PlanUpdated { agent_id, .. }
             | RuntimeEvent::UserEvent { agent_id, .. } => *agent_id = Some(id),
+            // Session-scoped event: no agent path to stamp.
+            RuntimeEvent::IntegrityDiscard { .. } => {}
         }
         self
     }

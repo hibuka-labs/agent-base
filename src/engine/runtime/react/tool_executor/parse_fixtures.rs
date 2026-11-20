@@ -35,6 +35,7 @@ fn turn(
         reasoning_text: String::new(),
         is_tool_call,
         tool_calls: calls,
+        integrity: Default::default(),
         usage: None,
         finish_reason: finish.map(String::from),
         ttft_ms: 1,

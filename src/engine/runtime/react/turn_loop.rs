@@ -18,6 +18,11 @@ use super::turn_end::TurnEndCtx;
 /// terminate the turn with a final outcome.
 pub(super) enum TurnFlow {
     Continue,
+    /// Turn-as-transaction: discard the response whole — nothing committed,
+    /// nothing executed — and re-ask the LLM within the same round
+    /// (`turn_count` unchanged). Created only while the round's retry budget
+    /// has room (see the tool-call branch gate).
+    RetryLlm,
     Done(RunOutcome),
 }
 
@@ -331,43 +336,57 @@ impl RuntimeCore {
                 trace_id: None,
             });
 
-            tracing::info!(
-                session_id = session_id.id,
-                turn = turn_count,
-                msg_count = messages.len(),
-                tool_count = tools_for_turn.len(),
-                "calling LLM"
-            );
+            let mut retries_this_round: u32 = 0;
+            let flow = 'retry: loop {
+                tracing::info!(
+                    session_id = session_id.id,
+                    turn = turn_count,
+                    msg_count = messages.len(),
+                    tool_count = tools_for_turn.len(),
+                    "calling LLM"
+                );
 
-            let result = self
-                .llm_call_with_retry(
-                    session_id,
-                    &messages,
-                    &tools_for_turn,
-                    &config,
-                    thinking_disabled,
-                    turn_count,
-                    event_rx,
-                    on_event.clone(),
-                )
-                .await;
+                let result = self
+                    .llm_call_with_retry(
+                        session_id,
+                        &messages,
+                        &tools_for_turn,
+                        &config,
+                        thinking_disabled,
+                        turn_count,
+                        event_rx,
+                        on_event.clone(),
+                    )
+                    .await;
 
-            match self
-                .handle_llm_turn(
-                    session_id,
-                    user_input_owned,
-                    &tool_definitions,
-                    turn_count,
-                    turn_start,
-                    &model,
-                    result,
-                    event_rx,
-                    on_event.clone(),
-                    all_user_inputs,
-                    max_turns,
-                )
-                .await?
-            {
+                match self
+                    .handle_llm_turn(
+                        session_id,
+                        user_input_owned,
+                        &tool_definitions,
+                        turn_count,
+                        turn_start,
+                        &model,
+                        result,
+                        event_rx,
+                        on_event.clone(),
+                        all_user_inputs,
+                        max_turns,
+                        retries_this_round,
+                    )
+                    .await?
+                {
+                    TurnFlow::RetryLlm => {
+                        // Nothing was committed or executed — re-ask from
+                        // the same state. The counter feeds the guard's
+                        // budget facts on the next pass.
+                        retries_this_round += 1;
+                        continue 'retry;
+                    }
+                    other => break other,
+                }
+            };
+            match flow {
                 TurnFlow::Continue => {
                     // Inline compaction check — context may have grown after
                     // tool execution. The compactor owns ALL threshold
@@ -417,6 +436,10 @@ impl RuntimeCore {
                     continue;
                 }
                 TurnFlow::Done(outcome) => return Ok((outcome, turn_count)),
+                // RetryLlm is consumed by the inner loop; reaching here would
+                // mean a retry survived its own budget check. Degrade to a
+                // fresh outer iteration (bounded by max_turns).
+                TurnFlow::RetryLlm => continue,
             }
         }
     }

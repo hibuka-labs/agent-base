@@ -28,7 +28,7 @@ pub use checkpoint::{
     ToolResultData,
 };
 pub use execution::{FinishReason, RunOutcome};
-pub use guard::{GuardCtx, GuardDecision};
+pub use guard::{GuardCtx, GuardDecision, StreamIntegrity};
 pub use interaction::{AskAnswer, AskOption};
 pub use message::MessageRole;
 pub use notify::{Notice, NoticeKind};
