@@ -104,11 +104,13 @@ fn scrub_value(v: &mut Value) -> bool {
                 true
             }
         }
-        Value::Array(a) => a.iter_mut().map(scrub_value).fold(false, |acc, c| acc || c),
+        // Bitwise `|`, not `||`: scrub_value mutates in place, so every element
+        // must be visited — an `any`-style short circuit would skip the rest.
+        Value::Array(a) => a.iter_mut().map(scrub_value).fold(false, |acc, c| acc | c),
         Value::Object(o) => o
             .values_mut()
             .map(scrub_value)
-            .fold(false, |acc, c| acc || c),
+            .fold(false, |acc, c| acc | c),
         _ => false,
     }
 }
@@ -434,11 +436,11 @@ mid<tool_call><function=a_tool><parameter=x>2</tool_call>";
     #[test]
     fn only_whitelisted_trailing_tags_are_residue() {
         assert_eq!(strip_markup_tail("all\u{3c}/parameter>"), "all");
+        assert_eq!(strip_markup_tail("x\u{3c}/parameter>\u{3c}/function>"), "x");
         assert_eq!(
-            strip_markup_tail("x\u{3c}/parameter>\u{3c}/function>"),
-            "x"
+            strip_markup_tail("see the \u{3c}/html>"),
+            "see the \u{3c}/html>"
         );
-        assert_eq!(strip_markup_tail("see the \u{3c}/html>"), "see the \u{3c}/html>");
         assert_eq!(
             strip_markup_tail("a\u{3c}/parameter>b"),
             "a\u{3c}/parameter>b"

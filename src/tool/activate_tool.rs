@@ -55,10 +55,7 @@ impl ActivateTool {
     /// Hand this opener the registry's shared deferred-definition catalog so
     /// tools registered after [`Self::new`] become openable too. Idempotent;
     /// the first call wins.
-    pub fn set_deferred_defs(
-        &self,
-        defs: Arc<std::sync::RwLock<HashMap<String, Value>>>,
-    ) {
+    pub fn set_deferred_defs(&self, defs: Arc<std::sync::RwLock<HashMap<String, Value>>>) {
         let _ = self.late.set(defs);
     }
 
@@ -69,7 +66,11 @@ impl ActivateTool {
             return Some(hit.clone());
         }
         let defs = self.late.get()?;
-        let def = defs.read().expect("deferred-defs lock poisoned").get(name).cloned()?;
+        let def = defs
+            .read()
+            .expect("deferred-defs lock poisoned")
+            .get(name)
+            .cloned()?;
         Some((ToolExposure::Deferred, def))
     }
 

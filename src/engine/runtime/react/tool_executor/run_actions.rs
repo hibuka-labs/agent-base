@@ -360,8 +360,7 @@ impl<'c> ToolCallExecutor<'c> {
             // Per-call result text. Missing-required-field calls go through the
             // injected handler; anything else uses the generic guidance above.
             let mut stop_reason: Option<String> = None;
-            let mut pre_resolved: Vec<(String, String)> =
-                Vec::with_capacity(invalid_indices.len());
+            let mut pre_resolved: Vec<(String, String)> = Vec::with_capacity(invalid_indices.len());
             for &i in &invalid_indices {
                 let missing = missing_fields
                     .iter()

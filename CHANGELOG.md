@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.1] - 2026-11-22
+
+### Fixed
+- **A run that hits the turn cap still delivers what it found.** The cap
+  used to end the run before the final model call, so a child that ran out
+  of turns handed its parent a bare "max turns exceeded" and every finding
+  was discarded. The cap now runs one text-only synthesis turn first and
+  writes the report as the run's final answer, then ends honestly with the
+  same `MaxTurnsExceeded` outcome. A failed or empty synthesis call falls
+  back to the old hard stop — the salvage is best-effort, never a new
+  failure mode.
+
+- **Tool-call argument scrubbing visits every value.** The scrub walked a
+  JSON array or object with an `any`-style short circuit: the first clean
+  element ended the walk, and the remaining (still dirty) elements were
+  never touched, so leaked template tags could still reach a tool. The walk
+  is now bitwise, so every element is visited.
+
+### Changed
+- **Tests run on every release platform.** CI builds and runs the test
+  suite on Linux, macOS and Windows instead of Linux alone — platform-only
+  breaks (a Windows-only path bug, a Windows-only build failure) used to
+  reach users because nothing upstream caught them. A new `platform-gate`
+  job rejects hand-rolled `HOME` / `USERPROFILE` environment lookups at
+  any call site: home resolution goes through `dirs::home_dir()` or the
+  repo's own home helper, so the Windows path (where only `USERPROFILE` is
+  set) cannot be missed again.
+
 ## [0.16.0] - 2026-11-20
 
 ### Added

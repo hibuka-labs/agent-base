@@ -374,8 +374,10 @@ async fn run_managed_text_only_event_order() {
 
 #[tokio::test]
 async fn max_turns_exceeded_event_order() {
-    // Turn 1 requests a tool; with max_turns = 1, turn 2 hits the cap
-    // before any LLM call, so the second script entry is never consumed.
+    // Turn 1 requests a tool; with max_turns = 1, turn 2 hits the cap before
+    // the normal turn machinery. The cap's grace synthesis call consumes the
+    // second script entry (text-only, no BeforeLlm checkpoint), then the run
+    // ends — so the terminal sequence is unchanged.
     let runtime = AgentBuilder::new(Arc::new(ScriptedProvider::new(vec![
         vec![
             StreamChunk::ToolCall(serde_json::json!({

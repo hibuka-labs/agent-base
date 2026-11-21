@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
 mod cancel_paths;
+mod cap_grace;
 mod ephemeral;
 mod event_order;
 mod guards;

@@ -14,6 +14,16 @@ use crate::types::{
 use super::entry::drain_locked;
 use super::turn_end::TurnEndCtx;
 
+/// The forced final-answer request sent once when the turn budget runs out:
+/// a single text-only synthesis call (the "grace turn"). Without it the cap
+/// tripped right after the last tool call, the final LLM call never happened,
+/// and the parent received a bare "max turns exceeded" with every finding
+/// discarded (2026-11-21: two reviewer sub-agents died at the wall with zero
+/// findings delivered).
+const GRACE_FINAL_ANSWER: &str = "Your turn budget is exhausted. This is the final message of \
+    this run: write your complete final answer now from everything you have already seen. \
+    Do not attempt any tool calls.";
+
 /// Control-flow result of one `handle_llm_turn` call: keep looping, or
 /// terminate the turn with a final outcome.
 pub(super) enum TurnFlow {
@@ -204,6 +214,75 @@ impl RuntimeCore {
             }
 
             if turn_count > max_turns {
+                // Grace synthesis turn: one text-only LLM call so the
+                // work already done lands in a final answer instead of
+                // dying at the wall. No tools, no action dispatch — just
+                // the report. Best-effort: a failed or empty call falls
+                // through to the hard stop with no salvage.
+                tracing::warn!(
+                    session_id = session_id.id,
+                    turn_count,
+                    max_turns,
+                    "max turns exceeded — running one final synthesis turn"
+                );
+                self.with_session_mut(session_id, |session| {
+                    session.push_user_synthetic(GRACE_FINAL_ANSWER);
+                })
+                .await?;
+                let messages = {
+                    let session = self.session_manager.session_or_err(session_id).await?;
+                    let raw = session.chat_messages().to_vec();
+                    match &self.convert_to_llm {
+                        Some(convert) => convert(&raw),
+                        None => default_convert_to_llm(&raw),
+                    }
+                };
+                let thinking_disabled = self
+                    .with_session_mut(session_id, |session| {
+                        session.run_state.thinking_disabled_for_rest_of_run
+                    })
+                    .await?;
+                let salvage = match self
+                    .llm_call_with_retry(
+                        session_id,
+                        &messages,
+                        &[],
+                        &config,
+                        thinking_disabled,
+                        turn_count,
+                        event_rx,
+                        on_event.clone(),
+                    )
+                    .await
+                {
+                    Ok(turn) => turn.full_text,
+                    Err(e) if e.is_cancelled() => {
+                        self.fire_turn_end(TurnEndCtx::new(
+                            session_id,
+                            turn_count,
+                            turn_start,
+                            &model,
+                            user_input_owned,
+                            RunOutcome::Cancelled,
+                        ))
+                        .await;
+                        return Ok((RunOutcome::Cancelled, turn_count));
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            session_id = session_id.id,
+                            error = %e,
+                            "grace synthesis call failed; ending without a salvage report"
+                        );
+                        String::new()
+                    }
+                };
+                if !salvage.trim().is_empty() {
+                    self.with_session_mut(session_id, |session| {
+                        session.push_message(MessageRole::Assistant, salvage.as_str());
+                    })
+                    .await?;
+                }
                 tracing::warn!(
                     session_id = session_id.id,
                     turn_count,
