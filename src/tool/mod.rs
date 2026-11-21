@@ -473,6 +473,14 @@ pub struct ToolRegistry {
     /// registration order irrelevant: some tools are registered directly, some
     /// arrive from a factory at build time, some come from plugins.
     deferred: HashSet<String>,
+    /// Rendered definitions of deferred-marked tools — shared across registry
+    /// clones, fed by [`Self::defer`] and [`Self::register_arc`].
+    ///
+    /// A tool can register long after the roster was rendered (a factory at
+    /// build time, a plugin, a product's late mount). Its definition lands
+    /// here the moment it appears, so [`crate::tool::ActivateTool`] can serve
+    /// it on open without ever holding the registry lock inside a call.
+    deferred_defs: Arc<std::sync::RwLock<HashMap<String, Value>>>,
 }
 
 impl ToolRegistry {
@@ -482,7 +490,14 @@ impl ToolRegistry {
 
     pub fn register_arc(&mut self, tool: Arc<dyn Tool>) {
         let name = tool.name().to_string();
-        let tool = if self.deferred.contains(&name) && tool.exposure() != ToolExposure::Deferred {
+        let deferred = self.deferred.contains(&name);
+        if deferred {
+            self.deferred_defs
+                .write()
+                .expect("deferred-defs lock poisoned")
+                .insert(name.clone(), render_tool_definition(tool.as_ref()));
+        }
+        let tool = if deferred && tool.exposure() != ToolExposure::Deferred {
             Arc::new(DeferredTool::new(tool)) as ToolRef
         } else {
             tool
@@ -508,11 +523,23 @@ impl ToolRegistry {
         self.deferred.insert(name.to_string());
         let inner = self.tools.get(name)?;
         let definition = render_tool_definition(inner.as_ref());
+        self.deferred_defs
+            .write()
+            .expect("deferred-defs lock poisoned")
+            .insert(name.to_string(), definition.clone());
         if inner.exposure() != ToolExposure::Deferred {
             let wrapped = Arc::new(DeferredTool::new(inner.clone())) as ToolRef;
             self.tools.insert(name.to_string(), wrapped);
         }
         Some(definition)
+    }
+
+    /// The shared deferred-definition catalog: name -> rendered definition,
+    /// filled whenever a deferred-marked tool is (or becomes) registered.
+    /// Hand it to [`crate::tool::ActivateTool`] so late registrations stay
+    /// openable — see the field docs for why it is shared and not a copy.
+    pub fn deferred_defs(&self) -> Arc<std::sync::RwLock<HashMap<String, Value>>> {
+        Arc::clone(&self.deferred_defs)
     }
 
     pub fn definitions(&self) -> Vec<Value> {

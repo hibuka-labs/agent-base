@@ -5,7 +5,7 @@ use tokio::sync::RwLock;
 
 use crate::engine::approval::ApprovalHandler;
 use crate::engine::pipeline::DefaultPipeline;
-use crate::engine::recovery::ToolErrorRecovery;
+use crate::engine::recovery::{InvalidArgsHandler, ReissueMissingFields, ToolErrorRecovery};
 use crate::engine::runtime::event_bus::EventBus;
 use crate::tool::{ActivationContext, ToolPolicy, ToolRegistry};
 
@@ -25,6 +25,7 @@ impl ToolEngine {
             approval_handler,
             tool_policy,
             error_recovery,
+            invalid_args_handler: Arc::new(ReissueMissingFields),
             event_bus,
             pipeline,
         }
@@ -87,6 +88,16 @@ impl ToolEngine {
 
     pub fn error_recovery(&self) -> &Arc<dyn ToolErrorRecovery> {
         &self.error_recovery
+    }
+
+    /// Replace the strategy used when a tool call omits required arguments.
+    pub fn with_invalid_args_handler(mut self, handler: Arc<dyn InvalidArgsHandler>) -> Self {
+        self.invalid_args_handler = handler;
+        self
+    }
+
+    pub fn invalid_args_handler(&self) -> &Arc<dyn InvalidArgsHandler> {
+        &self.invalid_args_handler
     }
 
     pub fn approval_handler(&self) -> Option<&Arc<dyn ApprovalHandler>> {

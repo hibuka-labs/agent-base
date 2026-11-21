@@ -35,7 +35,8 @@ pub use runtime::{NoticeHandle, ProviderHandle};
 
 pub use crate::types::{AgentResult, ApprovalDecision, ApprovalRequest, RiskLevel, SessionId};
 pub use recovery::{
-    ConsecutiveFailureRecovery, RetryOnError, StopOnError, ToolErrorAction, ToolErrorRecovery,
+    ConsecutiveFailureRecovery, InvalidArgsAction, InvalidArgsCtx, InvalidArgsHandler,
+    ReissueMissingFields, RetryOnError, StopOnError, ToolErrorAction, ToolErrorRecovery,
 };
 pub use runtime::AgentRuntime;
 // The seam's input type — exported so out-of-kernel ActionExecutor

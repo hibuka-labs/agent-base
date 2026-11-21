@@ -4,7 +4,10 @@ use crate::engine::executor::{
 };
 use crate::engine::middleware::{Middleware, PostLlmCtx, PreLlmCtx, UserMessageCtx};
 use crate::engine::runtime::LlmTurnResult;
-use crate::engine::{AgentBuilder, AgentRuntime, DenyAllApprovalHandler, RetryOnError};
+use crate::engine::{
+    AgentBuilder, AgentRuntime, DenyAllApprovalHandler, InvalidArgsAction, InvalidArgsCtx,
+    InvalidArgsHandler, RetryOnError,
+};
 use crate::llm::StreamChunk;
 use crate::tool::{Content, Tool, ToolContext, ToolPolicy};
 use crate::types::{

@@ -4,7 +4,7 @@ use tokio::sync::RwLock;
 
 use crate::engine::approval::ApprovalHandler;
 use crate::engine::pipeline::DefaultPipeline;
-use crate::engine::recovery::ToolErrorRecovery;
+use crate::engine::recovery::{InvalidArgsHandler, ToolErrorRecovery};
 use crate::engine::runtime::event_bus::EventBus;
 use crate::engine::runtime::session_manager::SessionManager;
 use crate::tool::{Content, ToolPolicy, ToolRegistry};
@@ -15,6 +15,7 @@ pub(crate) struct ToolEngine {
     pub(super) approval_handler: Option<Arc<dyn ApprovalHandler>>,
     pub(super) tool_policy: Option<Arc<dyn ToolPolicy>>,
     pub(super) error_recovery: Arc<dyn ToolErrorRecovery>,
+    pub(super) invalid_args_handler: Arc<dyn InvalidArgsHandler>,
     pub(super) event_bus: EventBus,
     pub(super) pipeline: DefaultPipeline,
 }

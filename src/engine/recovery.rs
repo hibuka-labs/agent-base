@@ -225,6 +225,78 @@ impl ToolErrorRecovery for ConsecutiveFailureRecovery {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Invalid tool arguments (schema-level, pre-execution)
+// ---------------------------------------------------------------------------
+
+/// A tool call whose JSON arguments parse but omit fields the tool's schema
+/// declares as required.
+///
+/// Distinct from [`ToolErrorAction`]: this describes a **malformed call**, not
+/// a failed execution. The tool is never invoked, so `ToolErrorRecovery` is
+/// not involved and no side effect happens.
+#[derive(Debug, Clone)]
+pub struct InvalidArgsCtx<'a> {
+    /// Name of the tool the model tried to call.
+    pub tool_name: &'a str,
+    /// Required fields absent from the arguments object.
+    pub missing_fields: Vec<String>,
+    /// The raw arguments JSON produced by the model.
+    pub raw_args: &'a str,
+    /// The tool's input schema as declared to the model.
+    pub schema: Option<&'a serde_json::Value>,
+}
+
+/// What the runtime should do after it rejects an argument-invalid call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InvalidArgsAction {
+    /// Feed the message back as the tool result and keep the run going so the
+    /// model can re-issue the call with complete arguments.
+    Reissue {
+        /// Guidance shown to the model in place of the tool result.
+        message: String,
+    },
+    /// Feed the message back as the tool result and end the run.
+    ///
+    /// For applications that prefer invalid calls to fail loudly instead of
+    /// silently retrying.
+    Stop {
+        /// Guidance shown to the model in place of the tool result.
+        message: String,
+    },
+}
+
+/// Strategy for calls that omit schema-required arguments.
+///
+/// Called before execution, once per rejected call, with the structured
+/// details. Implementations may perform side effects (load docs, trigger
+/// workflows) before returning an action.
+///
+/// The hook is `async` so applications can do I/O; the kernel only decides
+/// *when* to ask, not *how* to respond.
+#[async_trait::async_trait]
+pub trait InvalidArgsHandler: Send + Sync {
+    async fn on_invalid_args(&self, ctx: InvalidArgsCtx<'_>) -> AgentResult<InvalidArgsAction>;
+}
+
+/// Default handler: tell the model which required fields are missing and let it
+/// re-issue. Never surfaced to the user.
+pub struct ReissueMissingFields;
+
+#[async_trait::async_trait]
+impl InvalidArgsHandler for ReissueMissingFields {
+    async fn on_invalid_args(&self, ctx: InvalidArgsCtx<'_>) -> AgentResult<InvalidArgsAction> {
+        let missing = ctx.missing_fields.join("`, `");
+        Ok(InvalidArgsAction::Reissue {
+            message: format!(
+                "Tool call was not executed: it omitted required field(s) `{missing}`. \
+                 Re-issue the call with every required field filled in. If you need several \
+                 calls, emit each one with complete arguments."
+            ),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

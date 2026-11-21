@@ -46,10 +46,11 @@ pub use llm::{ReasoningConfig, ReasoningEffort, StreamChunk, UsageInfo};
 pub use engine::{
     AllowAllApprovalHandler, ApprovalDecision, ApprovalHandler, ApprovalRequest, CompactionKind,
     CompactionOutcome, ConsecutiveFailureRecovery, ContextCompaction, ContextWindowManager,
-    DenyAllApprovalHandler, GuardCtx, GuardDecision, Middleware, NoopGuard, NoticeHandle,
-    PostLlmCtx, PreLlmCtx, ProviderHandle, ReactLoopGuard, RetryOnError, RiskLevel, StopOnError,
-    StreamIntegrity, ToolEnforcementConfig, ToolEnforcementMiddleware, ToolErrorAction,
-    ToolErrorRecovery, TurnFactMiddleware, TurnToolLimitMiddleware, UserMessageCtx,
+    DenyAllApprovalHandler, GuardCtx, GuardDecision, InvalidArgsAction, InvalidArgsCtx,
+    InvalidArgsHandler, Middleware, NoopGuard, NoticeHandle, PostLlmCtx, PreLlmCtx, ProviderHandle,
+    ReactLoopGuard, ReissueMissingFields, RetryOnError, RiskLevel, StopOnError, StreamIntegrity,
+    ToolEnforcementConfig, ToolEnforcementMiddleware, ToolErrorAction, ToolErrorRecovery,
+    TurnFactMiddleware, TurnToolLimitMiddleware, UserMessageCtx,
     estimate_messages_tokens, first_system_prompt,
 };
 

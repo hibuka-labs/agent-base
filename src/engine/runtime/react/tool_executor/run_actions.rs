@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::Value;
 use tokio::sync::broadcast;
 
+use crate::engine::recovery::{InvalidArgsAction, InvalidArgsCtx};
 use crate::engine::runtime::react::turn_end::TurnEndCtx;
 use crate::engine::runtime::react::turn_guard::TurnMetrics;
 use crate::engine::runtime::react::turn_loop::TurnFlow;
@@ -36,6 +37,18 @@ impl<'c> ToolCallExecutor<'c> {
     {
         let session_id = &self.session_id;
         let mut tool_calls = actions_to_triples(&actions);
+
+        // Markup residue scrub (session 20261121_f984398e): the model sometimes
+        // writes the template's closing tags INSIDE native JSON argument values
+        // (e.g. `"all"` + a trailing parameter-close), which then rode into
+        // registered names and paths (`agent_path` came out with tag residue).
+        // Strip before any validity check so the clean values are what the
+        // missing-field check and the tools themselves see.
+        for call in &mut tool_calls {
+            if let Some(cleaned) = super::super::text_toolcall::scrub_arguments(&call.2) {
+                call.2 = cleaned;
+            }
+        }
         // Truncation guard — a well-formed provider stream always yields
         // complete JSON for each tool call's arguments. When that breaks, the
         // call must NOT be executed: re-issue it instead. Three ways it breaks:
@@ -68,6 +81,10 @@ impl<'c> ToolCallExecutor<'c> {
         // and only re-issue the broken ones (instead of discarding the whole batch).
         let truncated_by_limit = finish_reason.is_truncated();
         let mut invalid_indices: Vec<usize> = Vec::new();
+        // Per-call record of required fields dropped from an otherwise-valid
+        // arguments object. Case 5 keeps the structured detail here so the
+        // InvalidArgsHandler (not the generic truncation guidance) can answer.
+        let mut missing_fields: Vec<(usize, Vec<String>)> = Vec::new();
         for (i, (_id, name, args)) in tool_calls.iter().enumerate() {
             if name.is_empty() {
                 continue;
@@ -93,6 +110,28 @@ impl<'c> ToolCallExecutor<'c> {
             if empty_object && self.core.tool_engine.tool_requires_params(name).await {
                 invalid_indices.push(i);
                 continue;
+            }
+            // Case 5: valid JSON object that omits fields the tool's schema
+            // declares required. Session 20261121_a62ca27d: parallel spawn_agent
+            // calls arrived as {"model":…,"task_name":…} with `task` dropped —
+            // the object parses, so case 2 skips it, and it would otherwise fall
+            // through to a typed-arg execution failure *after* the call was
+            // recorded as made. Treat it as an incomplete call and re-issue.
+            if let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(args)
+                && let Some(schema) = self.core.tool_engine.tool_schema(name).await
+                && let Some(required) = schema.get("required").and_then(Value::as_array)
+            {
+                let missing: Vec<String> = required
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter(|k| !obj.contains_key(*k))
+                    .map(str::to_string)
+                    .collect();
+                if !missing.is_empty() {
+                    missing_fields.push((i, missing));
+                    invalid_indices.push(i);
+                    continue;
+                }
             }
             // Valid — no issue found
         }
@@ -278,7 +317,11 @@ impl<'c> ToolCallExecutor<'c> {
             }
 
             // ── Choose guidance text ──
-            let guidance: String = if strikes_after >= 2 {
+            // Truncation-class failures (cases 1-3) get the generic text below.
+            // Calls that merely omitted required fields (case 5) are answered by
+            // the application's InvalidArgsHandler: the default re-issues with
+            // its own wording; strict handlers may stop the run.
+            let generic_guidance: String = if strikes_after >= 2 {
                 // Stronger guidance on second+ attempt
                 if has_truncated || truncated_by_limit {
                     format!(
@@ -314,15 +357,47 @@ impl<'c> ToolCallExecutor<'c> {
                     .to_string()
             };
 
+            // Per-call result text. Missing-required-field calls go through the
+            // injected handler; anything else uses the generic guidance above.
+            let mut stop_reason: Option<String> = None;
+            let mut pre_resolved: Vec<(String, String)> =
+                Vec::with_capacity(invalid_indices.len());
+            for &i in &invalid_indices {
+                let missing = missing_fields
+                    .iter()
+                    .find(|(idx, _)| *idx == i)
+                    .map(|(_, fields)| fields);
+                let message = if let Some(missing) = missing {
+                    let name = tool_calls[i].1.clone();
+                    let schema = self.core.tool_engine.tool_schema(&name).await;
+                    let action = self
+                        .core
+                        .tool_engine
+                        .invalid_args_handler()
+                        .on_invalid_args(InvalidArgsCtx {
+                            tool_name: &name,
+                            missing_fields: missing.clone(),
+                            raw_args: &tool_calls[i].2,
+                            schema: schema.as_ref(),
+                        })
+                        .await?;
+                    match action {
+                        InvalidArgsAction::Reissue { message } => message,
+                        InvalidArgsAction::Stop { message } => {
+                            stop_reason.get_or_insert_with(|| message.clone());
+                            message
+                        }
+                    }
+                } else {
+                    generic_guidance.clone()
+                };
+                pre_resolved.push((tool_calls[i].0.clone(), message));
+            }
+
             if has_valid {
-                // Build pre-resolved results for invalid calls (guidance text).
                 // `handle_tool_calls` pushes ONE assistant message with ALL
                 // tool_calls, then these results, then executes the valid ones —
                 // every tool_call_id gets exactly one result in order.
-                let pre_resolved: Vec<(String, String)> = invalid_indices
-                    .iter()
-                    .map(|&i| (tool_calls[i].0.clone(), guidance.clone()))
-                    .collect();
                 self.handle_tool_calls(
                     session_id,
                     &tool_calls,
@@ -348,12 +423,16 @@ impl<'c> ToolCallExecutor<'c> {
                             Some(reasoning_text),
                             Some(full_text),
                         );
-                        for &i in &invalid_indices {
-                            session.push_tool_result(&tool_calls[i].0, &guidance);
+                        for (id, message) in &pre_resolved {
+                            session.push_tool_result(id, message);
                         }
                         session.run_state.record_truncation();
                     })
                     .await?;
+            }
+
+            if let Some(error) = stop_reason {
+                return Ok(TurnFlow::Done(RunOutcome::Failed { error }));
             }
             return Ok(TurnFlow::Continue);
         }

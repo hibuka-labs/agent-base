@@ -26,6 +26,13 @@ pub struct ActivateTool {
     activation: ToolActivation,
     /// Tool name -> the definition the model will get once it is open.
     candidates: HashMap<String, (ToolExposure, Value)>,
+    /// The registry's shared deferred-definition catalog ([`ToolRegistry::deferred_defs`](super::ToolRegistry::deferred_defs)).
+    ///
+    /// Tools can register long after this opener is built (a factory inside
+    /// `build`, a plugin, a product's late mount). The catalog fills itself as
+    /// they land, so a roster name stays openable no matter when its tool
+    /// arrived. Set once after build; `None` in tests with no registry.
+    late: std::sync::OnceLock<Arc<std::sync::RwLock<HashMap<String, Value>>>>,
 }
 
 impl ActivateTool {
@@ -41,12 +48,43 @@ impl ActivateTool {
                 .into_iter()
                 .map(|(name, exposure, def)| (name, (exposure, def)))
                 .collect(),
+            late: std::sync::OnceLock::new(),
         })
     }
 
-    /// Names in sorted order, for the error message a wrong guess deserves.
-    fn candidate_names(&self) -> Vec<&str> {
-        let mut names: Vec<&str> = self.candidates.keys().map(|s| s.as_str()).collect();
+    /// Hand this opener the registry's shared deferred-definition catalog so
+    /// tools registered after [`Self::new`] become openable too. Idempotent;
+    /// the first call wins.
+    pub fn set_deferred_defs(
+        &self,
+        defs: Arc<std::sync::RwLock<HashMap<String, Value>>>,
+    ) {
+        let _ = self.late.set(defs);
+    }
+
+    /// Candidates first (the build-time truth), then the late catalog (always
+    /// `Deferred`: a late tool only exists because its name was deferred).
+    fn lookup(&self, name: &str) -> Option<(ToolExposure, Value)> {
+        if let Some(hit) = self.candidates.get(name) {
+            return Some(hit.clone());
+        }
+        let defs = self.late.get()?;
+        let def = defs.read().expect("deferred-defs lock poisoned").get(name).cloned()?;
+        Some((ToolExposure::Deferred, def))
+    }
+
+    /// Names in sorted order, for the error message a wrong guess deserves —
+    /// the union of the build-time candidates and whatever has registered late.
+    fn candidate_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.candidates.keys().cloned().collect();
+        if let Some(defs) = self.late.get() {
+            let defs = defs.read().expect("deferred-defs lock poisoned");
+            for name in defs.keys() {
+                if !names.contains(name) {
+                    names.push(name.clone());
+                }
+            }
+        }
         names.sort_unstable();
         names
     }
@@ -104,7 +142,7 @@ impl Tool for ActivateTool {
                     .to_string(),
             })?;
 
-        let Some((exposure, definition)) = self.candidates.get(name) else {
+        let Some((exposure, definition)) = self.lookup(name) else {
             return Ok(vec![Content::text(format!(
                 "No tool named `{name}` is mountable. Mountable names: {}.",
                 self.candidate_names().join(", ")
@@ -127,7 +165,7 @@ impl Tool for ActivateTool {
                 };
                 Ok(vec![Content::text(format!(
                     "`{name}` {status}. Call it from the next turn on, with these arguments:\n{}",
-                    serde_json::to_string_pretty(definition).unwrap_or_default()
+                    serde_json::to_string_pretty(&definition).unwrap_or_default()
                 ))])
             }
         }
@@ -275,6 +313,35 @@ mod tests {
         assert!(
             !activation.is_active("always_here"),
             "a Direct tool needs no activation entry"
+        );
+    }
+
+    /// Value: protects=the roster's promise for tools that register late (a
+    /// factory inside build, a plugin, a product's late mount) — the opener
+    /// must serve them from the registry's shared catalog instead of answering
+    /// "not mountable"; fails_when=a late-registered deferred tool cannot be
+    /// opened. why_new=session 20261121_f984398e: `close_agent` came back
+    /// "not mountable" because its tool registered after the candidates were
+    /// built. seam=registry catalog -> opener; no_claim=about which tools
+    /// should be late.
+    #[tokio::test]
+    async fn a_late_registered_deferred_tool_is_openable() {
+        let (tool, activation) = registry_free_tool();
+        let catalog: Arc<std::sync::RwLock<HashMap<String, Value>>> = Default::default();
+        catalog.write().unwrap().insert(
+            "close_agent".to_string(),
+            json!({"name": "close_agent", "description": "Close a sub-agent."}),
+        );
+        tool.set_deferred_defs(catalog);
+        let out = call(&tool, json!({"name": "close_agent"})).await;
+        assert!(
+            activation.is_active("close_agent"),
+            "opening must stick for the session: {out}"
+        );
+        assert!(out.contains("mounted"), "{out}");
+        assert!(
+            out.contains("Close a sub-agent"),
+            "hand back the real definition, not just the name: {out}"
         );
     }
 

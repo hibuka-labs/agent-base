@@ -572,6 +572,95 @@ async fn truncation_guard_blocks_empty_args_for_required_field_tool() {
 }
 
 #[tokio::test]
+async fn truncation_guard_reissues_args_missing_required_field() {
+    // Session 20261121_a62ca27d: a parallel spawn_agent call arrived as valid
+    // JSON with the required task text dropped ({"task_name":…,"model":…}).
+    // Case 2 cannot see it (the object parses) and case 4 cannot either (not
+    // empty), so without case 5 it falls through to a typed-arg execution
+    // failure. It must instead be re-issued with the missing field named.
+    let runtime = AgentBuilder::new(Arc::new(ScriptedProvider::new(vec![
+        vec![
+            StreamChunk::ToolCall(serde_json::json!({
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_missing_task",
+                        "function": {
+                            "name": "spawn_agent",
+                            "arguments": "{\"task_name\":\"mod-agent\"}"
+                        }
+                    }]
+                }
+            })),
+            StreamChunk::Stop {
+                finish_reason: Some("tool_calls".to_string()),
+            },
+        ],
+        // Turn 2: model sees the re-issue instruction and replies.
+        vec![
+            StreamChunk::Text("Re-issuing with the task filled in.".to_string()),
+            StreamChunk::Stop {
+                finish_reason: Some("stop".to_string()),
+            },
+        ],
+    ])))
+    .system_prompt("You are a careful assistant.")
+    .register_tool(SpawnLikeTool)
+    .build()
+    .expect("build runtime");
+
+    let sid = runtime.create_session().await;
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    let result = runtime
+        .run_turn(sid.clone(), "spawn an agent", move |event| {
+            events_clone.lock().unwrap().push(event);
+            Ok(())
+        })
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "run_turn should complete: {:?}",
+        result.err()
+    );
+
+    let session = runtime.session(&sid).await.expect("session exists");
+    let messages = session.chat_messages().to_vec();
+
+    let has_reissue = messages.iter().any(|m| {
+        if let ChatMessage::Tool { content, .. } = m {
+            content.contains("Tool call was not executed")
+                && content.contains("omitted required field(s)")
+                && content.contains("message")
+        } else {
+            false
+        }
+    });
+    assert!(
+        has_reissue,
+        "args missing a required field must be caught by case 5 guard. Messages: {:#?}",
+        messages
+            .iter()
+            .map(|m| format!("{:?}", m))
+            .collect::<Vec<_>>()
+    );
+
+    let has_args_invalid = messages.iter().any(|m| {
+        let s = format!("{:?}", m);
+        s.contains("argument parsing failed") || s.contains("EOF while parsing")
+    });
+    assert!(
+        !has_args_invalid,
+        "missing-field args must not surface as a ToolArgsInvalid failure. Messages: {:#?}",
+        messages
+            .iter()
+            .map(|m| format!("{:?}", m))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
 async fn no_arg_tool_with_empty_object_args_executes_normally() {
     // A tool with no required fields (like `list_agents`) legitimately receives
     // `{}` as arguments. The case 4 guard must NOT fire — the tool should
@@ -656,6 +745,155 @@ async fn no_arg_tool_with_empty_object_args_executes_normally() {
     assert!(
         has_output,
         "no-arg tool must have executed and returned output. Messages: {:#?}",
+        messages
+            .iter()
+            .map(|m| format!("{:?}", m))
+            .collect::<Vec<_>>()
+    );
+}
+
+// ── InvalidArgsHandler: application-defined responses ─────────────────
+
+/// Custom handler that re-issues with product-specific guidance.
+struct DocsHintHandler;
+
+#[async_trait]
+impl InvalidArgsHandler for DocsHintHandler {
+    async fn on_invalid_args(&self, ctx: InvalidArgsCtx<'_>) -> AgentResult<InvalidArgsAction> {
+        Ok(InvalidArgsAction::Reissue {
+            message: format!(
+                "custom hint: missing `{}` — read docs/agents.md before retrying",
+                ctx.missing_fields.join("`, `")
+            ),
+        })
+    }
+}
+
+/// Strict handler: invalid arguments end the run instead of retrying.
+struct StopOnMissingArgs;
+
+#[async_trait]
+impl InvalidArgsHandler for StopOnMissingArgs {
+    async fn on_invalid_args(&self, ctx: InvalidArgsCtx<'_>) -> AgentResult<InvalidArgsAction> {
+        Ok(InvalidArgsAction::Stop {
+            message: format!("policy stop: missing `{}`", ctx.missing_fields.join("`, `")),
+        })
+    }
+}
+
+#[tokio::test]
+async fn invalid_args_handler_can_reissue_with_custom_message() {
+    let runtime = AgentBuilder::new(Arc::new(ScriptedProvider::new(vec![
+        vec![
+            StreamChunk::ToolCall(serde_json::json!({
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_missing",
+                        "function": {
+                            "name": "spawn_agent",
+                            "arguments": "{\"task_name\":\"mod-agent\"}"
+                        }
+                    }]
+                }
+            })),
+            StreamChunk::Stop {
+                finish_reason: Some("tool_calls".to_string()),
+            },
+        ],
+        vec![
+            StreamChunk::Text("Retrying after reading the docs.".to_string()),
+            StreamChunk::Stop {
+                finish_reason: Some("stop".to_string()),
+            },
+        ],
+    ])))
+    .system_prompt("test")
+    .register_tool(SpawnLikeTool)
+    .invalid_args_handler(Arc::new(DocsHintHandler))
+    .build()
+    .expect("build runtime");
+
+    let sid = runtime.create_session().await;
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    let result = runtime
+        .run_turn(sid.clone(), "spawn an agent", move |event| {
+            events_clone.lock().unwrap().push(event);
+            Ok(())
+        })
+        .await;
+    assert!(
+        result.is_ok(),
+        "run_turn should complete: {:?}",
+        result.err()
+    );
+
+    let session = runtime.session(&sid).await.expect("session exists");
+    let messages = session.chat_messages().to_vec();
+    let has_custom = messages.iter().any(|m| {
+        matches!(m, ChatMessage::Tool { content, .. } if content.contains("custom hint: missing `message`"))
+    });
+    assert!(
+        has_custom,
+        "the injected handler's message must reach the model. Messages: {:#?}",
+        messages
+            .iter()
+            .map(|m| format!("{:?}", m))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn invalid_args_handler_can_stop_the_run() {
+    let provider = ScriptedProvider::new(vec![vec![
+        StreamChunk::ToolCall(serde_json::json!({
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_missing",
+                    "function": {
+                        "name": "spawn_agent",
+                        "arguments": "{\"task_name\":\"mod-agent\"}"
+                    }
+                }]
+            }
+        })),
+        StreamChunk::Stop {
+            finish_reason: Some("tool_calls".to_string()),
+        },
+    ]]);
+    let runtime = AgentBuilder::new(Arc::new(provider))
+        .system_prompt("test")
+        .register_tool(SpawnLikeTool)
+        .invalid_args_handler(Arc::new(StopOnMissingArgs))
+        .build()
+        .expect("build runtime");
+
+    let sid = runtime.create_session().await;
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    let result = runtime
+        .run_turn(sid.clone(), "spawn an agent", move |event| {
+            events_clone.lock().unwrap().push(event);
+            Ok(())
+        })
+        .await;
+
+    assert!(
+        matches!(result, Ok(RunOutcome::Failed { .. })),
+        "a Stop handler must end the run as Failed, got {:?}",
+        result
+    );
+
+    let session = runtime.session(&sid).await.expect("session exists");
+    let messages = session.chat_messages().to_vec();
+    let has_policy = messages.iter().any(|m| {
+        matches!(m, ChatMessage::Tool { content, .. } if content.contains("policy stop: missing `message`"))
+    });
+    assert!(
+        has_policy,
+        "the stop message must still be recorded as the tool result. Messages: {:#?}",
         messages
             .iter()
             .map(|m| format!("{:?}", m))

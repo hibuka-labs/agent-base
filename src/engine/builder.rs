@@ -16,7 +16,7 @@ use super::executor::{
 };
 use super::middleware::{Middleware, MiddlewareRef};
 use super::react_loop_guard::ReactLoopGuard;
-use super::recovery::{StopOnError, ToolErrorRecovery};
+use super::recovery::{InvalidArgsHandler, StopOnError, ToolErrorRecovery};
 use super::session_store::{InMemorySessionStore, SessionStore};
 
 pub struct AgentBuilder {
@@ -29,6 +29,9 @@ pub struct AgentBuilder {
     context_manager: Option<ContextWindowManager>,
     session_store: Option<Arc<dyn SessionStore>>,
     error_recovery: Option<Arc<dyn ToolErrorRecovery>>,
+    /// Strategy for calls that omit schema-required arguments. Defaults to
+    /// [`super::recovery::ReissueMissingFields`] — tell the model, never the user.
+    invalid_args_handler: Option<Arc<dyn InvalidArgsHandler>>,
     event_bus_capacity: usize,
     session_id_generator: Option<Arc<dyn SessionIdGenerator>>,
     convert_to_llm: Option<ConvertToLlmFn>,
@@ -58,6 +61,7 @@ impl AgentBuilder {
             context_manager: None,
             session_store: None,
             error_recovery: None,
+            invalid_args_handler: None,
             event_bus_capacity: 2048,
             session_id_generator: None,
             convert_to_llm: None,
@@ -276,6 +280,17 @@ impl AgentBuilder {
         self
     }
 
+    /// Replace the strategy for tool calls that omit required arguments.
+    ///
+    /// Defaults to telling the model which fields are missing and letting it
+    /// re-issue. Inject [`super::recovery::InvalidArgsAction::Stop`]-returning
+    /// handlers for strict applications, or custom handlers that perform side
+    /// effects before answering.
+    pub fn invalid_args_handler(mut self, handler: Arc<dyn InvalidArgsHandler>) -> Self {
+        self.invalid_args_handler = Some(handler);
+        self
+    }
+
     pub fn max_sessions(mut self, max: usize) -> Self {
         self.config.session.max_sessions = Some(max);
         self
@@ -354,13 +369,16 @@ impl AgentBuilder {
 
         let llm_engine = super::runtime::LlmEngine::new(self.provider.clone(), event_bus.clone());
 
-        let tool_engine = super::runtime::ToolEngine::new(
+        let mut tool_engine = super::runtime::ToolEngine::new(
             self.tools,
             self.approval_handler,
             self.tool_policy,
             error_recovery,
             event_bus.clone(),
         );
+        if let Some(handler) = self.invalid_args_handler {
+            tool_engine = tool_engine.with_invalid_args_handler(handler);
+        }
 
         // Interaction defaults: fail-closed when the product mounts no
         // channel; the standard watchdog when it sets no deadline.

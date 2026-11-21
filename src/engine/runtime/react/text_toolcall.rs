@@ -27,6 +27,91 @@ use serde_json::Value;
 const OPEN: &str = "<tool_call>";
 const CLOSE: &str = "</tool_call>";
 const PARAM: &str = "<parameter=";
+/// Closing tags the template puts between parameters. A parameter-markup
+/// value ends at one of these as surely as at the next header — when the model
+/// leaks the closers into the value stream, keeping them in the value is what
+/// produced the polluted `agent_path` seen in session 20261121_f984398e.
+/// Written with escapes so this file never contains the literal sequences.
+const PARAM_CLOSE: &str = "\u{3c}/parameter>";
+const FUNCTION_CLOSE: &str = "\u{3c}/function>";
+
+/// Tag names the tool-call markup uses. Only a trailing run of these counts as
+/// residue — a value legitimately ending in an html tag or any other content
+/// is kept.
+const MARKUP_TAG_NAMES: &[&str] = &[
+    "parameter",
+    "function",
+    "_parameter",
+    "_function",
+    "tool_call",
+    "args",
+    "invoke",
+];
+
+/// Strip a trailing run of leaked tool-call markup tags (closing parameter /
+/// function tags and kin) from a parameter value.
+///
+/// Session 20261121_f984398e: the model wrote the template's closing tags
+/// inside native JSON argument values too (e.g. `"all"` + a trailing
+/// parameter-close — see [`scrub_arguments`]), so the cleanup lives here and
+/// not only in the markup parser. Only *trailing* `<...>` tokens with a
+/// whitelisted name go; everything else is the model's content.
+pub fn strip_markup_tail(mut s: &str) -> &str {
+    loop {
+        let trimmed = s.trim_end();
+        let Some(lt) = trimmed.rfind('<') else {
+            return trimmed;
+        };
+        if !is_markup_tag(&trimmed[lt..]) {
+            return trimmed;
+        }
+        s = &trimmed[..lt];
+    }
+}
+
+/// A whole `<tag>` / `</tag>` / `<_tag>` token whose name is in
+/// [`MARKUP_TAG_NAMES`] — anything wider is content.
+fn is_markup_tag(tag: &str) -> bool {
+    let Some(inner) = tag.strip_prefix('<').and_then(|t| t.strip_suffix('>')) else {
+        return false;
+    };
+    MARKUP_TAG_NAMES.contains(&inner.trim_start_matches('/'))
+}
+
+/// Scrub leaked markup residue from every string value in a JSON arguments
+/// payload. Returns the re-serialized JSON when anything changed, `None` when
+/// it did not (so callers can skip the rewrite).
+///
+/// Recurses through arrays and objects; object keys are left alone (a key is
+/// an identifier the schema matches on — renaming it would only move the
+/// failure).
+pub fn scrub_arguments(args: &str) -> Option<String> {
+    let mut v: Value = serde_json::from_str(args).ok()?;
+    if !scrub_value(&mut v) {
+        return None;
+    }
+    Some(v.to_string())
+}
+
+fn scrub_value(v: &mut Value) -> bool {
+    match v {
+        Value::String(s) => {
+            let stripped = strip_markup_tail(s);
+            if stripped.len() == s.len() {
+                false
+            } else {
+                *s = stripped.to_string();
+                true
+            }
+        }
+        Value::Array(a) => a.iter_mut().map(scrub_value).fold(false, |acc, c| acc || c),
+        Value::Object(o) => o
+            .values_mut()
+            .map(scrub_value)
+            .fold(false, |acc, c| acc || c),
+        _ => false,
+    }
+}
 
 /// A tool call recovered from the leaked markup: function name + raw string
 /// parameters (declaration order preserved; for duplicate names the first one
@@ -70,7 +155,7 @@ fn parse_block(body: &str) -> Option<HarvestedCall> {
     // Hermes JSON style: the block body itself is `{","arguments":{…}}`.
     if body.starts_with('{') {
         let v: Value = serde_json::from_str(body).ok()?;
-        let name = v.get("name").and_then(Value::as_str)?.trim().to_string();
+        let name = strip_markup_tail(v.get("name").and_then(Value::as_str)?.trim()).to_string();
         if name.is_empty() {
             return None;
         }
@@ -86,7 +171,7 @@ fn parse_block(body: &str) -> Option<HarvestedCall> {
             .iter()
             .map(|(k, val)| {
                 let raw = match val {
-                    Value::String(s) => s.clone(),
+                    Value::String(s) => strip_markup_tail(s).to_string(),
                     other => other.to_string(),
                 };
                 (k.clone(), raw)
@@ -97,14 +182,19 @@ fn parse_block(body: &str) -> Option<HarvestedCall> {
 
     // parameter-markup style: `<function=NAME><parameter=KEY>VALUE…`
     let rest = body.strip_prefix("<function=")?;
-    let gt = rest.find('>')?;
-    let name = rest[..gt].trim().to_string();
+    // The name runs to the first '>' — or '<', when the model leaked a closing
+    // tag right behind it (see session 20261121_f984398e).
+    let end = rest.find(['>', '<'])?;
+    let name = rest[..end].trim().to_string();
     if name.is_empty() {
         return None;
     }
     let mut params = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let mut cursor = &rest[gt + 1..];
+    let mut cursor = &rest[end..];
+    if cursor.starts_with('>') {
+        cursor = &cursor[1..];
+    }
     while let Some(p) = cursor.find(PARAM) {
         let after = &cursor[p + PARAM.len()..];
         // When a parameter header is truncated (no '>'), keep the parameters
@@ -114,15 +204,17 @@ fn parse_block(body: &str) -> Option<HarvestedCall> {
         };
         let key = after[..key_gt].trim().to_string();
         let value_part = &after[key_gt + 1..];
-        // The value ends at the nearest next parameter header / closing tag /
-        // end of text.
+        // The value ends at the nearest next parameter header / leaked closing
+        // tag / closing tag / end of text.
         let value_len = value_part
             .find(PARAM)
             .into_iter()
+            .chain(value_part.find(PARAM_CLOSE))
+            .chain(value_part.find(FUNCTION_CLOSE))
             .chain(value_part.find(CLOSE))
             .min()
             .unwrap_or(value_part.len());
-        let value = value_part[..value_len].trim().to_string();
+        let value = strip_markup_tail(value_part[..value_len].trim()).to_string();
         if !key.is_empty() && seen.insert(key.clone()) {
             params.push((key, value));
         }
@@ -316,5 +408,67 @@ mid<tool_call><function=a_tool><parameter=x>2</tool_call>";
         let calls = harvest("<tool_call><function=spawn_agent>");
         assert_eq!(calls.len(), 1);
         assert!(calls[0].params.is_empty());
+    }
+
+    /// Value: protects=parameter values from leaked template closers — the
+    /// residue must never ride into registered names and paths
+    /// (`agent_path: root/…<…>` in session 20261121_f984398e);
+    /// fails_when=a trailing closer run survives in the value. why_new=the
+    /// residue case is new. seam=markup -> params; no_claim=about values whose
+    /// legitimate content ends in other tags.
+    #[test]
+    fn trailing_markup_closers_stripped_from_values() {
+        let text = format!(
+            "{OPEN}<function=spawn_agent><parameter=task_name>interpret-phi-tui\u{3c}/parameter>\u{3c}/function>"
+        );
+        let calls = harvest(&text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "spawn_agent");
+        assert_eq!(calls[0].params[0].1, "interpret-phi-tui");
+    }
+
+    /// Value: protects=the model's own content — only *trailing whitelisted*
+    /// tags are residue; html or prose-ending tags are content;
+    /// fails_when=the cleanup eats a value like `see the </html>`. why_new=the
+    /// whitelist boundary is new. seam=cleanup.
+    #[test]
+    fn only_whitelisted_trailing_tags_are_residue() {
+        assert_eq!(strip_markup_tail("all\u{3c}/parameter>"), "all");
+        assert_eq!(
+            strip_markup_tail("x\u{3c}/parameter>\u{3c}/function>"),
+            "x"
+        );
+        assert_eq!(strip_markup_tail("see the \u{3c}/html>"), "see the \u{3c}/html>");
+        assert_eq!(
+            strip_markup_tail("a\u{3c}/parameter>b"),
+            "a\u{3c}/parameter>b"
+        );
+        assert_eq!(strip_markup_tail("plain"), "plain");
+    }
+
+    /// Value: protects=native-JSON argument values (the observed leak shape:
+    /// the model writes the closers inside JSON strings) — every string in the
+    /// payload gets cleaned, arrays and objects included;
+    /// fails_when=`"fork_turns":"all"` + closer survives ingestion.
+    /// why_new=session 20261121_f984398e. seam=args JSON -> engine.
+    #[test]
+    fn scrub_arguments_cleans_every_string_value() {
+        let dirty = concat!(
+            "{\"fork_turns\":\"all\u{3c}/parameter>\",",
+            "\"task_name\":\"t\u{3c}/parameter>\u{3c}/function>\",",
+            "\"nested\":{\"list\":[\"k\u{3c}/function>\",\"ok\"]},\"n\":1}"
+        );
+        let cleaned = scrub_arguments(dirty).expect("residue must trigger a rewrite");
+        assert_eq!(
+            serde_json::from_str::<Value>(&cleaned).unwrap(),
+            serde_json::json!({
+                "fork_turns": "all",
+                "task_name": "t",
+                "nested": {"list": ["k", "ok"]},
+                "n": 1
+            })
+        );
+        // Clean input → no rewrite at all.
+        assert_eq!(scrub_arguments(r#"{"a":"b"}"#), None);
     }
 }
